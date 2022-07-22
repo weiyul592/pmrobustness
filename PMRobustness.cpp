@@ -22,7 +22,6 @@
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
@@ -49,13 +48,12 @@ using namespace llvm;
 #include <llvm/IR/DebugLoc.h>
 
 // TODO: need to change data structure?
-typedef MapVector<Value *, struct VarState> state_t;
+typedef DenseMap<Value *, struct VarState> state_t;
 
 enum class PMState {
-	UNKNOWN,
-	FLUSHED,
-	UNFLUSHED,
-	CLWB
+	UNFLUSHED = 0x1,
+	CLWB = 0x11,
+	FLUSHED = 0x111
 };
 
 struct VarState {
@@ -65,14 +63,12 @@ struct VarState {
 
 void printVarState(VarState * state) {
 	errs() << "<";
-	if (state->s == PMState::UNKNOWN)
-		errs() << "Unknown,";
-	else if (state->s == PMState::FLUSHED)
-		errs() << "Flushed,";
-	else if (state->s == PMState::UNFLUSHED)
+	if (state->s == PMState::UNFLUSHED)
 		errs() << "Unflushed,";
-	else
+	else if (state->s == PMState::CLWB)
 		errs() << "CLWB,";
+	else
+		errs() << "Flushed,";
 
 	if (state->escaped) errs() << "escaped>";
 	else errs() << "captured>";
@@ -135,10 +131,10 @@ void PMRobustness::analyze(Function &F) {
 			bool changed = false;
 			BasicBlock::iterator prev = block->begin();
 			for (BasicBlock::iterator it = block->begin(); it != block->end();) {
-				MapVector<Value *, struct VarState> * state = States[&*it];
+				state_t * state = States[&*it];
 
 				if (state == NULL) {
-					state = new MapVector<Value *, struct VarState>();
+					state = new state_t();
 					States[&*it] = state;
 				}
 
@@ -210,22 +206,15 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 	state_t map;
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = States[pred->getTerminator()];
-		for (state_t::iterator sit = s->begin(); sit != s->end(); sit++) {
-			state_t::iterator ValueA = map.find(sit->first);
+		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
+			state_t::iterator ValueA = map.find(it->first);
 			if (ValueA != map.end()) {
 				// key-value pair found
-				// TODO: Using & can be more efficient; FLUSHED: 0x10; CLWB: 0x1; UNFLUSHED: 0x0;
-				if (ValueA->second.s == PMState::UNFLUSHED || sit->second.s == PMState::UNFLUSHED) {
-					map[sit->first].s = PMState::UNFLUSHED;
-				} else if (ValueA->second.s == PMState::CLWB || sit->second.s == PMState::CLWB) {
-					map[sit->first].s = PMState::CLWB;
-				} else {
-					map[sit->first].s = PMState::FLUSHED;
-				}
-				
-				map[sit->first].escaped = ValueA->second.escaped || sit->second.escaped;
+				int tmp = static_cast<int>(ValueA->second.s) & static_cast<int>(it->second.s);
+				map[it->first].s = static_cast<PMState>(tmp);
+				map[it->first].escaped = ValueA->second.escaped || it->second.escaped;
 			} else {
-				map[sit->first] = sit->second;
+				map[it->first] = it->second;
 			}
 		}
 	}
@@ -276,24 +265,22 @@ void PMRobustness::printMap(state_t * map) {
 }
 
 void PMRobustness::test() {
-	MapVector<int *, int> map;
+	/*
+	DenseMap<int *, int> map;
 	int x;
 	int y;
 	map[&y] = 2;
-	//errs() << "map[x]: " << map[&x] << "\n";
 	if (map.find(&x) == map.end()) {
 		errs() << "x not found\n";
 	} else {
 		errs() << "x found\n";	
 	}
 
-	//errs() << "map[y]: " << map[&y] << "\n";
 	if (map.find(&y) == map.end()) {
 		errs() << "y not found\n";
 	} else {
 		errs() << "y found\n";	
-	}
-
+	}*/
 }
 
 char PMRobustness::ID = 0;

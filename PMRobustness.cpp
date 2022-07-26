@@ -48,7 +48,7 @@ using namespace llvm;
 #include <llvm/IR/DebugLoc.h>
 
 // TODO: need to change data structure?
-typedef DenseMap<Value *, struct VarState> state_t;
+typedef DenseMap<Value *, std::vector<struct VarState>> state_t;
 
 enum class PMState {
 	UNFLUSHED = 0x1,
@@ -157,15 +157,6 @@ void PMRobustness::analyze(Function &F) {
 						}
 
 						copyMergedState(pred_list, state);
-
-						/*
-						errs() << "block: " << *block << "\n";
-						for (BasicBlock *pred : *pred_list) {
-							errs() << "pred\t";
-							errs() << *pred << "\n";
-						}
-						errs() << "----\n\n";
-						*/
 					}
 				} else {
 					// Copy the previous instruction's state
@@ -204,15 +195,41 @@ void PMRobustness::copyState(state_t * src, state_t * dst) {
 
 void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
 	state_t map;
+
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = States[pred->getTerminator()];
 		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
-			state_t::iterator ValueA = map.find(it->first);
-			if (ValueA != map.end()) {
-				// key-value pair found
-				int tmp = static_cast<int>(ValueA->second.s) & static_cast<int>(it->second.s);
-				map[it->first].s = static_cast<PMState>(tmp);
-				map[it->first].escaped = ValueA->second.escaped || it->second.escaped;
+			state_t::iterator item = map.find(it->first);
+			if (item != map.end()) {
+				// Loc-vector<VarState> pair found
+				std::vector<struct VarState> * var_state_listA = &item->second;
+				std::vector<struct VarState> * var_state_listB = &it->second;
+				if (var_state_listA->size() < var_state_listB->size()) {
+					unsigned old_size = var_state_listA->size();
+					var_state_listA->resize(var_state_listB->size());
+					// Merge states already in listA
+					for (unsigned i = 0; i < old_size; i++) {
+						int tmp = static_cast<int>((*var_state_listA)[i].s) & static_cast<int>((*var_state_listB)[i].s);
+						(*var_state_listA)[i].s = static_cast<PMState>(tmp);
+						(*var_state_listA)[i].escaped |= (*var_state_listB)[i].escaped;
+					}
+
+					// Copy states from listB to listA for the remaining indices
+					for (unsigned i = old_size; i < var_state_listB->size(); i++) {
+						(*var_state_listA)[i] = (*var_state_listB)[i];
+					}
+				} else {
+					// Merge states in listB to states in listA
+					for (unsigned i = 0; i < var_state_listB->size(); i++) {
+						int tmp = static_cast<int>((*var_state_listA)[i].s) & static_cast<int>((*var_state_listB)[i].s);
+						(*var_state_listA)[i].s = static_cast<PMState>(tmp);
+						(*var_state_listA)[i].escaped |= (*var_state_listB)[i].escaped;
+					}
+				}
+
+				//int tmp = static_cast<int>(item->second.s) & static_cast<int>(it->second.s);
+				//map[it->first].s = static_cast<PMState>(tmp);
+				//map[it->first].escaped = item->second.escaped || it->second.escaped;
 			} else {
 				map[it->first] = it->second;
 			}
@@ -227,15 +244,42 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 	if (AllocaInst *AI = dyn_cast<AllocaInst>(I)) {
 		struct VarState state;
 		Value * Addr = dyn_cast<Value>(AI);
-		(*map)[Addr] = state;
+
+		assert((*map)[Addr].size() == 0);
+		(*map)[Addr].push_back(state);
 
 		// Debug
 		value_list.push_back(Addr);
 		//errs() << *AI << "\n";
 	} else if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
 		Value * Addr = SI->getPointerOperand();
-		// errs() << "Addr: " << *Addr << "is alloca: " << "\n";
-		(*map)[Addr].s = PMState::UNFLUSHED;
+		std::vector<struct VarState> * var_states = &(*map)[Addr];
+		//errs() << "Addr: " << *Addr << "\n";
+		//errs() << "SI" << *SI << "\n";
+
+		if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(Addr)) {
+			errs() << "GEP " << *GEP->getPointerOperand() << "\n";
+			unsigned LastOperandIdx = GEP->getNumOperands() - 1;
+			Value *LastOperand = GEP->getOperand(LastOperandIdx);
+			if (ConstantInt *offset = dyn_cast<ConstantInt>(LastOperand)) {
+				//errs() << "GEP offset: " << offset->getValue() << "\n";
+				unsigned index = offset->getZExtValue() + 1;
+				if (var_states->size() < index) {
+					var_states->resize(index + 1);
+					(*var_states)[index].s = PMState::UNFLUSHED;
+				}
+
+				errs() << "Addr -> " << *Addr << "\t";
+				errs() << "var size -> " << var_states->size() << "\n";
+			} else {
+				assert("Non constant offset\n");
+			}
+		} else if (isa<AllocaInst>(Addr)){
+			assert(var_states->size() == 1);
+			(*var_states)[0].s = PMState::UNFLUSHED;
+		} else {
+			assert("Unknown Addr Type\n");
+		}
 	} else {
 		ret = false;
 	}
@@ -256,15 +300,36 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 
 void PMRobustness::printMap(state_t * map) {
 	for (unsigned i = 0; i < value_list.size(); i++) {
-		struct VarState *v = &(*map)[value_list[i]];
-		errs() << *value_list[i] << ": ";
-		printVarState(v);
-		errs() << "\n";
+		//struct VarState *v = &(*map)[value_list[i]];
+		std::vector<struct VarState> *v = &(*map)[value_list[i]];
+		//errs() << "var => " << value_list[i] << "\t";
+		//errs() << "var size => " << v->size() << "\n";
+
+		if (v->size() == 1) {
+			errs() << *value_list[i] << ": ";
+			printVarState( &(*v)[0] );
+			errs() << "\n";
+		} else {
+			for (unsigned j = 0; j < v->size(); j++) {
+				errs() << *value_list[i] << ", " << j << ": ";
+				printVarState( &(*v)[j] );
+				errs() << "\n";
+			}
+		}
 	}
 	errs() << "\n----\n";
 }
 
 void PMRobustness::test() {
+	std::vector<struct VarState> tmp;
+	tmp.resize(5);
+	tmp[3].s = PMState::UNFLUSHED;
+	//printVarState(&tmp[3]);
+
+	std::vector<struct VarState> tmp2;
+	tmp2 = tmp;
+	printVarState(&tmp2[3]);
+	errs() << "\n\n";
 	/*
 	DenseMap<int *, int> map;
 	int x;

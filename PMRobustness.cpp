@@ -44,11 +44,15 @@
 
 using namespace llvm;
 
-#define CDS_DEBUG
-#define DEBUG_TYPE "CDS"
+#define PMROBUST_DEBUG
+#define DEBUG_TYPE "PMROBUST_DEBUG"
 #include <llvm/IR/DebugLoc.h>
 
-// TODO: need to change data structure?
+/**
+ * Object with 3 fields: vector -> [object status, field 1, field 2, field 3]
+ * TODO: may need to track the size of fields
+ * TODO: need to change data structure?
+ **/
 typedef DenseMap<Value *, std::vector<struct VarState>> state_t;
 
 enum class PMState {
@@ -86,6 +90,7 @@ namespace {
 		void copyState(state_t * src, state_t * dst);
 		void copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst);
 		bool update(state_t * map, Instruction * I);
+		bool isPMAddr(Value * addr) { return true; }
 
 		static char ID;
 		//AliasAnalysis *AA;
@@ -239,11 +244,16 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 bool PMRobustness::update(state_t * map, Instruction * I) {
 	bool ret = true;
 
+	/* Rule 1: x.f = v => x.f becomes dirty */
 	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
 		Value * Addr = SI->getPointerOperand();
+
+		// TODO: Address check to be implemented
+		if (!isPMAddr(Addr))
+			return false;
+
 		//errs() << "Addr: " << *Addr << "\n";
 		//errs() << "SI" << *SI << "\n";
-
 		if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(Addr)) {
 			Value * BaseAddr = GEP->getPointerOperand();
 			std::vector<struct VarState> &var_states = (*map)[BaseAddr];
@@ -251,23 +261,23 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			unsigned LastOperandIdx = GEP->getNumOperands() - 1;
 			Value *LastOperand = GEP->getOperand(LastOperandIdx);
 			if (ConstantInt *offset = dyn_cast<ConstantInt>(LastOperand)) {
-				// Debug
+#ifdef PMROBUST_DEBUG
 				if (var_states.size() == 0) {
 					value_list.push_back(BaseAddr);
 				}
-
+#endif
 				unsigned index = offset->getZExtValue() + 1;	// index = GEP offset + 1
 				if (var_states.size() < index + 1)
 					var_states.resize(index + 1);
 
 				var_states[index].s = PMState::UNFLUSHED;
 				var_states[0].s = PMState::UNFLUSHED;
-
+/*
 				errs() << "SI" << *SI << "\n";
 				errs() << "store Addr -> " << *Addr << "\t";
 				errs() << "GEP Base Addr -> " << *BaseAddr << "\n";
 				errs() << "var size -> " << var_states.size() << "\n";
-
+*/
 			} else {
 				assert("Non constant offset\n");
 			}
@@ -280,8 +290,9 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				state.s = PMState::UNFLUSHED;
 				var_states.push_back(state);
 
-				// Debug
+#ifdef PMROBUST_DEBUG
 				value_list.push_back(Addr);
+#endif
 			} else if (var_states.size() == 1) {
 				var_states[0].s = PMState::UNFLUSHED;
 			} else
@@ -292,8 +303,8 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 	}
 
 	if (ret) {
-		errs() << "After " << *I << "\n";
-		printMap(map);
+		//errs() << "After " << *I << "\n";
+		//printMap(map);
 	}
 
 	return ret;
@@ -356,7 +367,7 @@ void PMRobustness::test() {
 }
 
 char PMRobustness::ID = 0;
-static RegisterPass<PMRobustness> X("hello", "Persistent Memory Robustness Analysis Pass");
+static RegisterPass<PMRobustness> X("pmrobust", "Persistent Memory Robustness Analysis Pass");
 
 // Automatically enable the pass.
 static void registerPMRobustness(const PassManagerBuilder &,

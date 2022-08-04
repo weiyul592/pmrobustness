@@ -245,16 +245,14 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 bool PMRobustness::update(state_t * map, Instruction * I) {
 	bool ret = true;
 
-	/* Rule 1: x.f = v => x.f becomes dirty */
 	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
+		/* Rule 1: x.f = v => x.f becomes dirty */
 		Value * Addr = SI->getPointerOperand();
 
 		// TODO: Address check to be implemented
 		if (!isPMAddr(Addr))
 			return false;
 
-		//errs() << "Addr: " << *Addr << "\n";
-		//errs() << "SI" << *SI << "\n";
 		if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(Addr)) {
 			Value * BaseAddr = GEP->getPointerOperand();
 			std::vector<struct VarState> &var_states = (*map)[BaseAddr];
@@ -302,14 +300,37 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 
 		Value * Val = SI->getValueOperand();
 		/* Rule 2: *x = p (where x is a heap address) => all fields of p escapes */
-		if (Val->getType()->isPointerTy()) {
-			if (mayInHeap(Addr)) {
-				std::vector<struct VarState> &val_var_states = (*map)[Val];
-				for (unsigned i = 0; i < val_var_states.size(); i++) {
-					val_var_states[i].escaped = true;
-				}
+		if (Val->getType()->isPointerTy() && mayInHeap(Addr)) {
+			std::vector<struct VarState> &val_var_states = (*map)[Val];
+			for (unsigned i = 0; i < val_var_states.size(); i++) {
+				val_var_states[i].escaped = true;
 			}
 		}
+	} else if (LoadInst * LI = dyn_cast<LoadInst>(I)) {
+		Value * Addr = LI->getPointerOperand();
+
+		if (Addr->getType()->isPointerTy() && LI->getType()->isPointerTy() &&
+			mayInHeap(Addr)) {
+
+			std::vector<struct VarState> &var_states = (*map)[LI];
+			if (var_states.size() == 0) {
+				struct VarState state;
+				state.s = PMState::UNFLUSHED;
+				state.escaped = true;
+				var_states.push_back(state);
+
+#ifdef PMROBUST_DEBUG
+				value_list.push_back(LI);
+#endif
+			} else if (var_states.size() == 1) {
+				var_states[0].escaped = true;
+			} else
+				assert(false && "Store to an object with several fields\n");
+		}
+		//errs() << "Load Inst: " << *LI << "\n";
+		//errs() << "Load Addr: " << *Addr << "\t";
+		//errs() << "Load Addr Type: " << *Ty << "\n";
+		//errs() << "Load Type: " << *LI->getType() << "\n";
 	} else {
 		ret = false;
 	}

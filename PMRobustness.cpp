@@ -85,18 +85,19 @@ namespace {
 		StringRef getPassName() const override;
 		bool runOnFunction(Function &F) override;
 		void getAnalysisUsage(AnalysisUsage &AU) const override;
-
 		void analyze(Function &F);
-		void copyState(state_t * src, state_t * dst);
-		void copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst);
-		bool update(state_t * map, Instruction * I);
-		bool isPMAddr(Value * addr) { return true; }
 
 		static char ID;
 		//AliasAnalysis *AA;
 		AndersenAAResult *AA;
 
 	private:
+		void copyState(state_t * src, state_t * dst);
+		void copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst);
+		bool update(state_t * map, Instruction * I);
+
+		bool isPMAddr(Value * addr) { return true; }
+		bool mayInHeap(Value * addr);
 		void printMap(state_t * map);
 		void test();
 
@@ -298,6 +299,17 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			} else
 				assert(false && "Store to an object with several fields\n");
 		}
+
+		Value * Val = SI->getValueOperand();
+		/* Rule 2: *x = p (where x is a heap address) => all fields of p escapes */
+		if (Val->getType()->isPointerTy()) {
+			if (mayInHeap(Addr)) {
+				std::vector<struct VarState> &val_var_states = (*map)[Val];
+				for (unsigned i = 0; i < val_var_states.size(); i++) {
+					val_var_states[i].escaped = true;
+				}
+			}
+		}
 	} else {
 		ret = false;
 	}
@@ -314,6 +326,30 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 	AU.setPreservesAll();
 	//AU.addRequired<AAResultsWrapperPass>();
 	AU.addRequired<AndersenAAWrapperPass>();
+}
+
+/** Simple may-analysis for checking if an address is in the heap
+ *  TODO: may need more sophisticated checks
+ **/
+bool PMRobustness::mayInHeap(Value * addr) {
+	if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(addr)) {
+		Value * BaseAddr = GEP->getPointerOperand();
+
+		for (auto &u : BaseAddr->uses()) {
+			if (isa<AllocaInst>(u)) {
+				return false;
+			}
+		}
+	} else {
+		for (auto &u : addr->uses()) {
+			if (isa<AllocaInst>(u)) {
+				return false;
+			}
+		}
+	}
+
+	// Address may be in the heap. We don't know for sure.
+	return true;
 }
 
 void PMRobustness::printMap(state_t * map) {

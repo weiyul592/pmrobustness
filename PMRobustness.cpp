@@ -32,12 +32,13 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils.h"
-#include "andersen/include/AndersenAA.h"
+//#include "andersen/include/AndersenAA.h"
 //#include "llvm/Analysis/AliasAnalysis.h"
 
 #include <cassert>
@@ -79,6 +80,22 @@ void printVarState(VarState &state) {
 	else errs() << "captured>";
 }
 
+static inline Value *getPosition( Instruction * I, IRBuilder <> IRB, bool print = false)
+{
+	const DebugLoc & debug_location = I->getDebugLoc ();
+	std::string position_string;
+	{
+		llvm::raw_string_ostream position_stream (position_string);
+		debug_location . print (position_stream);
+	}
+
+	if (print) {
+		errs() << position_string << "\n";
+	}
+
+	return IRB.CreateGlobalStringPtr (position_string);
+}
+
 namespace {
 	struct PMRobustness : public FunctionPass {
 		PMRobustness() : FunctionPass(ID) {}
@@ -89,7 +106,7 @@ namespace {
 
 		static char ID;
 		//AliasAnalysis *AA;
-		AndersenAAResult *AA;
+		//AndersenAAResult *AA;
 
 	private:
 		void copyState(state_t * src, state_t * dst);
@@ -103,6 +120,9 @@ namespace {
 
 		std::vector<Value *> value_list;
 		DenseMap<const Instruction *, state_t * > States;
+
+		std::vector<BasicBlock *> unprocessed_blocks;
+		std::list<BasicBlock *> WorkList;
 	};
 }
 
@@ -112,7 +132,7 @@ StringRef PMRobustness::getPassName() const {
 
 bool PMRobustness::runOnFunction(Function &F) {
 	//AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
-	AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
+	//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
 
 	analyze(F);
 
@@ -120,11 +140,9 @@ bool PMRobustness::runOnFunction(Function &F) {
 }
 
 void PMRobustness::analyze(Function &F) {
-	if (F.getName() == "main") {
+	if (true) {
 		//F.dump();
-		//errs() << "\n--------\n\n";
-
-		std::list<BasicBlock *> WorkList;
+		errs() << F.getName() << "\n------\n";
 
 		// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 		DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
@@ -134,6 +152,8 @@ void PMRobustness::analyze(Function &F) {
 		while (!WorkList.empty()) {
 			BasicBlock *block = WorkList.front();
 			WorkList.pop_front();
+
+			errs() << "processing block: "<< block << "\n";
 
 			bool changed = false;
 			BasicBlock::iterator prev = block->begin();
@@ -182,8 +202,8 @@ void PMRobustness::analyze(Function &F) {
 				if (succ_list == NULL) {
 					succ_list = new SmallPtrSet<BasicBlock *, 8>();
 					block_successors[block] = succ_list;
-					for (BasicBlock *pred : successors(block)) {
-						succ_list->insert(pred);
+					for (BasicBlock *succ : successors(block)) {
+						succ_list->insert(succ);
 					}
 				}
 
@@ -205,6 +225,11 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = States[pred->getTerminator()];
+		if (s == NULL) {
+			WorkList.push_back(pred);
+			continue;
+		}
+
 		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
 			state_t::iterator item = map.find(it->first);
 			if (item != map.end()) {
@@ -243,7 +268,7 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 }
 
 bool PMRobustness::update(state_t * map, Instruction * I) {
-	bool ret = true;
+	bool updated = false;
 
 	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
 		/* Rule 1: x.f = v => x.f becomes dirty */
@@ -269,19 +294,15 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				if (var_states.size() < index + 1)
 					var_states.resize(index + 1);
 
-				var_states[index].s = PMState::UNFLUSHED;
-				var_states[0].s = PMState::UNFLUSHED;
-/*
-				errs() << "SI" << *SI << "\n";
-				errs() << "store Addr -> " << *Addr << "\t";
-				errs() << "GEP Base Addr -> " << *BaseAddr << "\n";
-				errs() << "var size -> " << var_states.size() << "\n";
-*/
+				if (var_states[index].s != PMState::UNFLUSHED ||
+							var_states[0].s != PMState::UNFLUSHED) {
+					var_states[index].s = PMState::UNFLUSHED;
+					var_states[0].s = PMState::UNFLUSHED;
+					updated = true;
+				}
 			} else {
 				assert("Non constant offset\n");
 			}
-		} else if (isa<AllocaInst>(Addr)){
-			assert(false && "Non-promotable AllocaInst Encountered; fix it here!\n");
 		} else {
 			std::vector<struct VarState> &var_states = (*map)[Addr];
 			if (var_states.size() == 0) {
@@ -293,25 +314,31 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				value_list.push_back(Addr);
 #endif
 			} else if (var_states.size() == 1) {
-				var_states[0].s = PMState::UNFLUSHED;
-			} else
+				if (var_states[0].s != PMState::UNFLUSHED) {
+					var_states[0].s = PMState::UNFLUSHED;
+					updated = true;
+				}
+			} else {
 				assert(false && "Store to an object with several fields\n");
+			}
 		}
 
 		Value * Val = SI->getValueOperand();
-		/* Rule 2: *x = p (where x is a heap address) => all fields of p escapes */
+		/* Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes */
 		if (Val->getType()->isPointerTy() && mayInHeap(Addr)) {
 			std::vector<struct VarState> &val_var_states = (*map)[Val];
 			for (unsigned i = 0; i < val_var_states.size(); i++) {
-				val_var_states[i].escaped = true;
+				if (!val_var_states[i].escaped) {
+					val_var_states[i].escaped = true;
+					updated = true;
+				}
 			}
 		}
 	} else if (LoadInst * LI = dyn_cast<LoadInst>(I)) {
+		/* Rule 2.2: x = *p (where p is a heap address) => x escapes */
 		Value * Addr = LI->getPointerOperand();
 
-		if (Addr->getType()->isPointerTy() && LI->getType()->isPointerTy() &&
-			mayInHeap(Addr)) {
-
+		if (LI->getType()->isPointerTy() && mayInHeap(Addr)) {
 			std::vector<struct VarState> &var_states = (*map)[LI];
 			if (var_states.size() == 0) {
 				struct VarState state;
@@ -323,30 +350,28 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				value_list.push_back(LI);
 #endif
 			} else if (var_states.size() == 1) {
-				var_states[0].escaped = true;
-			} else
-				assert(false && "Store to an object with several fields\n");
+				if (!var_states[0].escaped) {
+					var_states[0].escaped = true;
+					updated = true;
+				}
+			} else {
+				//assert(false && "Store to an object with several fields\n");
+			}
 		}
-		//errs() << "Load Inst: " << *LI << "\n";
-		//errs() << "Load Addr: " << *Addr << "\t";
-		//errs() << "Load Addr Type: " << *Ty << "\n";
-		//errs() << "Load Type: " << *LI->getType() << "\n";
-	} else {
-		ret = false;
 	}
 
-	if (ret) {
+	if (updated) {
 		//errs() << "After " << *I << "\n";
 		//printMap(map);
 	}
 
-	return ret;
+	return updated;
 }
 
 void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 	AU.setPreservesAll();
 	//AU.addRequired<AAResultsWrapperPass>();
-	AU.addRequired<AndersenAAWrapperPass>();
+	//AU.addRequired<AndersenAAWrapperPass>();
 }
 
 /** Simple may-analysis for checking if an address is in the heap

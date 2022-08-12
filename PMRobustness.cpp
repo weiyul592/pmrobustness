@@ -170,8 +170,11 @@ void PMRobustness::analyze(Function &F) {
 					// First instruction; take the union of predecessors' states
 					if (BasicBlock *pred = block->getUniquePredecessor()) {
 						// Unique predecessor; copy the state of last instruction in the pred block
-						Instruction * last = pred->getTerminator();
-						copyState(States[last], state);
+						state_t * prev_s = States[pred->getTerminator()];
+						if (prev_s == NULL)
+							WorkList.push_back(pred);
+						else
+							copyState(prev_s, state);
 					} else {
 						// Multiple predecessors
 						SmallPtrSet<BasicBlock *, 8> *pred_list = block_predecessors[block];

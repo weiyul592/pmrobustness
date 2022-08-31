@@ -22,79 +22,36 @@
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/Analysis/MemoryLocation.h"
+//#include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/CFG.h"
-#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils.h"
+#include "PMRobustness.h"
 //#include "andersen/include/AndersenAA.h"
 //#include "llvm/Analysis/AliasAnalysis.h"
 
 #include <cassert>
 
-using namespace llvm;
-
 #define PMROBUST_DEBUG
 #define DEBUG_TYPE "PMROBUST_DEBUG"
 #include <llvm/IR/DebugLoc.h>
-
-/**
- * Object with 3 fields: vector -> [object status, field 1, field 2, field 3]
- * TODO: may need to track the size of fields
- * TODO: need to change data structure?
- **/
-typedef DenseMap<Value *, std::vector<struct VarState>> state_t;
-
-enum class PMState {
-	UNFLUSHED = 0x1,
-	CLWB = 0x11,
-	FLUSHED = 0x111
-};
-
-struct VarState {
-	PMState s = PMState::FLUSHED;
-	bool escaped = false;
-};
-
-void printVarState(VarState &state) {
-	errs() << "<";
-	if (state.s == PMState::UNFLUSHED)
-		errs() << "Unflushed,";
-	else if (state.s == PMState::CLWB)
-		errs() << "CLWB,";
-	else
-		errs() << "Flushed,";
-
-	if (state.escaped) errs() << "escaped>";
-	else errs() << "captured>";
-}
-
-static inline Value *getPosition( Instruction * I, IRBuilder <> IRB, bool print = false)
-{
-	const DebugLoc & debug_location = I->getDebugLoc ();
-	std::string position_string;
-	{
-		llvm::raw_string_ostream position_stream (position_string);
-		debug_location . print (position_stream);
-	}
-
-	if (print) {
-		errs() << position_string << "\n";
-	}
-
-	return IRB.CreateGlobalStringPtr (position_string);
-}
 
 namespace {
 	struct PMRobustness : public FunctionPass {
@@ -115,6 +72,15 @@ namespace {
 
 		bool isPMAddr(Value * addr) { return true; }
 		bool mayInHeap(Value * addr);
+
+		const Value * GetLinearExpression(
+		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
+		    unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
+		    AssumptionCache *AC, DominatorTree *DT, bool &NSW, bool &NUW);
+
+		bool DecomposeGEPExpression(const Value *V, DecomposedGEP &Decomposed,
+			const DataLayout &DL, AssumptionCache *AC, DominatorTree *DT);
+
 		void printMap(state_t * map);
 		void test();
 
@@ -123,6 +89,8 @@ namespace {
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> WorkList;
+
+		unsigned MaxLookupSearchDepth = 100;
 	};
 }
 
@@ -153,8 +121,7 @@ void PMRobustness::analyze(Function &F) {
 			BasicBlock *block = WorkList.front();
 			WorkList.pop_front();
 
-			errs() << "processing block: "<< block << "\n";
-
+			//errs() << "processing block: "<< block << "\n";
 			bool changed = false;
 			BasicBlock::iterator prev = block->begin();
 			for (BasicBlock::iterator it = block->begin(); it != block->end();) {
@@ -272,6 +239,20 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 
 bool PMRobustness::update(state_t * map, Instruction * I) {
 	bool updated = false;
+	IRBuilder<> IRB(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+
+    if (MemSetInst *M = dyn_cast<MemSetInst>(I)) {
+		// TODO
+		//errs() << "memset addr: " << M->getArgOperand(0) << "\t";
+		//errs() << "const bit: " << *M->getArgOperand(1) << "\t";
+		//errs() << "size: " << *M->getArgOperand(2) << "\n\n";
+    } else if (MemTransferInst *M = dyn_cast<MemTransferInst>(I)) {
+		// TODO
+		//errs() << "memcpy addr: " << M->getArgOperand(0) << "\t";
+		//errs() << "const bit: " << *M->getArgOperand(1) << "\t";
+		//errs() << "size: " << *M->getArgOperand(2) << "\n\n";
+    }
 
 	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
 		/* Rule 1: x.f = v => x.f becomes dirty */
@@ -280,6 +261,30 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		// TODO: Address check to be implemented
 		if (!isPMAddr(Addr))
 			return false;
+
+		DecomposedGEP DecompGEP;
+		unsigned MaxPointerSize = getMaxPointerSize(DL);
+		DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
+		bool GEPMaxLookupReached = DecomposeGEPExpression(Addr, DecompGEP, DL, NULL, NULL);
+		if (!GEPMaxLookupReached) {
+			if (DecompGEP.StructOffset.ugt(8)) {
+			    Type *OrigPtrTy = Addr->getType();
+			    Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
+			    assert(OrigTy->isSized());
+				uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
+
+				//errs() << "Store Base: " << DecompGEP.Base << "\t";
+				//errs() << "Struct Offset: " << DecompGEP.StructOffset << "\t";
+				//errs() << "Has VarIndices: " << DecompGEP.VarIndices.size() << "\t";
+				//errs() << "Store Size: " << TypeSize << "\n";
+				//errs() << *I << "\n";
+			}
+		} else {
+			errs() << "GEP Max Lookup Reached\n";
+#ifdef PMROBUST_DEBUG
+			assert(false && "GEP Max Lookup Reached; debug\n");
+#endif
+		}
 
 		if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(Addr)) {
 			Value * BaseAddr = GEP->getPointerOperand();
@@ -341,6 +346,23 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		/* Rule 2.2: x = *p (where p is a heap address) => x escapes */
 		Value * Addr = LI->getPointerOperand();
 
+		DecomposedGEP DecompGEP;
+		unsigned MaxPointerSize = getMaxPointerSize(DL);
+		DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
+		bool GEPMaxLookupReached = DecomposeGEPExpression(Addr, DecompGEP, DL, NULL, NULL);
+		if (!GEPMaxLookupReached) {
+			if (DecompGEP.StructOffset.ugt(8)) {
+				//errs() << "Load Base: " << DecompGEP.Base << "\t";
+				//errs() << "Struct Offset: " << DecompGEP.StructOffset << "\t";
+				//errs() << "Has VarIndices: " << DecompGEP.VarIndices.size() << "\n";
+			}
+		} else {
+			errs() << "GEP Max Lookup Reached\n";
+#ifdef PMROBUST_DEBUG
+			assert(false && "GEP Max Lookup Reached; debug\n");
+#endif
+		}
+
 		if (LI->getType()->isPointerTy() && mayInHeap(Addr)) {
 			std::vector<struct VarState> &var_states = (*map)[LI];
 			if (var_states.size() == 0) {
@@ -358,6 +380,9 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 					updated = true;
 				}
 			} else {
+				//errs() << *LI << "\n";
+				//errs() << *LI->getParent() << "\n";
+				//getPosition(LI, IRB, true);
 				//assert(false && "Store to an object with several fields\n");
 			}
 		}
@@ -398,6 +423,374 @@ bool PMRobustness::mayInHeap(Value * addr) {
 	}
 
 	// Address may be in the heap. We don't know for sure.
+	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// GetElementPtr Instruction Decomposition and Analysis
+//===----------------------------------------------------------------------===//
+/// Copied from Analysis/BasicAliasAnalysis.cpp
+/// Analyzes the specified value as a linear expression: "A*V + B", where A and
+/// B are constant integers.
+///
+/// Returns the scale and offset values as APInts and return V as a Value*, and
+/// return whether we looked through any sign or zero extends.  The incoming
+/// Value is known to have IntegerType, and it may already be sign or zero
+/// extended.
+///
+/// Note that this looks through extends, so the high bits may not be
+/// represented in the result.
+const Value *PMRobustness::GetLinearExpression(
+	const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
+	unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
+	AssumptionCache *AC, DominatorTree *DT, bool &NSW, bool &NUW) {
+
+	assert(V->getType()->isIntegerTy() && "Not an integer value");
+	// Limit our recursion depth.
+	if (Depth == 6) {
+		Scale = 1;
+		Offset = 0;
+		return V;
+	}
+
+	if (const ConstantInt *Const = dyn_cast<ConstantInt>(V)) {
+		// If it's a constant, just convert it to an offset and remove the variable.
+		// If we've been called recursively, the Offset bit width will be greater
+		// than the constant's (the Offset's always as wide as the outermost call),
+		// so we'll zext here and process any extension in the isa<SExtInst> &
+		// isa<ZExtInst> cases below.
+		Offset += Const->getValue().zextOrSelf(Offset.getBitWidth());
+		assert(Scale == 0 && "Constant values don't have a scale");
+		return V;
+	}
+
+	if (const BinaryOperator *BOp = dyn_cast<BinaryOperator>(V)) {
+		if (ConstantInt *RHSC = dyn_cast<ConstantInt>(BOp->getOperand(1))) {
+			// If we've been called recursively, then Offset and Scale will be wider
+			// than the BOp operands. We'll always zext it here as we'll process sign
+			// extensions below (see the isa<SExtInst> / isa<ZExtInst> cases).
+			APInt RHS = RHSC->getValue().zextOrSelf(Offset.getBitWidth());
+
+			switch (BOp->getOpcode()) {
+			default:
+				// We don't understand this instruction, so we can't decompose it any
+				// further.
+				Scale = 1;
+				Offset = 0;
+				return V;
+			case Instruction::Or:
+				// X|C == X+C if all the bits in C are unset in X.	Otherwise we can't
+				// analyze it.
+				if (!MaskedValueIsZero(BOp->getOperand(0), RHSC->getValue(), DL, 0, AC,
+						 BOp, DT)) {
+					Scale = 1;
+					Offset = 0;
+					return V;
+				}
+				LLVM_FALLTHROUGH;
+			case Instruction::Add:
+				V = GetLinearExpression(BOp->getOperand(0), Scale, Offset, ZExtBits,
+						SExtBits, DL, Depth + 1, AC, DT, NSW, NUW);
+				Offset += RHS;
+				break;
+			case Instruction::Sub:
+				V = GetLinearExpression(BOp->getOperand(0), Scale, Offset, ZExtBits,
+						SExtBits, DL, Depth + 1, AC, DT, NSW, NUW);
+				Offset -= RHS;
+				break;
+			case Instruction::Mul:
+				V = GetLinearExpression(BOp->getOperand(0), Scale, Offset, ZExtBits,
+						SExtBits, DL, Depth + 1, AC, DT, NSW, NUW);
+				Offset *= RHS;
+				Scale *= RHS;
+				break;
+			case Instruction::Shl:
+				V = GetLinearExpression(BOp->getOperand(0), Scale, Offset, ZExtBits,
+						SExtBits, DL, Depth + 1, AC, DT, NSW, NUW);
+
+				// We're trying to linearize an expression of the kind:
+				//	 shl i8 -128, 36
+				// where the shift count exceeds the bitwidth of the type.
+				// We can't decompose this further (the expression would return
+				// a poison value).
+				if (Offset.getBitWidth() < RHS.getLimitedValue() ||
+						Scale.getBitWidth() < RHS.getLimitedValue()) {
+					Scale = 1;
+					Offset = 0;
+					return V;
+				}
+
+				Offset <<= RHS.getLimitedValue();
+				Scale <<= RHS.getLimitedValue();
+				// the semantics of nsw and nuw for left shifts don't match those of
+				// multiplications, so we won't propagate them.
+				NSW = NUW = false;
+				return V;
+			}
+
+			if (isa<OverflowingBinaryOperator>(BOp)) {
+				NUW &= BOp->hasNoUnsignedWrap();
+				NSW &= BOp->hasNoSignedWrap();
+			}
+			return V;
+		}
+	}
+
+	// Since GEP indices are sign extended anyway, we don't care about the high
+	// bits of a sign or zero extended value - just scales and offsets.	The
+	// extensions have to be consistent though.
+	if (isa<SExtInst>(V) || isa<ZExtInst>(V)) {
+		Value *CastOp = cast<CastInst>(V)->getOperand(0);
+		unsigned NewWidth = V->getType()->getPrimitiveSizeInBits();
+		unsigned SmallWidth = CastOp->getType()->getPrimitiveSizeInBits();
+		unsigned OldZExtBits = ZExtBits, OldSExtBits = SExtBits;
+		const Value *Result =
+				GetLinearExpression(CastOp, Scale, Offset, ZExtBits, SExtBits, DL,
+					Depth + 1, AC, DT, NSW, NUW);
+
+		// zext(zext(%x)) == zext(%x), and similarly for sext; we'll handle this
+		// by just incrementing the number of bits we've extended by.
+		unsigned ExtendedBy = NewWidth - SmallWidth;
+
+		if (isa<SExtInst>(V) && ZExtBits == 0) {
+			// sext(sext(%x, a), b) == sext(%x, a + b)
+
+			if (NSW) {
+				// We haven't sign-wrapped, so it's valid to decompose sext(%x + c)
+				// into sext(%x) + sext(c). We'll sext the Offset ourselves:
+				unsigned OldWidth = Offset.getBitWidth();
+				Offset = Offset.trunc(SmallWidth).sext(NewWidth).zextOrSelf(OldWidth);
+			} else {
+				// We may have signed-wrapped, so don't decompose sext(%x + c) into
+				// sext(%x) + sext(c)
+				Scale = 1;
+				Offset = 0;
+				Result = CastOp;
+				ZExtBits = OldZExtBits;
+				SExtBits = OldSExtBits;
+			}
+			SExtBits += ExtendedBy;
+		} else {
+			// sext(zext(%x, a), b) = zext(zext(%x, a), b) = zext(%x, a + b)
+
+			if (!NUW) {
+				// We may have unsigned-wrapped, so don't decompose zext(%x + c) into
+				// zext(%x) + zext(c)
+				Scale = 1;
+				Offset = 0;
+				Result = CastOp;
+				ZExtBits = OldZExtBits;
+				SExtBits = OldSExtBits;
+			}
+			ZExtBits += ExtendedBy;
+		}
+
+		return Result;
+	}
+
+	Scale = 1;
+	Offset = 0;
+	return V;
+}
+
+/// If V is a symbolic pointer expression, decompose it into a base pointer
+/// with a constant offset and a number of scaled symbolic offsets.
+///
+/// The scaled symbolic offsets (represented by pairs of a Value* and a scale
+/// in the VarIndices vector) are Value*'s that are known to be scaled by the
+/// specified amount, but which may have other unrepresented high bits. As
+/// such, the gep cannot necessarily be reconstructed from its decomposed form.
+///
+/// When DataLayout is around, this function is capable of analyzing everything
+/// that GetUnderlyingObject can look through. To be able to do that
+/// GetUnderlyingObject and DecomposeGEPExpression must use the same search
+/// depth (MaxLookupSearchDepth). When DataLayout not is around, it just looks
+/// through pointer casts.
+bool PMRobustness::DecomposeGEPExpression(const Value *V,
+		DecomposedGEP &Decomposed, const DataLayout &DL, AssumptionCache *AC,
+		DominatorTree *DT) {
+	// Limit recursion depth to limit compile time in crazy cases.
+	unsigned MaxLookup = MaxLookupSearchDepth;
+	//SearchTimes++;
+
+	unsigned MaxPointerSize = getMaxPointerSize(DL);
+	Decomposed.VarIndices.clear();
+	do {
+		// See if this is a bitcast or GEP.
+		const Operator *Op = dyn_cast<Operator>(V);
+		if (!Op) {
+			// The only non-operator case we can handle are GlobalAliases.
+			if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(V)) {
+				if (!GA->isInterposable()) {
+					V = GA->getAliasee();
+					continue;
+				}
+			}
+			Decomposed.Base = V;
+			return false;
+		}
+
+		if (Op->getOpcode() == Instruction::BitCast ||
+				Op->getOpcode() == Instruction::AddrSpaceCast) {
+			V = Op->getOperand(0);
+			continue;
+		}
+
+		const GEPOperator *GEPOp = dyn_cast<GEPOperator>(Op);
+		if (!GEPOp) {
+			if (const auto *Call = dyn_cast<CallBase>(V)) {
+				// CaptureTracking can know about special capturing properties of some
+				// intrinsics like launder.invariant.group, that can't be expressed with
+				// the attributes, but have properties like returning aliasing pointer.
+				// Because some analysis may assume that nocaptured pointer is not
+				// returned from some special intrinsic (because function would have to
+				// be marked with returns attribute), it is crucial to use this function
+				// because it should be in sync with CaptureTracking. Not using it may
+				// cause weird miscompilations where 2 aliasing pointers are assumed to
+				// noalias.
+				if (auto *RP = getArgumentAliasingToReturnedPointer(Call)) {
+					V = RP;
+					continue;
+				}
+			}
+
+			// If it's not a GEP, hand it off to SimplifyInstruction to see if it
+			// can come up with something. This matches what GetUnderlyingObject does.
+			if (const Instruction *I = dyn_cast<Instruction>(V))
+				// TODO: Get a DominatorTree and AssumptionCache and use them here
+				// (these are both now available in this function, but this should be
+				// updated when GetUnderlyingObject is updated). TLI should be
+				// provided also.
+				if (const Value *Simplified =
+								SimplifyInstruction(const_cast<Instruction *>(I), DL)) {
+					V = Simplified;
+					continue;
+				}
+
+			Decomposed.Base = V;
+			return false;
+		}
+
+		// Don't attempt to analyze GEPs over unsized objects.
+		if (!GEPOp->getSourceElementType()->isSized()) {
+			Decomposed.Base = V;
+			return false;
+		}
+
+		unsigned AS = GEPOp->getPointerAddressSpace();
+		// Walk the indices of the GEP, accumulating them into BaseOff/VarIndices.
+		gep_type_iterator GTI = gep_type_begin(GEPOp);
+		unsigned PointerSize = DL.getPointerSizeInBits(AS);
+		// Assume all GEP operands are constants until proven otherwise.
+		bool GepHasConstantOffset = true;
+		for (User::const_op_iterator I = GEPOp->op_begin() + 1, E = GEPOp->op_end();
+				 I != E; ++I, ++GTI) {
+			const Value *Index = *I;
+			// Compute the (potentially symbolic) offset in bytes for this index.
+			if (StructType *STy = GTI.getStructTypeOrNull()) {
+				// For a struct, add the member offset.
+				unsigned FieldNo = cast<ConstantInt>(Index)->getZExtValue();
+				if (FieldNo == 0)
+					continue;
+
+				Decomposed.StructOffset +=
+					DL.getStructLayout(STy)->getElementOffset(FieldNo);
+				continue;
+			}
+
+			// For an array/pointer, add the element offset, explicitly scaled.
+			if (const ConstantInt *CIdx = dyn_cast<ConstantInt>(Index)) {
+				if (CIdx->isZero())
+					continue;
+				Decomposed.OtherOffset +=
+					(DL.getTypeAllocSize(GTI.getIndexedType()) *
+						CIdx->getValue().sextOrSelf(MaxPointerSize))
+						.sextOrTrunc(MaxPointerSize);
+				continue;
+			}
+
+			GepHasConstantOffset = false;
+
+			APInt Scale(MaxPointerSize, DL.getTypeAllocSize(GTI.getIndexedType()));
+			unsigned ZExtBits = 0, SExtBits = 0;
+
+			// If the integer type is smaller than the pointer size, it is implicitly
+			// sign extended to pointer size.
+			unsigned Width = Index->getType()->getIntegerBitWidth();
+			if (PointerSize > Width)
+				SExtBits += PointerSize - Width;
+
+			// Use GetLinearExpression to decompose the index into a C1*V+C2 form.
+			APInt IndexScale(Width, 0), IndexOffset(Width, 0);
+			bool NSW = true, NUW = true;
+			const Value *OrigIndex = Index;
+			Index = GetLinearExpression(Index, IndexScale, IndexOffset, ZExtBits,
+																	SExtBits, DL, 0, AC, DT, NSW, NUW);
+
+			// The GEP index scale ("Scale") scales C1*V+C2, yielding (C1*V+C2)*Scale.
+			// This gives us an aggregate computation of (C1*Scale)*V + C2*Scale.
+
+			// It can be the case that, even through C1*V+C2 does not overflow for
+			// relevant values of V, (C2*Scale) can overflow. In that case, we cannot
+			// decompose the expression in this way.
+			//
+			// FIXME: C1*Scale and the other operations in the decomposed
+			// (C1*Scale)*V+C2*Scale can also overflow. We should check for this
+			// possibility.
+			APInt WideScaledOffset = IndexOffset.sextOrTrunc(MaxPointerSize*2) *
+																 Scale.sext(MaxPointerSize*2);
+			if (WideScaledOffset.getMinSignedBits() > MaxPointerSize) {
+				Index = OrigIndex;
+				IndexScale = 1;
+				IndexOffset = 0;
+
+				ZExtBits = SExtBits = 0;
+				if (PointerSize > Width)
+					SExtBits += PointerSize - Width;
+			} else {
+				Decomposed.OtherOffset += IndexOffset.sextOrTrunc(MaxPointerSize) * Scale;
+				Scale *= IndexScale.sextOrTrunc(MaxPointerSize);
+			}
+
+			// If we already had an occurrence of this index variable, merge this
+			// scale into it.	For example, we want to handle:
+			//	 A[x][x] -> x*16 + x*4 -> x*20
+			// This also ensures that 'x' only appears in the index list once.
+			for (unsigned i = 0, e = Decomposed.VarIndices.size(); i != e; ++i) {
+				if (Decomposed.VarIndices[i].V == Index &&
+						Decomposed.VarIndices[i].ZExtBits == ZExtBits &&
+						Decomposed.VarIndices[i].SExtBits == SExtBits) {
+					Scale += Decomposed.VarIndices[i].Scale;
+					Decomposed.VarIndices.erase(Decomposed.VarIndices.begin() + i);
+					break;
+				}
+			}
+
+			// Make sure that we have a scale that makes sense for this target's
+			// pointer size.
+			Scale = adjustToPointerSize(Scale, PointerSize);
+
+			if (!!Scale) {
+				VariableGEPIndex Entry = {Index, ZExtBits, SExtBits, Scale};
+				Decomposed.VarIndices.push_back(Entry);
+			}
+		}
+
+		// Take care of wrap-arounds
+		if (GepHasConstantOffset) {
+			Decomposed.StructOffset =
+					adjustToPointerSize(Decomposed.StructOffset, PointerSize);
+			Decomposed.OtherOffset =
+					adjustToPointerSize(Decomposed.OtherOffset, PointerSize);
+		}
+
+		// Analyze the base pointer next.
+		V = GEPOp->getOperand(0);
+	} while (--MaxLookup);
+
+	// If the chain of expressions is too deep, just return early.
+	Decomposed.Base = V;
+	//SearchLimitReached++;
 	return true;
 }
 

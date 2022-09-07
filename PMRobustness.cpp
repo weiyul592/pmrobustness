@@ -20,9 +20,6 @@
 // The rest is handled by the run-time library.
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ADT/Statistic.h"
-#include "llvm/ADT/SmallString.h"
-//#include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/InstructionSimplify.h"
@@ -47,8 +44,6 @@
 //#include "andersen/include/AndersenAA.h"
 //#include "llvm/Analysis/AliasAnalysis.h"
 
-#include <cassert>
-
 #define PMROBUST_DEBUG
 #define DEBUG_TYPE "PMROBUST_DEBUG"
 #include <llvm/IR/DebugLoc.h>
@@ -70,22 +65,28 @@ namespace {
 		void copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst);
 		bool update(state_t * map, Instruction * I);
 
-		bool isPMAddr(Value * addr) { return true; }
-		bool mayInHeap(Value * addr);
+		bool isPMAddr(const Value * Addr) { return true; }
+		bool mayInHeap(const Value * Addr);
+
+		void decomposeGEPAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
 		    unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
-		    AssumptionCache *AC, DominatorTree *DT, bool &NSW, bool &NUW);
+		    AssumptionCache *AC, DominatorTree *DT, bool &NSW, bool &NUW
+		);
 
 		bool DecomposeGEPExpression(const Value *V, DecomposedGEP &Decomposed,
-			const DataLayout &DL, AssumptionCache *AC, DominatorTree *DT);
+			const DataLayout &DL, AssumptionCache *AC, DominatorTree *DT
+		);
+
+		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
 
 		void printMap(state_t * map);
 		void test();
 
-		std::vector<Value *> value_list;
-		DenseMap<const Instruction *, state_t * > States;
+		std::vector<const Value *> value_list;
+		DenseMap<const Instruction *, state_t *> States;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> WorkList;
@@ -109,8 +110,8 @@ bool PMRobustness::runOnFunction(Function &F) {
 
 void PMRobustness::analyze(Function &F) {
 	if (true) {
-		//F.dump();
 		errs() << F.getName() << "\n------\n";
+		F.dump();
 
 		// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 		DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
@@ -185,13 +186,21 @@ void PMRobustness::analyze(Function &F) {
 	}
 }
 
+// DenseMap<Value *, ob_state_t *> state_t;
 void PMRobustness::copyState(state_t * src, state_t * dst) {
-	for (state_t::iterator it = src->begin(); it != src->end(); it++)
-		(*dst)[it->first] = it->second;
+	for (state_t::iterator it = src->begin(); it != src->end(); it++) {
+		ob_state_t *object_state = (*dst)[it->first];
+		if (object_state == NULL) {
+			object_state = new ob_state_t(it->second);
+			(*dst)[it->first] = object_state;
+		} else
+			(*dst)[it->first]->copyFrom(it->second);
+	}
 }
 
 void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
-	state_t map;
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
+		(*dst)[it->first]->size = 0;
 
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = States[pred->getTerminator()];
@@ -200,41 +209,26 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 			continue;
 		}
 
+		//DenseMap<Value *, ob_state_t *> state_t;
 		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
-			state_t::iterator item = map.find(it->first);
-			if (item != map.end()) {
+			state_t::iterator item = dst->find(it->first);
+			if (item != dst->end()) {
 				// (Loc, vector<VarState>) pair found
-				std::vector<struct VarState> &var_state_listA = item->second;
-				std::vector<struct VarState> &var_state_listB = it->second;
-				if (var_state_listA.size() < var_state_listB.size()) {
-					unsigned old_size = var_state_listA.size();
-					var_state_listA.resize(var_state_listB.size());
-					// Merge states already in listA
-					for (unsigned i = 0; i < old_size; i++) {
-						int tmp = static_cast<int>(var_state_listA[i].s) & static_cast<int>(var_state_listB[i].s);
-						var_state_listA[i].s = static_cast<PMState>(tmp);
-						var_state_listA[i].escaped |= var_state_listB[i].escaped;
-					}
+				ob_state_t *A = item->second;
+				ob_state_t *B = it->second;
 
-					// Copy states from listB to listA for the remaining indices
-					for (unsigned i = old_size; i < var_state_listB.size(); i++) {
-						var_state_listA[i] = var_state_listB[i];
-					}
+				if (A->getSize() == 0) {
+					A->setSize(B->getSize());
+					A->copyFrom(B);
 				} else {
-					// Merge states in listB to states in listA
-					for (unsigned i = 0; i < var_state_listB.size(); i++) {
-						int tmp = static_cast<int>(var_state_listA[i].s) & static_cast<int>(var_state_listB[i].s);
-						var_state_listA[i].s = static_cast<PMState>(tmp);
-						var_state_listA[i].escaped |= var_state_listB[i].escaped;
-					}
+					A->mergeFrom(B);
 				}
 			} else {
-				map[it->first] = it->second;
+				(*dst)[it->first] = new ob_state_t(it->second);
+				//map[it->first] = it->second;
 			}
 		}
 	}
-
-	copyState(&map, dst);
 }
 
 bool PMRobustness::update(state_t * map, Instruction * I) {
@@ -249,13 +243,10 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		//errs() << "size: " << *M->getArgOperand(2) << "\n\n";
     } else if (MemTransferInst *M = dyn_cast<MemTransferInst>(I)) {
 		// TODO
-		//errs() << "memcpy addr: " << M->getArgOperand(0) << "\t";
-		//errs() << "const bit: " << *M->getArgOperand(1) << "\t";
-		//errs() << "size: " << *M->getArgOperand(2) << "\n\n";
     }
 
 	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
-		/* Rule 1: x.f = v => x.f becomes dirty */
+		// Rule 1: x.f = v => x.f becomes dirty
 		Value * Addr = SI->getPointerOperand();
 
 		// TODO: Address check to be implemented
@@ -263,137 +254,102 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			return false;
 
 		DecomposedGEP DecompGEP;
-		unsigned MaxPointerSize = getMaxPointerSize(DL);
-		DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
-		bool GEPMaxLookupReached = DecomposeGEPExpression(Addr, DecompGEP, DL, NULL, NULL);
-		if (!GEPMaxLookupReached) {
-			if (DecompGEP.StructOffset.ugt(8)) {
-			    Type *OrigPtrTy = Addr->getType();
-			    Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
-			    assert(OrigTy->isSized());
-				uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
-
-				//errs() << "Store Base: " << DecompGEP.Base << "\t";
-				//errs() << "Struct Offset: " << DecompGEP.StructOffset << "\t";
-				//errs() << "Has VarIndices: " << DecompGEP.VarIndices.size() << "\t";
-				//errs() << "Store Size: " << TypeSize << "\n";
-				//errs() << *I << "\n";
-			}
+		decomposeGEPAddress(DecompGEP, Addr, DL);
+		if (DecompGEP.isArray) {
+			//errs() << I->getFunction()->getName() << "\n";
+			errs() << "Array encountered\t";
+			errs() << "Addr: " << *Addr << "\n";
+			//errs() << *I << "\n";
+			//getPosition(I, IRB, true);
 		} else {
-			errs() << "GEP Max Lookup Reached\n";
+			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+			unsigned offset = DecompGEP.getOffsets();
+
+			// printDecomposedGEP(DecomposedGEP &Decom);
+			ob_state_t *object_state = (*map)[DecompGEP.Base];
+			if (object_state == NULL) {
+				object_state = new ob_state_t(offset + TypeSize);
+				(*map)[DecompGEP.Base] = object_state;
 #ifdef PMROBUST_DEBUG
-			assert(false && "GEP Max Lookup Reached; debug\n");
+				value_list.push_back(DecompGEP.Base);
 #endif
+				updated |= true;
+			}
+
+			if (object_state->getSize() < offset + TypeSize) {
+				object_state->resize(offset + TypeSize);
+			}
+
+			updated |= object_state->setDirty(offset, TypeSize);
 		}
 
-		if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(Addr)) {
-			Value * BaseAddr = GEP->getPointerOperand();
-			std::vector<struct VarState> &var_states = (*map)[BaseAddr];
-
-			unsigned LastOperandIdx = GEP->getNumOperands() - 1;
-			Value *LastOperand = GEP->getOperand(LastOperandIdx);
-			if (ConstantInt *offset = dyn_cast<ConstantInt>(LastOperand)) {
-#ifdef PMROBUST_DEBUG
-				if (var_states.size() == 0) {
-					value_list.push_back(BaseAddr);
-				}
-#endif
-				unsigned index = offset->getZExtValue() + 1;	// index = GEP offset + 1
-				if (var_states.size() < index + 1)
-					var_states.resize(index + 1);
-
-				if (var_states[index].s != PMState::UNFLUSHED ||
-							var_states[0].s != PMState::UNFLUSHED) {
-					var_states[index].s = PMState::UNFLUSHED;
-					var_states[0].s = PMState::UNFLUSHED;
-					updated = true;
-				}
-			} else {
-				assert("Non constant offset\n");
-			}
-		} else {
-			std::vector<struct VarState> &var_states = (*map)[Addr];
-			if (var_states.size() == 0) {
-				struct VarState state;
-				state.s = PMState::UNFLUSHED;
-				var_states.push_back(state);
-
-#ifdef PMROBUST_DEBUG
-				value_list.push_back(Addr);
-#endif
-			} else if (var_states.size() == 1) {
-				if (var_states[0].s != PMState::UNFLUSHED) {
-					var_states[0].s = PMState::UNFLUSHED;
-					updated = true;
-				}
-			} else {
-				assert(false && "Store to an object with several fields\n");
-			}
-		}
-
+		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
 		Value * Val = SI->getValueOperand();
-		/* Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes */
 		if (Val->getType()->isPointerTy() && mayInHeap(Addr)) {
-			std::vector<struct VarState> &val_var_states = (*map)[Val];
-			for (unsigned i = 0; i < val_var_states.size(); i++) {
-				if (!val_var_states[i].escaped) {
-					val_var_states[i].escaped = true;
-					updated = true;
-				}
-			}
+			errs() << *SI << "\n";
+			ob_state_t *object_state = (*map)[Val];
+			assert(object_state);
+			updated |= object_state->setEscape(0, object_state->getSize());
+			errs() << "position 2\n";
 		}
 	} else if (LoadInst * LI = dyn_cast<LoadInst>(I)) {
-		/* Rule 2.2: x = *p (where p is a heap address) => x escapes */
+		// Rule 2.2: x = *p (where p is a heap address) => x escapes
 		Value * Addr = LI->getPointerOperand();
 
 		DecomposedGEP DecompGEP;
-		unsigned MaxPointerSize = getMaxPointerSize(DL);
-		DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
-		bool GEPMaxLookupReached = DecomposeGEPExpression(Addr, DecompGEP, DL, NULL, NULL);
-		if (!GEPMaxLookupReached) {
-			if (DecompGEP.StructOffset.ugt(8)) {
-				//errs() << "Load Base: " << DecompGEP.Base << "\t";
-				//errs() << "Struct Offset: " << DecompGEP.StructOffset << "\t";
-				//errs() << "Has VarIndices: " << DecompGEP.VarIndices.size() << "\n";
-			}
+		decomposeGEPAddress(DecompGEP, Addr, DL);
+
+		if (DecompGEP.isArray) {
+			//errs() << I->getFunction()->getName() << "\n";
+			errs() << "Array encountered\t";
+			errs() << "Addr: " << *Addr << "\n";
+			//errs() << *I << "\n";
+			//getPosition(I, IRB, true);
 		} else {
-			errs() << "GEP Max Lookup Reached\n";
-#ifdef PMROBUST_DEBUG
-			assert(false && "GEP Max Lookup Reached; debug\n");
-#endif
-		}
+			if (LI->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
+				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+				unsigned offset = DecompGEP.getOffsets();
 
-		if (LI->getType()->isPointerTy() && mayInHeap(Addr)) {
-			std::vector<struct VarState> &var_states = (*map)[LI];
-			if (var_states.size() == 0) {
-				struct VarState state;
-				state.s = PMState::UNFLUSHED;
-				state.escaped = true;
-				var_states.push_back(state);
-
+				ob_state_t *object_state = (*map)[LI];
+				if (object_state == NULL) {
+					object_state = new ob_state_t(offset + TypeSize);
+					(*map)[DecompGEP.Base] = object_state;
 #ifdef PMROBUST_DEBUG
-				value_list.push_back(LI);
+					value_list.push_back(LI);
 #endif
-			} else if (var_states.size() == 1) {
-				if (!var_states[0].escaped) {
-					var_states[0].escaped = true;
-					updated = true;
 				}
-			} else {
-				//errs() << *LI << "\n";
-				//errs() << *LI->getParent() << "\n";
-				//getPosition(LI, IRB, true);
-				//assert(false && "Store to an object with several fields\n");
+
+				if (object_state->getSize() < offset + TypeSize) {
+					object_state->resize(offset + TypeSize);
+				}
+
+				updated |= object_state->setEscape(0, offset + TypeSize);
+				errs() << "position 3\n";
 			}
 		}
 	}
 
 	if (updated) {
-		//errs() << "After " << *I << "\n";
-		//printMap(map);
+		errs() << "After " << *I << "\n";
+		printMap(map);
 	}
 
 	return updated;
+}
+
+unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
+	Type *OrigPtrTy = Addr->getType();
+	Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
+	assert(OrigTy->isSized());
+	unsigned TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
+    if (TypeSize != 8  && TypeSize != 16 &&
+		TypeSize != 32 && TypeSize != 64 && TypeSize != 128) {
+		//NumAccessesWithBadSize++;
+		// Ignore all unusual sizes.
+		assert(false && "Bad size access\n");
+    }
+
+	return TypeSize / 8;
 }
 
 void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -405,8 +361,8 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 /** Simple may-analysis for checking if an address is in the heap
  *  TODO: may need more sophisticated checks
  **/
-bool PMRobustness::mayInHeap(Value * addr) {
-	if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>(addr)) {
+bool PMRobustness::mayInHeap(const Value * Addr) {
+	if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>((Value *)Addr)) {
 		Value * BaseAddr = GEP->getPointerOperand();
 
 		for (auto &u : BaseAddr->uses()) {
@@ -415,7 +371,7 @@ bool PMRobustness::mayInHeap(Value * addr) {
 			}
 		}
 	} else {
-		for (auto &u : addr->uses()) {
+		for (auto &u : Addr->uses()) {
 			if (isa<AllocaInst>(u)) {
 				return false;
 			}
@@ -425,6 +381,21 @@ bool PMRobustness::mayInHeap(Value * addr) {
 	// Address may be in the heap. We don't know for sure.
 	return true;
 }
+
+void PMRobustness::decomposeGEPAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL) {
+	unsigned MaxPointerSize = getMaxPointerSize(DL);
+	DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
+	DecompGEP.isArray = false;
+	bool GEPMaxLookupReached = DecomposeGEPExpression(Addr, DecompGEP, DL, NULL, NULL);
+
+	if (GEPMaxLookupReached) {
+		errs() << "GEP Max Lookup Reached\n";
+#ifdef PMROBUST_DEBUG
+		assert(false && "GEP Max Lookup Reached; debug\n");
+#endif
+	}
+}
+
 
 //===----------------------------------------------------------------------===//
 // GetElementPtr Instruction Decomposition and Analysis
@@ -683,6 +654,15 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 		unsigned PointerSize = DL.getPointerSizeInBits(AS);
 		// Assume all GEP operands are constants until proven otherwise.
 		bool GepHasConstantOffset = true;
+
+		// Detecing array
+		const Value * firstIndex = *(GEPOp->op_begin() + 1);
+		unsigned FieldNo = cast<ConstantInt>(firstIndex)->getZExtValue();
+		if (FieldNo != 0 || dyn_cast<ArrayType>(GEPOp->getSourceElementType())) {
+			Decomposed.isArray = true;
+			return false;
+		}
+
 		for (User::const_op_iterator I = GEPOp->op_begin() + 1, E = GEPOp->op_end();
 				 I != E; ++I, ++GTI) {
 			const Value *Index = *I;
@@ -795,53 +775,34 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 }
 
 void PMRobustness::printMap(state_t * map) {
-	for (unsigned i = 0; i < value_list.size(); i++) {
-		Value * val = value_list[i];
-		std::vector<struct VarState> &v = (*map)[val];
-		//errs() << "var => " << val << "\t";
-		//errs() << "var size => " << v->size() << "\n";
-
-		if (v.size() == 1) {
-			errs() << *val << ": ";
-			printVarState( v[0] );
-			errs() << "\n";
-		} else {
-			for (unsigned j = 0; j < v.size(); j++) {
-				errs() << *val << ", " << j << ": ";
-				printVarState( v[j] );
-				errs() << "\n";
-			}
-		}
+	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
+		ob_state_t *object_state = it->second;
+		errs() << "loc: " << *it->first << "\n";
+		object_state->print();
 	}
-	errs() << "\n----\n";
+
+//	errs() << "map size: " << map->size() << "\n";
+//	for (unsigned i = 0; i < value_list.size(); i++) {
+//		Value * val = (Value *)value_list[i];
+//		ob_state_t *object_state = (*map)[val];
+//		object_state->print();
+//	}
+	errs() << "\n**\n";
 }
 
 void PMRobustness::test() {
-	std::vector<struct VarState> tmp;
-	tmp.resize(5);
-	tmp[3].s = PMState::UNFLUSHED;
-	//printVarState(tmp[3]);
+	typedef DenseMap<int *, int *> type_t;
+	type_t * map = new type_t();
 
-	std::vector<struct VarState> tmp2;
-	tmp2 = tmp;
-	printVarState(tmp2[3]);
-	errs() << "\n\n";
-	/*
-	DenseMap<int *, int> map;
-	int x;
-	int y;
-	map[&y] = 2;
-	if (map.find(&x) == map.end()) {
-		errs() << "x not found\n";
-	} else {
-		errs() << "x found\n";	
-	}
+	int *x = new int(2);
+	int *y = new int(3);
 
-	if (map.find(&y) == map.end()) {
-		errs() << "y not found\n";
-	} else {
-		errs() << "y found\n";	
-	}*/
+	(*map)[x] = x;
+	(*map)[y] = y;
+
+	errs() << "x: " << *x << "\n";
+	delete map;
+	errs() << "x: " << *x << "\n";
 }
 
 char PMRobustness::ID = 0;
@@ -855,10 +816,11 @@ static void registerPMRobustness(const PassManagerBuilder &,
 }
 /* Enable the pass when opt level is greater than 0 */
 static RegisterStandardPasses 
-	RegisterMyPass1(PassManagerBuilder::EP_OptimizerLast,
+	RegisterMyPass1(PassManagerBuilder::EP_EarlyAsPossible,
 registerPMRobustness);
 
 /* Enable the pass when opt level is 0 */
-static RegisterStandardPasses 
-	RegisterMyPass2(PassManagerBuilder::EP_EnabledOnOptLevel0,
-registerPMRobustness);
+// Don't turn this on when using EP_EarlyAsPossible. Otherwise, the pass will run twice
+//static RegisterStandardPasses
+//	RegisterMyPass2(PassManagerBuilder::EP_EnabledOnOptLevel0,
+//registerPMRobustness);

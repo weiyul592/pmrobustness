@@ -1,4 +1,6 @@
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/ADT/BitVector.h"
+#include <cassert>
 
 using namespace llvm;
 
@@ -35,14 +37,127 @@ struct DecomposedGEP {
 	APInt OtherOffset;
 	// Scaled variable (non-constant) indices.
 	SmallVector<VariableGEPIndex, 4> VarIndices;
+
+	bool isArray;
+
+	uint64_t getOffsets() {
+		assert(VarIndices.size() == 0);
+		assert(StructOffset.getSExtValue() >= 0);
+		assert(OtherOffset.getSExtValue() >= 0);
+
+		return StructOffset.getZExtValue() + OtherOffset.getZExtValue();
+	}
 };
 
 /**
- * Object with 3 fields: vector -> [object status, field 1, field 2, field 3]
  * TODO: may need to track the size of fields
- * TODO: need to change data structure?
  **/
-typedef DenseMap<Value *, std::vector<struct VarState>> state_t;
+// <flushed_bit, clwb_bit> is either <1, 0>, <0, 1>, or <0, 0>
+struct ob_state_t {
+	unsigned size;
+	BitVector flushed_bits;
+	BitVector clwb_bits;
+	BitVector escaped_bits;
+
+	ob_state_t(unsigned s) :
+		size(s),
+		flushed_bits(s),
+		clwb_bits(s),
+		escaped_bits(s)
+	{ assert(s <= (1 << 12)); }
+
+	ob_state_t(ob_state_t * other) :
+		size(other->size),
+		flushed_bits(other->flushed_bits),
+		clwb_bits(other->clwb_bits),
+		escaped_bits(other->escaped_bits)
+	{ assert(size <= (1 << 12)); }
+
+	void mergeFrom(ob_state_t * other) {
+		assert(size == other->size);
+
+		//BitVector clwb_bits = clwb_bits & other->clwb_bits |
+		//	((clwb_bits ^ other->clwb_bits) & (flushed_bits ^ other->flushed_bits));
+		BitVector tmp1(clwb_bits);
+		BitVector tmp2(flushed_bits);
+		tmp1 ^= other->clwb_bits;
+		tmp2 ^= other->flushed_bits;
+		tmp1 &= tmp2;
+
+		clwb_bits &= other->clwb_bits;
+		clwb_bits |= tmp1;
+
+		flushed_bits &= other->flushed_bits;
+		escaped_bits |= other->escaped_bits;
+	}
+
+	void copyFrom(ob_state_t * src) {
+		assert(size == src->size);
+
+		flushed_bits = src->flushed_bits;
+		clwb_bits = src->clwb_bits;
+		escaped_bits = src->escaped_bits;
+	}
+
+	void resize(unsigned s) {
+		assert(s <= (1 << 12));
+		if (size < s) {
+			size = s;
+			flushed_bits.resize(size);
+			clwb_bits.resize(size);
+			escaped_bits.resize(size);
+		}
+	}
+
+	// return true: modified; return else: unchanged
+	bool setDirty(unsigned start, unsigned len) {
+		unsigned end = start + len;
+		int index1 = flushed_bits.find_first_in(start, end);
+		int index2 = clwb_bits.find_first_in(start, end);
+
+		if (index1 == -1 && index2 == -1)
+			return false;
+		else {
+			flushed_bits.reset(start, end);
+			clwb_bits.reset(start, end);
+			return true;
+		}
+	}
+
+	// return true: modified; return else: unchanged
+	bool setEscape(unsigned start, unsigned len) {
+		unsigned end = start + len;
+		int index = escaped_bits.find_first_unset_in(start, end);
+		if (index == -1)
+			return false;
+		else {
+			escaped_bits.set(start, end);
+			return true;
+		}
+	}
+
+	unsigned getSize() {
+		return size;
+	}
+
+	void setSize(unsigned s) {
+		size = s;
+	}
+
+	void print() {
+		errs() << "bit vector size: " << size << "\n";
+		for (unsigned i = 0; i < size; i++) {
+			errs() << flushed_bits[i];
+		}
+		errs() << "\n";
+		for (unsigned i = 0; i < size; i++) {
+			errs() << clwb_bits[i];
+		}
+		errs() << "\n";
+	}
+};
+
+typedef DenseMap<const Value *, ob_state_t *> state_t;
 
 enum class PMState {
 	UNFLUSHED = 0x1,
@@ -68,7 +183,14 @@ void printVarState(VarState &state) {
 	else errs() << "captured>";
 }
 
-static inline Value *getPosition( Instruction * I, IRBuilder <> IRB, bool print = false)
+void printDecomposedGEP(DecomposedGEP &Decom) {
+	errs() << "Store Base: " << *Decom.Base << "\t";
+	errs() << "Struct Offset: " << Decom.StructOffset << "\t";
+	errs() << "Other Offset: " << Decom.OtherOffset << "\t";
+	errs() << "Has VarIndices: " << Decom.VarIndices.size() << "\t";
+}
+
+static inline Value *getPosition(Instruction * I, IRBuilder <> IRB, bool print = false)
 {
 	const DebugLoc & debug_location = I->getDebugLoc ();
 	std::string position_string;

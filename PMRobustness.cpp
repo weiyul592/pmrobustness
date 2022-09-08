@@ -68,7 +68,7 @@ namespace {
 		bool isPMAddr(const Value * Addr) { return true; }
 		bool mayInHeap(const Value * Addr);
 
-		void decomposeGEPAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
+		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -254,8 +254,9 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			return false;
 
 		DecomposedGEP DecompGEP;
-		decomposeGEPAddress(DecompGEP, Addr, DL);
+		decomposeAddress(DecompGEP, Addr, DL);
 		if (DecompGEP.isArray) {
+			//TODO: implement robustness checks for array
 			//errs() << I->getFunction()->getName() << "\n";
 			errs() << "Array encountered\t";
 			errs() << "Addr: " << *Addr << "\n";
@@ -270,10 +271,10 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			if (object_state == NULL) {
 				object_state = new ob_state_t(offset + TypeSize);
 				(*map)[DecompGEP.Base] = object_state;
+				updated |= true;
 #ifdef PMROBUST_DEBUG
 				value_list.push_back(DecompGEP.Base);
 #endif
-				updated |= true;
 			}
 
 			if (object_state->getSize() < offset + TypeSize) {
@@ -285,21 +286,26 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
 		Value * Val = SI->getValueOperand();
-		if (Val->getType()->isPointerTy() && mayInHeap(Addr)) {
-			errs() << *SI << "\n";
-			ob_state_t *object_state = (*map)[Val];
-			assert(object_state);
+		if (Val->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
+			DecomposedGEP DecompGEP;	// DecompGEP is shadowed
+			decomposeAddress(DecompGEP, Val, DL);
+			if (DecompGEP.isArray)
+				assert(false && "Fix me");
+			else if (DecompGEP.getOffsets() > 0)
+				assert(false && "Fix me");
+
+			ob_state_t *object_state = (*map)[DecompGEP.Base];
 			updated |= object_state->setEscape(0, object_state->getSize());
-			errs() << "position 2\n";
 		}
 	} else if (LoadInst * LI = dyn_cast<LoadInst>(I)) {
 		// Rule 2.2: x = *p (where p is a heap address) => x escapes
 		Value * Addr = LI->getPointerOperand();
 
 		DecomposedGEP DecompGEP;
-		decomposeGEPAddress(DecompGEP, Addr, DL);
+		decomposeAddress(DecompGEP, Addr, DL);
 
 		if (DecompGEP.isArray) {
+			//TODO: implement robustness checks for array
 			//errs() << I->getFunction()->getName() << "\n";
 			errs() << "Array encountered\t";
 			errs() << "Addr: " << *Addr << "\n";
@@ -313,7 +319,8 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				ob_state_t *object_state = (*map)[LI];
 				if (object_state == NULL) {
 					object_state = new ob_state_t(offset + TypeSize);
-					(*map)[DecompGEP.Base] = object_state;
+					(*map)[LI] = object_state;
+					updated |= true;
 #ifdef PMROBUST_DEBUG
 					value_list.push_back(LI);
 #endif
@@ -324,7 +331,6 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				}
 
 				updated |= object_state->setEscape(0, offset + TypeSize);
-				errs() << "position 3\n";
 			}
 		}
 	}
@@ -382,7 +388,7 @@ bool PMRobustness::mayInHeap(const Value * Addr) {
 	return true;
 }
 
-void PMRobustness::decomposeGEPAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL) {
+void PMRobustness::decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL) {
 	unsigned MaxPointerSize = getMaxPointerSize(DL);
 	DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
 	DecompGEP.isArray = false;

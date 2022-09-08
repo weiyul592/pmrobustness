@@ -154,6 +154,10 @@ struct ob_state_t {
 			errs() << clwb_bits[i];
 		}
 		errs() << "\n";
+		for (unsigned i = 0; i < size; i++) {
+			errs() << escaped_bits[i];
+		}
+		errs() << "\n";
 	}
 };
 

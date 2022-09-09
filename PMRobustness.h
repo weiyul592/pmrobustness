@@ -4,6 +4,8 @@
 
 using namespace llvm;
 
+#define UNKNOWNOFFSET 0xffffffff
+
 struct VariableGEPIndex {
 	// An opaque Value - we can't decompose this further.
 	const Value *V;
@@ -41,11 +43,13 @@ struct DecomposedGEP {
 	bool isArray;
 
 	uint64_t getOffsets() {
-		assert(VarIndices.size() == 0);
-		assert(StructOffset.getSExtValue() >= 0);
-		assert(OtherOffset.getSExtValue() >= 0);
+		if (VarIndices.size() == 0) {
+			assert(StructOffset.getSExtValue() >= 0);
+			assert(OtherOffset.getSExtValue() >= 0);
 
-		return StructOffset.getZExtValue() + OtherOffset.getZExtValue();
+			return StructOffset.getZExtValue() + OtherOffset.getZExtValue();
+		} else
+			return UNKNOWNOFFSET;
 	}
 };
 
@@ -58,19 +62,30 @@ struct ob_state_t {
 	BitVector flushed_bits;
 	BitVector clwb_bits;
 	BitVector escaped_bits;
+	bool escaped;
+
+	ob_state_t() :
+		size(0),
+		flushed_bits(),
+		clwb_bits(),
+		escaped_bits(),
+		escaped(false)
+	{}
 
 	ob_state_t(unsigned s) :
 		size(s),
 		flushed_bits(s),
 		clwb_bits(s),
-		escaped_bits(s)
+		escaped_bits(s),
+		escaped(false)
 	{ assert(s <= (1 << 12)); }
 
 	ob_state_t(ob_state_t * other) :
 		size(other->size),
 		flushed_bits(other->flushed_bits),
 		clwb_bits(other->clwb_bits),
-		escaped_bits(other->escaped_bits)
+		escaped_bits(other->escaped_bits),
+		escaped(other->escaped)
 	{ assert(size <= (1 << 12)); }
 
 	void mergeFrom(ob_state_t * other) {
@@ -89,14 +104,17 @@ struct ob_state_t {
 
 		flushed_bits &= other->flushed_bits;
 		escaped_bits |= other->escaped_bits;
+		escaped |= other->escaped;
 	}
 
 	void copyFrom(ob_state_t * src) {
-		assert(size == src->size);
+		//assert(size == src->size);
 
+		size = src->size;
 		flushed_bits = src->flushed_bits;
 		clwb_bits = src->clwb_bits;
 		escaped_bits = src->escaped_bits;
+		escaped = src->escaped;
 	}
 
 	void resize(unsigned s) {
@@ -105,7 +123,7 @@ struct ob_state_t {
 			size = s;
 			flushed_bits.resize(size);
 			clwb_bits.resize(size);
-			escaped_bits.resize(size);
+			escaped_bits.resize(size, escaped);
 		}
 	}
 
@@ -125,7 +143,8 @@ struct ob_state_t {
 	}
 
 	// return true: modified; return else: unchanged
-	bool setEscape(unsigned start, unsigned len) {
+	bool setEscape(unsigned start, unsigned len, bool objectEscape = false) {
+		escaped = objectEscape;
 		unsigned end = start + len;
 		int index = escaped_bits.find_first_unset_in(start, end);
 		if (index == -1)
@@ -162,30 +181,6 @@ struct ob_state_t {
 };
 
 typedef DenseMap<const Value *, ob_state_t *> state_t;
-
-enum class PMState {
-	UNFLUSHED = 0x1,
-	CLWB = 0x11,
-	FLUSHED = 0x111
-};
-
-struct VarState {
-	PMState s = PMState::FLUSHED;
-	bool escaped = false;
-};
-
-void printVarState(VarState &state) {
-	errs() << "<";
-	if (state.s == PMState::UNFLUSHED)
-		errs() << "Unflushed,";
-	else if (state.s == PMState::CLWB)
-		errs() << "CLWB,";
-	else
-		errs() << "Flushed,";
-
-	if (state.escaped) errs() << "escaped>";
-	else errs() << "captured>";
-}
 
 void printDecomposedGEP(DecomposedGEP &Decom) {
 	errs() << "Store Base: " << *Decom.Base << "\t";

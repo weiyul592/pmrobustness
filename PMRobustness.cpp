@@ -69,6 +69,7 @@ namespace {
 		bool mayInHeap(const Value * Addr);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
+		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -79,8 +80,6 @@ namespace {
 		bool DecomposeGEPExpression(const Value *V, DecomposedGEP &Decomposed,
 			const DataLayout &DL, AssumptionCache *AC, DominatorTree *DT
 		);
-
-		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
 
 		void printMap(state_t * map);
 		void test();
@@ -111,7 +110,7 @@ bool PMRobustness::runOnFunction(Function &F) {
 void PMRobustness::analyze(Function &F) {
 	if (true) {
 		errs() << F.getName() << "\n------\n";
-		F.dump();
+		//F.dump();
 
 		// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 		DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
@@ -193,8 +192,13 @@ void PMRobustness::copyState(state_t * src, state_t * dst) {
 		if (object_state == NULL) {
 			object_state = new ob_state_t(it->second);
 			(*dst)[it->first] = object_state;
-		} else
-			(*dst)[it->first]->copyFrom(it->second);
+		} else {
+//			if (object_state->size != it->second->size) {
+//				errs() << "dst size: " << object_state->size << "\t";
+//				errs() << "src size: " << it->second->size << "\n";
+//			}
+			object_state->copyFrom(it->second);
+		}
 	}
 }
 
@@ -255,6 +259,9 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 
 		DecomposedGEP DecompGEP;
 		decomposeAddress(DecompGEP, Addr, DL);
+		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		unsigned offset = DecompGEP.getOffsets();
+
 		if (DecompGEP.isArray) {
 			//TODO: implement robustness checks for array
 			//errs() << I->getFunction()->getName() << "\n";
@@ -262,14 +269,12 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			errs() << "Addr: " << *Addr << "\n";
 			//errs() << *I << "\n";
 			//getPosition(I, IRB, true);
+		} else if (offset == UNKNOWNOFFSET) {
+			// TODO: treat it the same way as array
 		} else {
-			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-			unsigned offset = DecompGEP.getOffsets();
-
-			// printDecomposedGEP(DecomposedGEP &Decom);
 			ob_state_t *object_state = (*map)[DecompGEP.Base];
 			if (object_state == NULL) {
-				object_state = new ob_state_t(offset + TypeSize);
+				object_state = new ob_state_t();
 				(*map)[DecompGEP.Base] = object_state;
 				updated |= true;
 #ifdef PMROBUST_DEBUG
@@ -287,15 +292,37 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
 		Value * Val = SI->getValueOperand();
 		if (Val->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
-			DecomposedGEP DecompGEP;	// DecompGEP is shadowed
-			decomposeAddress(DecompGEP, Val, DL);
-			if (DecompGEP.isArray)
+			DecomposedGEP ValDecompGEP;
+			decomposeAddress(ValDecompGEP, Val, DL);
+			if (ValDecompGEP.isArray) {
+				// TODO: ignore for now
+				//assert(false && "Fix me");
+			} else if (ValDecompGEP.getOffsets() == UNKNOWNOFFSET) {
 				assert(false && "Fix me");
-			else if (DecompGEP.getOffsets() > 0)
-				assert(false && "Fix me");
+			} else {
+				// Get the size of the pointer
+				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+				unsigned offset = ValDecompGEP.getOffsets();
 
-			ob_state_t *object_state = (*map)[DecompGEP.Base];
-			updated |= object_state->setEscape(0, object_state->getSize());
+				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
+				if (object_state == NULL) {
+					object_state = new ob_state_t();
+					(*map)[ValDecompGEP.Base] = object_state;
+					updated |= true;
+				}
+
+				if (offset == 0) {
+					// Mark the entire object as escaped
+					updated |= object_state->setEscape(0, object_state->getSize(), true);
+				} else {
+					// Only mark this field as escaped
+					if (object_state->getSize() < offset + TypeSize) {
+						object_state->resize(offset + TypeSize);
+					}
+
+					updated |= object_state->setEscape(offset, TypeSize, false);
+				}
+			}
 		}
 	} else if (LoadInst * LI = dyn_cast<LoadInst>(I)) {
 		// Rule 2.2: x = *p (where p is a heap address) => x escapes
@@ -318,7 +345,7 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 
 				ob_state_t *object_state = (*map)[LI];
 				if (object_state == NULL) {
-					object_state = new ob_state_t(offset + TypeSize);
+					object_state = new ob_state_t();
 					(*map)[LI] = object_state;
 					updated |= true;
 #ifdef PMROBUST_DEBUG
@@ -330,14 +357,14 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 					object_state->resize(offset + TypeSize);
 				}
 
-				updated |= object_state->setEscape(0, offset + TypeSize);
+				updated |= object_state->setEscape(0, offset + TypeSize, true);
 			}
 		}
 	}
 
 	if (updated) {
-		errs() << "After " << *I << "\n";
-		printMap(map);
+		//errs() << "After " << *I << "\n";
+		//printMap(map);
 	}
 
 	return updated;
@@ -352,6 +379,7 @@ unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
 		TypeSize != 32 && TypeSize != 64 && TypeSize != 128) {
 		//NumAccessesWithBadSize++;
 		// Ignore all unusual sizes.
+
 		assert(false && "Bad size access\n");
     }
 
@@ -663,10 +691,12 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 
 		// Detecing array
 		const Value * firstIndex = *(GEPOp->op_begin() + 1);
-		unsigned FieldNo = cast<ConstantInt>(firstIndex)->getZExtValue();
-		if (FieldNo != 0 || dyn_cast<ArrayType>(GEPOp->getSourceElementType())) {
-			Decomposed.isArray = true;
-			return false;
+		if (const ConstantInt *CIdx = dyn_cast<ConstantInt>(firstIndex)) {
+			unsigned FieldNo = CIdx->getZExtValue();
+			if (FieldNo != 0 || dyn_cast<ArrayType>(GEPOp->getSourceElementType())) {
+				Decomposed.isArray = true;
+				return false;
+			}
 		}
 
 		for (User::const_op_iterator I = GEPOp->op_begin() + 1, E = GEPOp->op_end();

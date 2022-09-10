@@ -64,6 +64,9 @@ namespace {
 		void copyState(state_t * src, state_t * dst);
 		void copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst);
 		bool update(state_t * map, Instruction * I);
+		bool processAtomic(state_t * map, Instruction * I);
+		bool processMemIntrinsic(state_t * map, Instruction * I);
+		bool processLoadOrStore(state_t * map, Instruction * I);
 
 		bool isPMAddr(const Value * Addr) { return true; }
 		bool mayInHeap(const Value * Addr);
@@ -237,8 +240,33 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 
 bool PMRobustness::update(state_t * map, Instruction * I) {
 	bool updated = false;
-	IRBuilder<> IRB(I);
-	const DataLayout &DL = I->getModule()->getDataLayout();
+
+	if (I->isAtomic()) {
+		//return processAtomic(map, I);
+	} else if (isa<LoadInst>(I) || isa<StoreInst>(I)) {
+		updated = processLoadOrStore(map, I);
+	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+		if (isa<MemIntrinsic>(I)) {
+			updated = processMemIntrinsic(map, I);
+		} else {
+			// TODO: cache operations
+		}
+	}
+
+	if (updated) {
+		//errs() << "After " << *I << "\n";
+		//printMap(map);
+	}
+
+	return updated;
+}
+
+bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
+	return false;
+}
+
+bool PMRobustness::processMemIntrinsic(state_t * map, Instruction * I) {
+	bool updated = false;
 
     if (MemSetInst *M = dyn_cast<MemSetInst>(I)) {
 		// TODO
@@ -248,6 +276,13 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
     } else if (MemTransferInst *M = dyn_cast<MemTransferInst>(I)) {
 		// TODO
     }
+	return updated;
+}
+
+bool PMRobustness::processLoadOrStore(state_t * map, Instruction * I) {
+	bool updated = false;
+	IRBuilder<> IRB(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
 
 	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
 		// Rule 1: x.f = v => x.f becomes dirty
@@ -369,11 +404,6 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				updated |= object_state->setEscape(0, object_state->getSize(), true);
 			}
 		}
-	}
-
-	if (updated) {
-		//errs() << "After " << *I << "\n";
-		//printMap(map);
 	}
 
 	return updated;

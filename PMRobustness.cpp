@@ -294,15 +294,16 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		if (Val->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
 			DecomposedGEP ValDecompGEP;
 			decomposeAddress(ValDecompGEP, Val, DL);
+			unsigned offset = ValDecompGEP.getOffsets();
+
 			if (ValDecompGEP.isArray) {
 				// TODO: ignore for now
 				//assert(false && "Fix me");
-			} else if (ValDecompGEP.getOffsets() == UNKNOWNOFFSET) {
+			} else if (offset == UNKNOWNOFFSET) {
 				assert(false && "Fix me");
 			} else {
 				// Get the size of the pointer
 				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-				unsigned offset = ValDecompGEP.getOffsets();
 
 				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
 				if (object_state == NULL) {
@@ -340,13 +341,21 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 			//getPosition(I, IRB, true);
 		} else {
 			if (LI->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
-				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-				unsigned offset = DecompGEP.getOffsets();
+				DecomposedGEP LIDecompGEP;
+				decomposeAddress(LIDecompGEP, LI, DL);
+				unsigned offset = LIDecompGEP.getOffsets();
 
-				ob_state_t *object_state = (*map)[LI];
+				if (LIDecompGEP.isArray) {
+					assert(false && "Fix me");
+				} else if (offset > 0) {
+					assert(false && "fix me");
+				}
+
+				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+				ob_state_t *object_state = (*map)[LIDecompGEP.Base];
 				if (object_state == NULL) {
 					object_state = new ob_state_t();
-					(*map)[LI] = object_state;
+					(*map)[LIDecompGEP.Base] = object_state;
 					updated |= true;
 #ifdef PMROBUST_DEBUG
 					value_list.push_back(LI);
@@ -357,7 +366,7 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 					object_state->resize(offset + TypeSize);
 				}
 
-				updated |= object_state->setEscape(0, offset + TypeSize, true);
+				updated |= object_state->setEscape(0, object_state->getSize(), true);
 			}
 		}
 	}

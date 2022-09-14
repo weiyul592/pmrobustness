@@ -273,9 +273,12 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 		updated |= processStore(map, I);
 	} else if (isa<LoadInst>(I)) {
 		updated |= processLoad(map, I);
-	} else if (isa<AtomicRMWInst>(I)) {
-		// TODO: is this correct?
-		updated |= processLoad(map, I);
+	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
+		// Treat atomic_exchange as load + store
+		// Treat other RMWs as store
+		if (RMWI->getOperation() == AtomicRMWInst::Xchg)
+			updated |= processLoad(map, I);
+
 		updated |= processStore(map, I);
 		errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
@@ -315,8 +318,10 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		Val = SI->getValueOperand();
 	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
 		Addr = RMWI->getPointerOperand();
-		// TODO: Is this correct?
-		Val = RMWI->getValOperand();
+
+		// Rule 2.1 only makes sense for atomic_exchange
+		if (RMWI->getOperation() == AtomicRMWInst::Xchg)
+			Val = RMWI->getValOperand();
 	} else {
 		return false;
 	}
@@ -412,7 +417,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		return false;
 	}
 
-	// Rule 2.2: x = *p (where p is a heap address) => x escapes
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
 
@@ -424,8 +428,9 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
 	} else {
-		if (I->isAtomic()) {
+		if (I->isAtomic() && isa<LoadInst>(I)) {
 			// Mark the address as dirty to detect interthread robustness violation
+			// For Atomic RMW, this is already done in processStore
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			unsigned offset = DecompGEP.getOffsets();
 
@@ -446,6 +451,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			updated |= object_state->setDirty(offset, TypeSize);
 		}
 
+		// Rule 2.2: x = *p (where p is a heap address) => x escapes
 		if (I->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
 			DecomposedGEP LIDecompGEP;
 			decomposeAddress(LIDecompGEP, I, DL);

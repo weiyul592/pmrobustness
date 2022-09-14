@@ -66,7 +66,8 @@ namespace {
 		bool update(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
-		bool processLoadOrStore(state_t * map, Instruction * I);
+		bool processLoad(state_t * map, Instruction * I);
+		bool processStore(state_t * map, Instruction * I);
 
 		bool isPMAddr(const Value * Addr) { return true; }
 		bool mayInHeap(const Value * Addr);
@@ -133,6 +134,7 @@ void PMRobustness::analyze(Function &F) {
 				if (state == NULL) {
 					state = new state_t();
 					States[&*it] = state;
+					changed |= true;
 				}
 
 				// Build state from predecessors' states
@@ -164,7 +166,7 @@ void PMRobustness::analyze(Function &F) {
 				}
 
 				if (update(state, &*it))
-					changed = true;
+					changed |= true;
 
 				prev = it;
 				it++;
@@ -242,9 +244,11 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 	bool updated = false;
 
 	if (I->isAtomic()) {
-		//return processAtomic(map, I);
-	} else if (isa<LoadInst>(I) || isa<StoreInst>(I)) {
-		updated = processLoadOrStore(map, I);
+		updated = processAtomic(map, I);
+	} else if (isa<LoadInst>(I)) {
+		updated = processLoad(map, I);
+	} else if (isa<StoreInst>(I)) {
+		updated = processStore(map, I);
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
@@ -262,7 +266,27 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 }
 
 bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
-	return false;
+	bool updated = false;
+	//const DataLayout &DL = I->getModule()->getDataLayout();
+
+	if (isa<StoreInst>(I)) {
+		updated |= processStore(map, I);
+	} else if (isa<LoadInst>(I)) {
+		updated |= processLoad(map, I);
+	} else if (isa<AtomicRMWInst>(I)) {
+		// TODO: is this correct?
+		updated |= processLoad(map, I);
+		updated |= processStore(map, I);
+		errs() << "Atomic RMW processed\n";
+	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
+		//
+		errs() << "CASI not implemented yet\n";
+	} else if (FenceInst *FI = dyn_cast<FenceInst>(I)) {
+		//
+		errs() << "FenseInst not implemented yet\n";
+	}
+
+	return updated;
 }
 
 bool PMRobustness::processMemIntrinsic(state_t * map, Instruction * I) {
@@ -279,34 +303,132 @@ bool PMRobustness::processMemIntrinsic(state_t * map, Instruction * I) {
 	return updated;
 }
 
-bool PMRobustness::processLoadOrStore(state_t * map, Instruction * I) {
+bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	bool updated = false;
 	IRBuilder<> IRB(I);
 	const DataLayout &DL = I->getModule()->getDataLayout();
+	Value *Addr = NULL;
+	Value *Val = NULL;
 
-	if (StoreInst * SI = dyn_cast<StoreInst>(I)) {
-		// Rule 1: x.f = v => x.f becomes dirty
-		Value * Addr = SI->getPointerOperand();
+	if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+		Addr = SI->getPointerOperand();
+		Val = SI->getValueOperand();
+	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
+		Addr = RMWI->getPointerOperand();
+		// TODO: Is this correct?
+		Val = RMWI->getValOperand();
+	} else {
+		return false;
+	}
 
-		// TODO: Address check to be implemented
-		if (!isPMAddr(Addr))
-			return false;
+	// Rule 1: x.f = v => x.f becomes dirty
+	// TODO: Address check to be implemented
+	if (!isPMAddr(Addr))
+		return false;
 
-		DecomposedGEP DecompGEP;
-		decomposeAddress(DecompGEP, Addr, DL);
-		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-		unsigned offset = DecompGEP.getOffsets();
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
 
-		if (DecompGEP.isArray) {
-			//TODO: implement robustness checks for array
-			//errs() << I->getFunction()->getName() << "\n";
-			errs() << "Array encountered\t";
-			errs() << "Addr: " << *Addr << "\n";
-			//errs() << *I << "\n";
-			//getPosition(I, IRB, true);
+	if (DecompGEP.isArray) {
+		//TODO: implement robustness checks for array
+		//errs() << I->getFunction()->getName() << "\n";
+		errs() << "Array encountered\t";
+		errs() << "Addr: " << *Addr << "\n";
+		//errs() << *I << "\n";
+		//getPosition(I, IRB, true);
+	} else if (offset == UNKNOWNOFFSET) {
+		// TODO: treat it the same way as array
+	} else {
+		ob_state_t *object_state = (*map)[DecompGEP.Base];
+		if (object_state == NULL) {
+			object_state = new ob_state_t();
+			(*map)[DecompGEP.Base] = object_state;
+			updated |= true;
+#ifdef PMROBUST_DEBUG
+			value_list.push_back(DecompGEP.Base);
+#endif
+		}
+
+		if (object_state->getSize() < offset + TypeSize) {
+			object_state->resize(offset + TypeSize);
+		}
+
+		updated |= object_state->setDirty(offset, TypeSize);
+	}
+
+	// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
+	if (Val && Val->getType()->isPointerTy() &&
+		mayInHeap(DecompGEP.Base)) {
+		DecomposedGEP ValDecompGEP;
+		decomposeAddress(ValDecompGEP, Val, DL);
+		unsigned offset = ValDecompGEP.getOffsets();
+
+		if (ValDecompGEP.isArray) {
+			// TODO: ignore for now
+			//assert(false && "Fix me");
 		} else if (offset == UNKNOWNOFFSET) {
-			// TODO: treat it the same way as array
+			assert(false && "Fix me");
 		} else {
+			// Get the size of the pointer
+			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+
+			ob_state_t *object_state = (*map)[ValDecompGEP.Base];
+			if (object_state == NULL) {
+				object_state = new ob_state_t();
+				(*map)[ValDecompGEP.Base] = object_state;
+				updated |= true;
+			}
+
+			if (offset == 0) {
+				// Mark the entire object as escaped
+				updated |= object_state->setEscape(0, object_state->getSize(), true);
+			} else {
+				// Only mark this field as escaped
+				if (object_state->getSize() < offset + TypeSize) {
+					object_state->resize(offset + TypeSize);
+				}
+
+				updated |= object_state->setEscape(offset, TypeSize, false);
+			}
+		}
+	}
+
+	return updated;
+}
+
+bool PMRobustness::processLoad(state_t * map, Instruction * I) {
+	bool updated = false;
+	IRBuilder<> IRB(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	Value *Addr = NULL;
+
+	if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+		Addr = LI->getPointerOperand();
+	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
+		Addr = RMWI->getPointerOperand();
+	} else {
+		return false;
+	}
+
+	// Rule 2.2: x = *p (where p is a heap address) => x escapes
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+
+	if (DecompGEP.isArray) {
+		//TODO: implement robustness checks for array
+		//errs() << I->getFunction()->getName() << "\n";
+		errs() << "Array encountered\t";
+		errs() << "Addr: " << *Addr << "\n";
+		//errs() << *I << "\n";
+		//getPosition(I, IRB, true);
+	} else {
+		if (I->isAtomic()) {
+			// Mark the address as dirty to detect interthread robustness violation
+			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+			unsigned offset = DecompGEP.getOffsets();
+
 			ob_state_t *object_state = (*map)[DecompGEP.Base];
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
@@ -324,85 +446,33 @@ bool PMRobustness::processLoadOrStore(state_t * map, Instruction * I) {
 			updated |= object_state->setDirty(offset, TypeSize);
 		}
 
-		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
-		Value * Val = SI->getValueOperand();
-		if (Val->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
-			DecomposedGEP ValDecompGEP;
-			decomposeAddress(ValDecompGEP, Val, DL);
-			unsigned offset = ValDecompGEP.getOffsets();
+		if (I->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
+			DecomposedGEP LIDecompGEP;
+			decomposeAddress(LIDecompGEP, I, DL);
+			unsigned offset = LIDecompGEP.getOffsets();
 
-			if (ValDecompGEP.isArray) {
-				// TODO: ignore for now
-				//assert(false && "Fix me");
-			} else if (offset == UNKNOWNOFFSET) {
+			if (LIDecompGEP.isArray) {
 				assert(false && "Fix me");
-			} else {
-				// Get the size of the pointer
-				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-
-				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
-				if (object_state == NULL) {
-					object_state = new ob_state_t();
-					(*map)[ValDecompGEP.Base] = object_state;
-					updated |= true;
-				}
-
-				if (offset == 0) {
-					// Mark the entire object as escaped
-					updated |= object_state->setEscape(0, object_state->getSize(), true);
-				} else {
-					// Only mark this field as escaped
-					if (object_state->getSize() < offset + TypeSize) {
-						object_state->resize(offset + TypeSize);
-					}
-
-					updated |= object_state->setEscape(offset, TypeSize, false);
-				}
+			} else if (offset > 0) {
+				assert(false && "fix me");
 			}
-		}
-	} else if (LoadInst * LI = dyn_cast<LoadInst>(I)) {
-		// Rule 2.2: x = *p (where p is a heap address) => x escapes
-		Value * Addr = LI->getPointerOperand();
 
-		DecomposedGEP DecompGEP;
-		decomposeAddress(DecompGEP, Addr, DL);
-
-		if (DecompGEP.isArray) {
-			//TODO: implement robustness checks for array
-			//errs() << I->getFunction()->getName() << "\n";
-			errs() << "Array encountered\t";
-			errs() << "Addr: " << *Addr << "\n";
-			//errs() << *I << "\n";
-			//getPosition(I, IRB, true);
-		} else {
-			if (LI->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
-				DecomposedGEP LIDecompGEP;
-				decomposeAddress(LIDecompGEP, LI, DL);
-				unsigned offset = LIDecompGEP.getOffsets();
-
-				if (LIDecompGEP.isArray) {
-					assert(false && "Fix me");
-				} else if (offset > 0) {
-					assert(false && "fix me");
-				}
-
-				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-				ob_state_t *object_state = (*map)[LIDecompGEP.Base];
-				if (object_state == NULL) {
-					object_state = new ob_state_t();
-					(*map)[LIDecompGEP.Base] = object_state;
-					updated |= true;
+			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+			ob_state_t *object_state = (*map)[LIDecompGEP.Base];
+			if (object_state == NULL) {
+				object_state = new ob_state_t();
+				(*map)[LIDecompGEP.Base] = object_state;
+				updated |= true;
 #ifdef PMROBUST_DEBUG
-					value_list.push_back(LI);
+				value_list.push_back(I);
 #endif
-				}
-
-				if (object_state->getSize() < offset + TypeSize) {
-					object_state->resize(offset + TypeSize);
-				}
-
-				updated |= object_state->setEscape(0, object_state->getSize(), true);
 			}
+
+			if (object_state->getSize() < offset + TypeSize) {
+				object_state->resize(offset + TypeSize);
+			}
+
+			updated |= object_state->setEscape(0, object_state->getSize(), true);
 		}
 	}
 

@@ -374,7 +374,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 			// TODO: ignore for now
 			//assert(false && "Fix me");
 		} else if (offset == UNKNOWNOFFSET) {
-			assert(false && "Fix me");
+			// TODO: start working here
+			// assert(false && "Fix me");
 		} else {
 			// Get the size of the pointer
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
@@ -416,6 +417,9 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	} else {
 		return false;
 	}
+
+	if (!isPMAddr(Addr))
+		return false;
 
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);

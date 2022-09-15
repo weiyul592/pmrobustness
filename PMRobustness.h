@@ -89,7 +89,7 @@ struct ob_state_t {
 	{ assert(size <= (1 << 12)); }
 
 	void mergeFrom(ob_state_t * other) {
-		assert(size == other->size);
+		//assert(size == other->size);
 
 		//BitVector clwb_bits = clwb_bits & other->clwb_bits |
 		//	((clwb_bits ^ other->clwb_bits) & (flushed_bits ^ other->flushed_bits));

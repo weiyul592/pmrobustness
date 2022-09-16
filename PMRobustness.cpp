@@ -69,6 +69,7 @@ namespace {
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 
+		// TODO: Address check to be implemented
 		bool isPMAddr(const Value * Addr) { return true; }
 		bool mayInHeap(const Value * Addr);
 
@@ -280,13 +281,15 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 			updated |= processLoad(map, I);
 
 		updated |= processStore(map, I);
-		errs() << "Atomic RMW processed\n";
+		//errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
 		//
 		errs() << "CASI not implemented yet\n";
 	} else if (FenceInst *FI = dyn_cast<FenceInst>(I)) {
 		//
+		//IRBuilder<> IRB(I);
 		errs() << "FenseInst not implemented yet\n";
+		//getPosition(I, IRB, true);
 	}
 
 	return updated;
@@ -327,13 +330,11 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	}
 
 	// Rule 1: x.f = v => x.f becomes dirty
-	// TODO: Address check to be implemented
 	if (!isPMAddr(Addr))
 		return false;
 
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
-	unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
 
 	if (DecompGEP.isArray) {
@@ -346,6 +347,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
+		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = (*map)[DecompGEP.Base];
 		if (object_state == NULL) {
 			object_state = new ob_state_t();
@@ -361,42 +363,42 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		}
 
 		updated |= object_state->setDirty(offset, TypeSize);
-	}
 
-	// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
-	if (Val && Val->getType()->isPointerTy() &&
-		mayInHeap(DecompGEP.Base)) {
-		DecomposedGEP ValDecompGEP;
-		decomposeAddress(ValDecompGEP, Val, DL);
-		unsigned offset = ValDecompGEP.getOffsets();
+		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
+		if (Val && Val->getType()->isPointerTy() &&
+			mayInHeap(DecompGEP.Base)) {
+			DecomposedGEP ValDecompGEP;
+			decomposeAddress(ValDecompGEP, Val, DL);
+			unsigned offset = ValDecompGEP.getOffsets();
 
-		if (ValDecompGEP.isArray) {
-			// TODO: ignore for now
-			//assert(false && "Fix me");
-		} else if (offset == UNKNOWNOFFSET) {
-			// TODO: start working here
-			// assert(false && "Fix me");
-		} else {
-			// Get the size of the pointer
-			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-
-			ob_state_t *object_state = (*map)[ValDecompGEP.Base];
-			if (object_state == NULL) {
-				object_state = new ob_state_t();
-				(*map)[ValDecompGEP.Base] = object_state;
-				updated |= true;
-			}
-
-			if (offset == 0) {
-				// Mark the entire object as escaped
-				updated |= object_state->setEscape(0, object_state->getSize(), true);
+			if (ValDecompGEP.isArray) {
+				// TODO: ignore for now
+				//assert(false && "Fix me");
+			} else if (offset == UNKNOWNOFFSET) {
+				// TODO: start working here
+				// assert(false && "Fix me");
 			} else {
-				// Only mark this field as escaped
-				if (object_state->getSize() < offset + TypeSize) {
-					object_state->resize(offset + TypeSize);
+				// Get the size of the pointer
+				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+
+				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
+				if (object_state == NULL) {
+					object_state = new ob_state_t();
+					(*map)[ValDecompGEP.Base] = object_state;
+					updated |= true;
 				}
 
-				updated |= object_state->setEscape(offset, TypeSize, false);
+				if (offset == 0) {
+					// Mark the entire object as escaped
+					updated |= object_state->setEscape(0, object_state->getSize(), true);
+				} else {
+					// Only mark this field as escaped
+					if (object_state->getSize() < offset + TypeSize) {
+						object_state->resize(offset + TypeSize);
+					}
+
+					updated |= object_state->setEscape(offset, TypeSize, false);
+				}
 			}
 		}
 	}
@@ -423,6 +425,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
 
 	if (DecompGEP.isArray) {
 		//TODO: implement robustness checks for array
@@ -431,12 +434,13 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		errs() << "Addr: " << *Addr << "\n";
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
+	} else if (offset == UNKNOWNOFFSET) {
+		// TODO: treat it the same way as array
 	} else {
 		if (I->isAtomic() && isa<LoadInst>(I)) {
 			// Mark the address as dirty to detect interthread robustness violation
 			// For Atomic RMW, this is already done in processStore
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-			unsigned offset = DecompGEP.getOffsets();
 
 			ob_state_t *object_state = (*map)[DecompGEP.Base];
 			if (object_state == NULL) {

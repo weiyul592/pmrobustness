@@ -6,6 +6,13 @@ using namespace llvm;
 
 #define UNKNOWNOFFSET 0xffffffff
 
+enum NVMOP {
+	NVM_CLWB,
+	NVM_CLFLUSH,
+	NVM_FENCE,
+	NVM_UNKNOWN
+};
+
 struct VariableGEPIndex {
 	// An opaque Value - we can't decompose this further.
 	const Value *V;

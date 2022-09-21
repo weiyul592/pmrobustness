@@ -35,10 +35,13 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils.h"
 #include "PMRobustness.h"
 //#include "andersen/include/AndersenAA.h"
@@ -68,6 +71,7 @@ namespace {
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
+		void processFlush(state_t * map, Instruction * I);
 
 		// TODO: Address check to be implemented
 		bool isPMAddr(const Value * Addr) { return true; }
@@ -75,6 +79,7 @@ namespace {
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
+		NVMOP whichNVMoperation(Instruction *I);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -114,7 +119,7 @@ bool PMRobustness::runOnFunction(Function &F) {
 
 void PMRobustness::analyze(Function &F) {
 	if (true) {
-		errs() << F.getName() << "\n------\n";
+		//errs() << F.getName() << "\n------\n";
 		//F.dump();
 
 		// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
@@ -254,7 +259,14 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
 		} else {
-			// TODO: cache operations
+			NVMOP op = whichNVMoperation(I);
+			if (op == NVM_FENCE) {
+				// TODO: fence operations
+			} else if (op == NVM_CLWB) {
+				// TODO: CLWB
+			} else if (op == NVM_CLFLUSH) {
+				// TODO: Flush
+			}
 		}
 	}
 
@@ -286,9 +298,9 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 		//
 		errs() << "CASI not implemented yet\n";
 	} else if (FenceInst *FI = dyn_cast<FenceInst>(I)) {
-		//
+		// Ignore for now
+		//errs() << "FenseInst not implemented yet\n";
 		//IRBuilder<> IRB(I);
-		errs() << "FenseInst not implemented yet\n";
 		//getPosition(I, IRB, true);
 	}
 
@@ -344,8 +356,16 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		errs() << "Addr: " << *Addr << "\n";
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
+		//I>getParent()->dump();
 	} else if (offset == UNKNOWNOFFSET) {
 		// TODO: treat it the same way as array
+		/*
+		errs() << "UNKNOWN offset encountered\t";
+		errs() << "Addr: " << *Addr << "\n";
+		errs() << *I << "\n";
+		getPosition(I, IRB, true);
+		I->getParent()->dump();
+		*/
 	} else {
 		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = (*map)[DecompGEP.Base];
@@ -493,6 +513,10 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	return updated;
 }
 
+void PMRobustness::processFlush(state_t * map, Instruction * I) {
+	
+}
+
 unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
 	Type *OrigPtrTy = Addr->getType();
 	Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
@@ -553,6 +577,32 @@ void PMRobustness::decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const
 	}
 }
 
+NVMOP PMRobustness::whichNVMoperation(Instruction *I) {
+	IRBuilder<> IRB(I);
+
+	if (CallInst* callInst = dyn_cast<CallInst>(I)) {
+		if (callInst->isInlineAsm()) {
+			InlineAsm *asmInline = dyn_cast<InlineAsm>(callInst->getCalledOperand());
+			StringRef asmStr = asmInline->getAsmString();
+			if (asmStr.contains("mfence") || asmStr.contains("sfence")) {
+				//errs() << "mfence/sfence seen\n";
+				//getPosition(I, IRB, true);
+				return NVM_FENCE;
+			} else if (asmStr.contains("xsaveopt") || asmStr.contains("clflushopt")) {
+				//errs() << "clflushopt seen\n";
+				//getPosition(I, IRB, true);
+				return NVM_CLWB;
+			} else if (asmStr.contains("clflush")) {
+				errs() << "clflush seen\n";
+				getPosition(I, IRB, true);
+				errs() << *I << "\n";
+				errs() << *asmInline << "\n";
+				return NVM_CLFLUSH;
+			}
+		}
+	}
+	return NVM_UNKNOWN;
+}
 
 //===----------------------------------------------------------------------===//
 // GetElementPtr Instruction Decomposition and Analysis
@@ -971,6 +1021,7 @@ static RegisterPass<PMRobustness> X("pmrobust", "Persistent Memory Robustness An
 static void registerPMRobustness(const PassManagerBuilder &,
 							legacy::PassManagerBase &PM) {
 	PM.add(createPromoteMemoryToRegisterPass());
+	PM.add(createEarlyCSEPass(false));
 	PM.add(new PMRobustness());
 }
 /* Enable the pass when opt level is greater than 0 */

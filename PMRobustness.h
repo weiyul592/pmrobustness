@@ -149,6 +149,25 @@ struct ob_state_t {
 		}
 	}
 
+	void setFlush(unsigned start, unsigned len) {
+		unsigned end;
+		if (len == (unsigned)-1) {
+			assert("false");
+		} else if (start + len > end){
+			end = size;
+		} else {
+			end = start + len;
+		}
+
+		if (start >= size) {
+			assert(false && "Flush unknown bits");
+		}
+
+
+		flushed_bits.set(start, end);
+		clwb_bits.reset(start, end);	
+	}
+
 	// return true: modified; return else: unchanged
 	bool setEscape(unsigned start, unsigned len, bool objectEscape = false) {
 		escaped = objectEscape;

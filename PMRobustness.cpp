@@ -36,6 +36,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
@@ -55,6 +56,7 @@ namespace {
 	struct PMRobustness : public FunctionPass {
 		PMRobustness() : FunctionPass(ID) {}
 		StringRef getPassName() const override;
+		bool doInitialization(Module &M) override;
 		bool runOnFunction(Function &F) override;
 		void getAnalysisUsage(AnalysisUsage &AU) const override;
 		void analyze(Function &F);
@@ -71,15 +73,18 @@ namespace {
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
-		void processFlush(state_t * map, Instruction * I);
+		//bool processFlush(state_t * map, Instruction * I, NVMOP op);
+		bool processFlushWrapperFunction(state_t * map, Instruction * I);
 
 		// TODO: Address check to be implemented
+		bool skipFunction(Function &F);
 		bool isPMAddr(const Value * Addr) { return true; }
 		bool mayInHeap(const Value * Addr);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
 		NVMOP whichNVMoperation(Instruction *I);
+		bool isFlushWrapperFunction(Instruction *I);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -108,7 +113,27 @@ StringRef PMRobustness::getPassName() const {
 	return "PMRobustness";
 }
 
+bool PMRobustness::doInitialization (Module &M) {
+	GlobalVariable *global_annos = M.getNamedGlobal("llvm.global.annotations");
+	if (global_annos) {
+		ConstantArray *a = cast<ConstantArray>(global_annos->getOperand(0));
+		for (unsigned i=0; i < a->getNumOperands(); i++) {
+			ConstantStruct *e = cast<ConstantStruct>(a->getOperand(i));
+			if (Function *fn = dyn_cast<Function>(e->getOperand(0)->getOperand(0))) {
+				StringRef anno = cast<ConstantDataArray>(cast<GlobalVariable>(e->getOperand(1)->getOperand(0))->getOperand(0))->getAsCString();
+				std::pair<StringRef, StringRef> Split = anno.split(":");
+				fn->addFnAttr(Split.first, Split.second);
+			}
+		}
+	}
+
+	return true;
+}
+
 bool PMRobustness::runOnFunction(Function &F) {
+	if (skipFunction(F))
+		return false;
+
 	//AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
 	//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
 
@@ -119,7 +144,7 @@ bool PMRobustness::runOnFunction(Function &F) {
 
 void PMRobustness::analyze(Function &F) {
 	if (true) {
-		//errs() << F.getName() << "\n------\n";
+		//errs() << "\n------\n" << F.getName() << "\n";
 		//F.dump();
 
 		// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
@@ -258,14 +283,14 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
+		} else if (isFlushWrapperFunction(I)) {
+			updated |= processFlushWrapperFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
 			if (op == NVM_FENCE) {
 				// TODO: fence operations
-			} else if (op == NVM_CLWB) {
-				// TODO: CLWB
-			} else if (op == NVM_CLFLUSH) {
-				// TODO: Flush
+			} else if (op == NVM_CLWB || op == NVM_CLFLUSH) {
+				// updated |= processFlush(map, I, op);
 			}
 		}
 	}
@@ -296,8 +321,8 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 		//errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
 		//
-		errs() << "CASI not implemented yet\n";
-	} else if (FenceInst *FI = dyn_cast<FenceInst>(I)) {
+		//errs() << "CASI not implemented yet\n";
+	} else if (isa<FenceInst>(I)) {
 		// Ignore for now
 		//errs() << "FenseInst not implemented yet\n";
 		//IRBuilder<> IRB(I);
@@ -352,8 +377,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	if (DecompGEP.isArray) {
 		//TODO: implement robustness checks for array
 		//errs() << I->getFunction()->getName() << "\n";
-		errs() << "Array encountered\t";
-		errs() << "Addr: " << *Addr << "\n";
+		//errs() << "Array encountered\t";
+		//errs() << "Addr: " << *Addr << "\n";
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
 		//I>getParent()->dump();
@@ -450,8 +475,8 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	if (DecompGEP.isArray) {
 		//TODO: implement robustness checks for array
 		//errs() << I->getFunction()->getName() << "\n";
-		errs() << "Array encountered\t";
-		errs() << "Addr: " << *Addr << "\n";
+		//errs() << "Array encountered\t";
+		//errs() << "Addr: " << *Addr << "\n";
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
 	} else if (offset == UNKNOWNOFFSET) {
@@ -513,9 +538,92 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	return updated;
 }
 
-void PMRobustness::processFlush(state_t * map, Instruction * I) {
-	
+bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
+	CallInst *callInst = cast<CallInst>(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	Function *callee = callInst->getCalledFunction();
+	assert(callee);
+
+	std::vector<StringRef> annotations;
+	StringRef AttrValue = callee->getFnAttribute("myflush").getValueAsString();
+	std::pair<StringRef, StringRef> Split = AttrValue.split("|");
+	annotations.push_back(Split.first);
+
+	while (!Split.second.empty()) {
+		Split = Split.second.split("|");
+		annotations.push_back(Split.first);
+	}
+
+	assert(callInst->arg_size() == annotations.size() &&
+		"annotations should match the number of paramaters");
+	Value *Addr = NULL;
+	Value *FlushSize = NULL;
+	for (unsigned i = 0; i < annotations.size(); i++) {
+		StringRef &token = annotations[i];
+		if (token == "addr") {
+			Addr = callInst->getArgOperand(i);
+		} else if (token == "size") {
+			FlushSize = callInst->getArgOperand(i);
+		} else {
+			assert(false && "bad annotation");
+		}
+	}
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		//TODO: implement robustness checks for array
+	} else if (offset == UNKNOWNOFFSET) {
+		// TODO: treat it the same way as array
+	} else {
+		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		ob_state_t *object_state = (*map)[DecompGEP.Base];
+		if (object_state == NULL) {
+			// TODO: to be solve in interprocedural analysis
+			//errs() << "FLush an unknown address\n";
+			assert(false && "Flush an unknown address");
+		} else {
+			//printDecomposedGEP(DecompGEP);
+			unsigned size = cast<ConstantInt>(FlushSize)->getZExtValue();
+			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
+			object_state->setFlush(offset, size);
+		}
+	}
+
+	return true;
 }
+
+/*
+bool PMRobustness::processFlush(state_t * map, Instruction * I, NVMOP op) {
+	CallInst *callInst = cast<CallInst>(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+
+	Value *Addr = callInst->getArgOperand(0);
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		//TODO: implement robustness checks for array
+	} else if (offset == UNKNOWNOFFSET) {
+		// TODO: treat it the same way as array
+	} else {
+		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		ob_state_t *object_state = (*map)[DecompGEP.Base];
+		if (object_state == NULL) {
+			// TODO: to be solve in interprocedural analysis
+			errs() << "FLush an unknown address\n";
+		} else {
+			printDecomposedGEP(DecompGEP);
+			object_state->setFlush(offset, -1);
+		}
+	}
+
+	return true;
+}*/
 
 unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
 	Type *OrigPtrTy = Addr->getType();
@@ -537,6 +645,13 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 	AU.setPreservesAll();
 	//AU.addRequired<AAResultsWrapperPass>();
 	//AU.addRequired<AndersenAAWrapperPass>();
+}
+
+bool PMRobustness::skipFunction(Function &F) {
+	if (F.hasFnAttribute("myflush"))
+		return false;
+
+	return false;
 }
 
 /** Simple may-analysis for checking if an address is in the heap
@@ -580,29 +695,43 @@ void PMRobustness::decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const
 NVMOP PMRobustness::whichNVMoperation(Instruction *I) {
 	IRBuilder<> IRB(I);
 
-	if (CallInst* callInst = dyn_cast<CallInst>(I)) {
+	if (CallInst *callInst = dyn_cast<CallInst>(I)) {
 		if (callInst->isInlineAsm()) {
 			InlineAsm *asmInline = dyn_cast<InlineAsm>(callInst->getCalledOperand());
 			StringRef asmStr = asmInline->getAsmString();
 			if (asmStr.contains("mfence") || asmStr.contains("sfence")) {
-				//errs() << "mfence/sfence seen\n";
+				//errs() << "mfence/sfence seen at\n";
 				//getPosition(I, IRB, true);
+				//errs() << *I << "\n";
 				return NVM_FENCE;
 			} else if (asmStr.contains("xsaveopt") || asmStr.contains("clflushopt")) {
-				//errs() << "clflushopt seen\n";
+				//errs() << "clflushopt seen at\n";
 				//getPosition(I, IRB, true);
+				//errs() << *I << "\n";
 				return NVM_CLWB;
 			} else if (asmStr.contains("clflush")) {
-				errs() << "clflush seen\n";
-				getPosition(I, IRB, true);
-				errs() << *I << "\n";
-				errs() << *asmInline << "\n";
+				assert(callInst->getArgOperand(0) == callInst->getArgOperand(1));
+				//errs() << "clflush seen at\n";
+				//getPosition(I, IRB, true);
+				//errs() << *I << "\n";
 				return NVM_CLFLUSH;
 			}
 		}
 	}
 	return NVM_UNKNOWN;
 }
+
+bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
+	if (CallInst *CI = dyn_cast<CallInst>(I)) {
+		if (Function *callee = CI->getCalledFunction()) {
+			if (callee->hasFnAttribute("myflush"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
 
 //===----------------------------------------------------------------------===//
 // GetElementPtr Instruction Decomposition and Analysis

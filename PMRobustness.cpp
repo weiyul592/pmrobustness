@@ -84,6 +84,8 @@ namespace {
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
 		NVMOP whichNVMoperation(Instruction *I);
+		NVMOP whichNVMoperation(StringRef flushtype);
+		NVMOP analyzeFlushType(Function &F);
 		bool isFlushWrapperFunction(Instruction *I);
 
 		const Value * GetLinearExpression(
@@ -569,6 +571,15 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		}
 	}
 
+	NVMOP FlushOp = NVM_UNKNOWN;
+	if (callee->hasFnAttribute("flush_type")) {
+		StringRef flushtype = callee->getFnAttribute("flush_type").getValueAsString();
+		FlushOp = whichNVMoperation(flushtype);
+	} else {
+		FlushOp = analyzeFlushType(*callee);
+	}
+	assert(FlushOp == NVM_CLWB || FlushOp == NVM_CLFLUSH);
+
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
@@ -588,7 +599,11 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 			//printDecomposedGEP(DecompGEP);
 			unsigned size = cast<ConstantInt>(FlushSize)->getZExtValue();
 			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
-			object_state->setFlush(offset, size);
+
+			if (FlushOp == NVM_CLFLUSH)
+				object_state->setFlush(offset, size);
+			else if (FlushOp == NVM_CLWB)
+				object_state->setClwb(offset, size);
 		}
 	}
 
@@ -710,7 +725,6 @@ NVMOP PMRobustness::whichNVMoperation(Instruction *I) {
 				//errs() << *I << "\n";
 				return NVM_CLWB;
 			} else if (asmStr.contains("clflush")) {
-				assert(callInst->getArgOperand(0) == callInst->getArgOperand(1));
 				//errs() << "clflush seen at\n";
 				//getPosition(I, IRB, true);
 				//errs() << *I << "\n";
@@ -719,6 +733,34 @@ NVMOP PMRobustness::whichNVMoperation(Instruction *I) {
 		}
 	}
 	return NVM_UNKNOWN;
+}
+
+NVMOP PMRobustness::whichNVMoperation(StringRef flushtype) {
+	if (flushtype.contains("mfence") || flushtype.contains("sfence")) {
+		return NVM_FENCE;
+	} else if (flushtype.contains("clflushopt")) {
+		return NVM_CLWB;
+	} else if (flushtype.contains("clflush")) {
+		return NVM_CLFLUSH;
+	}
+	return NVM_UNKNOWN;
+}
+
+NVMOP PMRobustness::analyzeFlushType(Function &F) {
+	NVMOP op = NVM_UNKNOWN;
+	for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
+		op = whichNVMoperation(&*I);
+		if (op != NVM_UNKNOWN) {
+			if (op == NVM_CLWB) {
+				F.addFnAttr("flush_type", "clflushopt");
+			} else if (op == NVM_CLFLUSH) {
+				F.addFnAttr("flush_type", "clflush");
+			}
+			break;
+		}
+	}
+
+	return op;
 }
 
 bool PMRobustness::isFlushWrapperFunction(Instruction *I) {

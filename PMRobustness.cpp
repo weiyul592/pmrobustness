@@ -322,8 +322,7 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 		updated |= processStore(map, I);
 		//errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
-		//
-		//errs() << "CASI not implemented yet\n";
+		errs() << "CASI not implemented yet\n";
 	} else if (isa<FenceInst>(I)) {
 		// Ignore for now
 		//errs() << "FenseInst not implemented yet\n";
@@ -383,7 +382,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		//errs() << "Addr: " << *Addr << "\n";
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
-		//I>getParent()->dump();
+		//printDecomposedGEP(DecompGEP);
+		//I->getParent()->dump();
 	} else if (offset == UNKNOWNOFFSET) {
 		// TODO: treat it the same way as array
 		/*
@@ -412,6 +412,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		updated |= object_state->setDirty(offset, TypeSize);
 
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
+		// TODO: Val should be PM Addr
 		if (Val && Val->getType()->isPointerTy() &&
 			mayInHeap(DecompGEP.Base)) {
 			DecomposedGEP ValDecompGEP;
@@ -425,9 +426,6 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				// TODO: start working here
 				// assert(false && "Fix me");
 			} else {
-				// Get the size of the pointer
-				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-
 				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
 				if (object_state == NULL) {
 					object_state = new ob_state_t();
@@ -437,9 +435,16 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 				if (offset == 0) {
 					// Mark the entire object as escaped
+					// TODO: the offset of the first field is also 0;
+					// could not tell if the object or the first field escapes
 					updated |= object_state->setEscape(0, object_state->getSize(), true);
 				} else {
 					// Only mark this field as escaped
+					// Example: *x = &p->f;
+
+					// Get the size of the field p->f
+					unsigned TypeSize = getMemoryAccessSize(Val, DL);
+
 					if (object_state->getSize() < offset + TypeSize) {
 						object_state->resize(offset + TypeSize);
 					}
@@ -1039,7 +1044,7 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 			unsigned FieldNo = CIdx->getZExtValue();
 			if (FieldNo != 0 || dyn_cast<ArrayType>(GEPOp->getSourceElementType())) {
 				Decomposed.isArray = true;
-				return false;
+				//return false;
 			}
 		}
 

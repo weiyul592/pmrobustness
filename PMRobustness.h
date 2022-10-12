@@ -5,6 +5,7 @@
 using namespace llvm;
 
 #define UNKNOWNOFFSET 0xffffffff
+#define VARIABLEOFFSET 0xfffffffe
 
 enum NVMOP {
 	NVM_CLWB,
@@ -52,11 +53,20 @@ struct DecomposedGEP {
 	uint64_t getOffsets() {
 		if (VarIndices.size() == 0) {
 			assert(StructOffset.getSExtValue() >= 0);
-			assert(OtherOffset.getSExtValue() >= 0);
+			//assert(OtherOffset.getSExtValue() >= 0);
+			if (OtherOffset.getSExtValue() < 0) {
+				errs() << "strange offset: " << StructOffset.getSExtValue() << ", " << OtherOffset.getSExtValue() << "\n";
+				return UNKNOWNOFFSET;
+			}
 
 			return StructOffset.getZExtValue() + OtherOffset.getZExtValue();
 		} else
-			return UNKNOWNOFFSET;
+			return VARIABLEOFFSET;
+	}
+
+	uint64_t getStructOffset() {
+		assert(StructOffset.getSExtValue() >= 0);
+		return StructOffset.getZExtValue();
 	}
 };
 
@@ -137,6 +147,10 @@ struct ob_state_t {
 	// return true: modified; return else: unchanged
 	bool setDirty(unsigned start, unsigned len) {
 		unsigned end = start + len;
+		if (end > size) {
+			resize(end);
+		}
+
 		int index1 = flushed_bits.find_first_in(start, end);
 		int index2 = clwb_bits.find_first_in(start, end);
 
@@ -149,6 +163,7 @@ struct ob_state_t {
 		}
 	}
 
+	// TODO: start + len and size?
 	void setFlush(unsigned start, unsigned len) {
 		unsigned end;
 		if (len == (unsigned)-1) {
@@ -167,6 +182,7 @@ struct ob_state_t {
 		clwb_bits.reset(start, end);
 	}
 
+	// TODO: start + len and size?
 	void setClwb(unsigned start, unsigned len) {
 		unsigned end;
 		if (len == (unsigned)-1) {
@@ -188,11 +204,14 @@ struct ob_state_t {
 		clwb_bits &= tmp;
 	}
 
-
 	// return true: modified; return else: unchanged
 	bool setEscape(unsigned start, unsigned len, bool objectEscape = false) {
 		escaped = objectEscape;
 		unsigned end = start + len;
+		if (end > size) {
+			resize(end);
+		}
+
 		int index = escaped_bits.find_first_unset_in(start, end);
 		if (index == -1)
 			return false;

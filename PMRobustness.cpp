@@ -83,6 +83,7 @@ namespace {
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
+		unsigned getFieldSize(Value *Addr, const DataLayout &DL);
 		NVMOP whichNVMoperation(Instruction *I);
 		NVMOP whichNVMoperation(StringRef flushtype);
 		NVMOP analyzeFlushType(Function &F);
@@ -384,7 +385,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		//getPosition(I, IRB, true);
 		//printDecomposedGEP(DecompGEP);
 		//I->getParent()->dump();
-	} else if (offset == UNKNOWNOFFSET) {
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 		/*
 		errs() << "UNKNOWN offset encountered\t";
@@ -405,10 +406,6 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 #endif
 		}
 
-		if (object_state->getSize() < offset + TypeSize) {
-			object_state->resize(offset + TypeSize);
-		}
-
 		updated |= object_state->setDirty(offset, TypeSize);
 
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
@@ -420,9 +417,20 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 			unsigned offset = ValDecompGEP.getOffsets();
 
 			if (ValDecompGEP.isArray) {
-				// TODO: ignore for now
-				//assert(false && "Fix me");
-			} else if (offset == UNKNOWNOFFSET) {
+				// e.g. struct { int A; int arr[10]; };
+				// StructOffset is the beginning address of arr.
+				// TODO: can we compute the size of the arr field?
+				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
+				if (object_state == NULL) {
+					object_state = new ob_state_t();
+					(*map)[ValDecompGEP.Base] = object_state;
+					updated |= true;
+				}
+
+				// Mark the start byte of the arr as escaped
+				unsigned startByte = ValDecompGEP.getStructOffset();
+				updated |= object_state->setEscape(startByte, 1);
+			} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 				// TODO: start working here
 				// assert(false && "Fix me");
 			} else {
@@ -435,7 +443,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 				if (offset == 0) {
 					// Mark the entire object as escaped
-					// TODO: the offset of the first field is also 0;
+					// FIXME: the offset of the first field is also 0;
 					// could not tell if the object or the first field escapes
 					updated |= object_state->setEscape(0, object_state->getSize(), true);
 				} else {
@@ -443,13 +451,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 					// Example: *x = &p->f;
 
 					// Get the size of the field p->f
-					unsigned TypeSize = getMemoryAccessSize(Val, DL);
-
-					if (object_state->getSize() < offset + TypeSize) {
-						object_state->resize(offset + TypeSize);
-					}
-
-					updated |= object_state->setEscape(offset, TypeSize, false);
+					unsigned TypeSize = getFieldSize(Val, DL);
+					updated |= object_state->setEscape(offset, TypeSize);
 				}
 			}
 		}
@@ -486,7 +489,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		//errs() << "Addr: " << *Addr << "\n";
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
-	} else if (offset == UNKNOWNOFFSET) {
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
 		if (I->isAtomic() && isa<LoadInst>(I)) {
@@ -502,10 +505,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 #ifdef PMROBUST_DEBUG
 				value_list.push_back(DecompGEP.Base);
 #endif
-			}
-
-			if (object_state->getSize() < offset + TypeSize) {
-				object_state->resize(offset + TypeSize);
 			}
 
 			updated |= object_state->setDirty(offset, TypeSize);
@@ -532,10 +531,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 #ifdef PMROBUST_DEBUG
 				value_list.push_back(I);
 #endif
-			}
-
-			if (object_state->getSize() < offset + TypeSize) {
-				object_state->resize(offset + TypeSize);
 			}
 
 			updated |= object_state->setEscape(0, object_state->getSize(), true);
@@ -591,17 +586,16 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 
 	if (DecompGEP.isArray) {
 		//TODO: implement robustness checks for array
-	} else if (offset == UNKNOWNOFFSET) {
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
-		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = (*map)[DecompGEP.Base];
 		if (object_state == NULL) {
 			// TODO: to be solve in interprocedural analysis
 			//errs() << "FLush an unknown address\n";
 			assert(false && "Flush an unknown address");
 		} else {
-			//printDecomposedGEP(DecompGEP);
 			unsigned size = cast<ConstantInt>(FlushSize)->getZExtValue();
 			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
 
@@ -660,6 +654,16 @@ unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
 
 	return TypeSize / 8;
 }
+
+unsigned PMRobustness::getFieldSize(Value *Addr, const DataLayout &DL) {
+	Type *OrigPtrTy = Addr->getType();
+	Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
+	assert(OrigTy->isSized());
+	unsigned TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
+
+	return TypeSize / 8;
+}
+
 
 void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 	AU.setPreservesAll();
@@ -1060,6 +1064,7 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 
 				Decomposed.StructOffset +=
 					DL.getStructLayout(STy)->getElementOffset(FieldNo);
+
 				continue;
 			}
 

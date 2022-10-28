@@ -23,6 +23,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
@@ -48,7 +49,7 @@
 //#include "andersen/include/AndersenAA.h"
 //#include "llvm/Analysis/AliasAnalysis.h"
 
-#define PMROBUST_DEBUG
+//#define PMROBUST_DEBUG
 #define DEBUG_TYPE "PMROBUST_DEBUG"
 #include <llvm/IR/DebugLoc.h>
 
@@ -73,8 +74,8 @@ namespace {
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
-		//bool processFlush(state_t * map, Instruction * I, NVMOP op);
 		bool processFlushWrapperFunction(state_t * map, Instruction * I);
+		//bool processParamAnnotationFunction(Instruction * I);
 
 		// TODO: Address check to be implemented
 		bool skipFunction(Function &F);
@@ -87,7 +88,11 @@ namespace {
 		NVMOP whichNVMoperation(Instruction *I);
 		NVMOP whichNVMoperation(StringRef flushtype);
 		NVMOP analyzeFlushType(Function &F);
+		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
+		addr_set_t * getOrCreateUnflushedAddrSet(Function * F);
+		bool checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
+		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -108,6 +113,8 @@ namespace {
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> WorkList;
 
+		DenseMap<Function *, addr_set_t *> UnflushedArrays;
+
 		unsigned MaxLookupSearchDepth = 100;
 	};
 }
@@ -116,6 +123,7 @@ StringRef PMRobustness::getPassName() const {
 	return "PMRobustness";
 }
 
+/* annotations -> myflush:[addr|size|ignore] */
 bool PMRobustness::doInitialization (Module &M) {
 	GlobalVariable *global_annos = M.getNamedGlobal("llvm.global.annotations");
 	if (global_annos) {
@@ -286,7 +294,9 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
-		} else if (isFlushWrapperFunction(I)) {
+		} /*else if (isParamAnnotationFunction(I)) {
+			processParamAnnotationFunction(I);
+		}*/ else if (isFlushWrapperFunction(I)) {
 			updated |= processFlushWrapperFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
@@ -323,7 +333,9 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 		updated |= processStore(map, I);
 		//errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
+#ifdef PMROBUST_DEBUG
 		errs() << "CASI not implemented yet\n";
+#endif
 	} else if (isa<FenceInst>(I)) {
 		// Ignore for now
 		//errs() << "FenseInst not implemented yet\n";
@@ -377,14 +389,17 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	unsigned offset = DecompGEP.getOffsets();
 
 	if (DecompGEP.isArray) {
-		//TODO: implement robustness checks for array
-		//errs() << I->getFunction()->getName() << "\n";
+		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction());
+		DecomposedGEP * tmp = new DecomposedGEP();
+		tmp->copyFrom(DecompGEP);
+		unflushed_addr->insert({Addr, tmp});
+
+		errs() << "Addr inserted: " << *Addr << "\n";
 		//errs() << "Array encountered\t";
-		//errs() << "Addr: " << *Addr << "\n";
-		//errs() << *I << "\n";
-		//getPosition(I, IRB, true);
-		//printDecomposedGEP(DecompGEP);
-		//I->getParent()->dump();
+		errs() << *I << "\n";
+		//I->getFunction()->dump();
+		getPosition(I, IRB, true);
+		errs() << "\n";
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 		/*
@@ -432,7 +447,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				updated |= object_state->setEscape(startByte, 1);
 			} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 				// TODO: start working here
-				// assert(false && "Fix me");
+				//assert(false && "Fix me");
 			} else {
 				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
 				if (object_state == NULL) {
@@ -522,7 +537,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 				assert(false && "fix me");
 			}
 
-			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+			//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			ob_state_t *object_state = (*map)[LIDecompGEP.Base];
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
@@ -566,6 +581,8 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 			Addr = callInst->getArgOperand(i);
 		} else if (token == "size") {
 			FlushSize = callInst->getArgOperand(i);
+		} else if (token == "ignore") {
+			// Ignore
 		} else {
 			assert(false && "bad annotation");
 		}
@@ -584,8 +601,15 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
 
+	errs() << "flush wrapper " << *Addr << "\n\tfor " << *FlushSize << "\n";
+	//I->getFunction()->dump();
+	IRBuilder<> IRB(I);
+	getPosition(I, IRB, true);
+
 	if (DecompGEP.isArray) {
-		//TODO: implement robustness checks for array
+		//TODO: compare GEP address
+		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction());
+		checkUnflushedAddress(AddrSet, Addr, DecompGEP);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
@@ -593,7 +617,7 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		ob_state_t *object_state = (*map)[DecompGEP.Base];
 		if (object_state == NULL) {
 			// TODO: to be solve in interprocedural analysis
-			//errs() << "FLush an unknown address\n";
+			errs() << "Flush an unknown address\n";
 			assert(false && "Flush an unknown address");
 		} else {
 			unsigned size = cast<ConstantInt>(FlushSize)->getZExtValue();
@@ -610,33 +634,15 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 }
 
 /*
-bool PMRobustness::processFlush(state_t * map, Instruction * I, NVMOP op) {
+bool PMRobustness::processParamAnnotationFunction(Instruction * I) {
 	CallInst *callInst = cast<CallInst>(I);
 	const DataLayout &DL = I->getModule()->getDataLayout();
 
-	Value *Addr = callInst->getArgOperand(0);
+	Value *str = callInst->getArgOperand(0)->stripPointerCasts();
+	Constant *c = cast<GlobalVariable>(str)->getInitializer();
+	errs() << cast<ConstantDataArray>(c)->getAsCString() << "\n";
 
-	DecomposedGEP DecompGEP;
-	decomposeAddress(DecompGEP, Addr, DL);
-	unsigned offset = DecompGEP.getOffsets();
-
-	if (DecompGEP.isArray) {
-		//TODO: implement robustness checks for array
-	} else if (offset == UNKNOWNOFFSET) {
-		// TODO: treat it the same way as array
-	} else {
-		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-		ob_state_t *object_state = (*map)[DecompGEP.Base];
-		if (object_state == NULL) {
-			// TODO: to be solve in interprocedural analysis
-			errs() << "FLush an unknown address\n";
-		} else {
-			printDecomposedGEP(DecompGEP);
-			object_state->setFlush(offset, -1);
-		}
-	}
-
-	return true;
+	return false;
 }*/
 
 unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
@@ -666,14 +672,16 @@ unsigned PMRobustness::getFieldSize(Value *Addr, const DataLayout &DL) {
 
 
 void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
-	AU.setPreservesAll();
+	AU.addRequiredTransitive<AAResultsWrapperPass>();
+	AU.addRequiredTransitive<MemoryDependenceWrapperPass>();
 	//AU.addRequired<AAResultsWrapperPass>();
 	//AU.addRequired<AndersenAAWrapperPass>();
+	AU.setPreservesAll();
 }
 
 bool PMRobustness::skipFunction(Function &F) {
-	if (F.hasFnAttribute("myflush"))
-		return false;
+	if (F.hasFnAttribute("myflush") || F.hasFnAttribute("ignore"))
+		return true;
 
 	return false;
 }
@@ -681,7 +689,7 @@ bool PMRobustness::skipFunction(Function &F) {
 /** Simple may-analysis for checking if an address is in the heap
  *  TODO: may need more sophisticated checks
  **/
-bool PMRobustness::mayInHeap(const Value * Addr) {
+bool PMRobustness::mayInHeap(const Value * Addr /*, Instruction *I*/) {
 	if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>((Value *)Addr)) {
 		Value * BaseAddr = GEP->getPointerOperand();
 
@@ -697,6 +705,14 @@ bool PMRobustness::mayInHeap(const Value * Addr) {
 			}
 		}
 	}
+
+	// TODO: if pointer comes from function parameters; check the caller
+	// Attach metadata to each uses of function parameters
+	/*
+	if (I->getMetadata(FUNC_PARAM_USE)) {
+		
+	}
+	*/
 
 	// Address may be in the heap. We don't know for sure.
 	return true;
@@ -772,6 +788,18 @@ NVMOP PMRobustness::analyzeFlushType(Function &F) {
 	return op;
 }
 
+/*
+bool PMRobustness::isParamAnnotationFunction(Instruction *I) {
+	if (CallInst *CI = dyn_cast<CallInst>(I)) {
+		if (Function *callee = CI->getCalledFunction()) {
+			if (callee->hasFnAttribute("magic_function"))
+				return true;
+		}
+	}
+
+	return false;
+}*/
+
 bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	if (CallInst *CI = dyn_cast<CallInst>(I)) {
 		if (Function *callee = CI->getCalledFunction()) {
@@ -781,6 +809,166 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	}
 
 	return false;
+}
+
+addr_set_t * PMRobustness::getOrCreateUnflushedAddrSet(Function * F) {
+	addr_set_t * set = UnflushedArrays[F];
+	if (set == NULL) {
+		set = new addr_set_t();
+		UnflushedArrays[F] = set;
+	}
+
+	return set;
+}
+
+bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP) {
+	addr_set_t::iterator it = AddrSet->find(Addr);
+	if (it != AddrSet->end()) {
+		AddrSet->erase(it);
+		errs() << "Addr is flushed: " << *Addr << "\n";
+		return true;
+	}
+
+	MemoryDependenceResults &MDA = getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
+
+	Value *V = Addr;
+	Value *VBase = NULL;
+	while (true) {
+		Operator *Op = dyn_cast<Operator>(V);
+		if (Op->getOpcode() == Instruction::BitCast ||
+			Op->getOpcode() == Instruction::AddrSpaceCast) {
+			V = Op->getOperand(0);
+			continue;
+		}
+
+		GEPOperator *GEPOp = dyn_cast<GEPOperator>(Op);
+		if (!GEPOp) {
+			errs() << "not GEP\n";
+			break;
+		}
+
+		// Don't attempt to analyze GEPs over unsized objects.
+		if (!GEPOp->getSourceElementType()->isSized()) {
+			assert(false && "Cannot compare unsized objects");
+			return false;
+		}
+
+		VBase = GEPOp->getOperand(0);
+		if (Instruction *Load = dyn_cast<Instruction>(VBase)) {
+			MemDepResult Res = MDA.getDependency(cast<Instruction>(Load));
+			if (!Res.isNonLocal()) {
+				errs() << "\nDepends on: " << *Res.getInst() << "\n";
+				if (isa<StoreInst>(Res.getInst())) {
+					VBase = Res.getInst()->getOperand(0);
+				}
+			} else {
+				errs() << "\nNonLocal Inst: " << "\n";
+				Load->getFunction()->dump();
+			}
+		} else {
+			errs() << "GEP Base not a load: " << *VBase << "\n";
+		}
+
+		break;
+	}
+
+	errs() << "V: " << *V << "\n";
+	errs() << "VBase: " << *VBase << "\n";
+	// Iterate over the set of unflushed addresses and compare the decomposed GEP
+	for (addr_set_t::iterator it = AddrSet->begin(); it != AddrSet->end(); it++) {
+		Value *targetAddr = it->first;
+		Value *targetBase = NULL;
+		DecomposedGEP *targetAddrDecom = it->second;
+
+		//printDecomposedGEP(*targetAddrDecom);
+
+		// Compare offsets and variable indices in decomposed GEP
+		if (compareDecomposedGEP(*targetAddrDecom, DecompGEP)) {
+			AddrSet->erase(it);
+			return true;
+		}
+
+		while (true) {
+			Operator *Op = dyn_cast<Operator>(targetAddr);
+			if (Op->getOpcode() == Instruction::BitCast ||
+					Op->getOpcode() == Instruction::AddrSpaceCast) {
+				targetAddr = Op->getOperand(0);
+				continue;
+			}
+
+			GEPOperator *GEPOp = dyn_cast<GEPOperator>(Op);
+			if (!GEPOp) {
+				errs() << "target not GEP\n";
+				break;
+			}
+
+	        // Don't attempt to analyze GEPs over unsized objects.
+			if (!GEPOp->getSourceElementType()->isSized()) {
+				continue;
+	        }
+
+			targetBase = GEPOp->getOperand(0);
+			break;
+		}
+
+		errs() << "targetAddr: " << *targetAddr << "\n";
+		if (targetBase)
+			errs() << "targetBase: " << *targetBase << "\n";
+		else
+			errs() << "targetBase: NULL\n";
+
+		if (VBase == NULL && targetBase == NULL) {
+			// Both addresses are not GEP instructions
+			if (V == targetAddr) {
+				AddrSet->erase(it);
+				return true;
+			}
+		} else if (VBase != NULL && targetBase != NULL) {
+			// Compare indices in GEP instructions
+			if (VBase == targetBase) {
+				GEPOperator *VGEPOp = dyn_cast<GEPOperator>(V);
+				GEPOperator *targetGEPOp = dyn_cast<GEPOperator>(targetAddr);
+
+				if (VGEPOp->getNumIndices() != targetGEPOp->getNumIndices())
+					continue;
+
+				bool diff = false;
+				for (unsigned i = 1; i < VGEPOp->getNumIndices(); i++) {
+					if (VGEPOp->getOperand(i) != targetGEPOp->getOperand(i)) {
+						diff = true;
+						break;
+					}
+				}
+
+				if (!diff) {
+					errs() << "Address match!!!\n";
+					AddrSet->erase(it);
+					return true;
+				}
+			}
+		}
+	}
+
+	assert(false && "flush an array address not seen before");
+	return false;
+}
+
+bool PMRobustness::compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2) {
+	if (GEP1.OtherOffset != GEP2.OtherOffset ||
+		GEP1.StructOffset != GEP2.StructOffset) {
+		return false;
+	}
+
+	if (GEP1.VarIndices.size() != GEP2.VarIndices.size())
+		return false;
+
+	for (unsigned i = 0; i < GEP1.VarIndices.size(); i++) {
+		if (GEP1.VarIndices[i] != GEP2.VarIndices[i]) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 

@@ -6,6 +6,13 @@ using namespace llvm;
 
 #define UNKNOWNOFFSET 0xffffffff
 #define VARIABLEOFFSET 0xfffffffe
+#define FUNC_PARAM_USE 100
+
+struct ob_state_t;
+struct DecomposedGEP;
+
+typedef DenseMap<const Value *, ob_state_t *> state_t;
+typedef DenseMap<Value *, DecomposedGEP *> addr_set_t;
 
 enum NVMOP {
 	NVM_CLWB,
@@ -55,7 +62,9 @@ struct DecomposedGEP {
 			assert(StructOffset.getSExtValue() >= 0);
 			//assert(OtherOffset.getSExtValue() >= 0);
 			if (OtherOffset.getSExtValue() < 0) {
+#ifdef PMROBUST_DEBUG
 				errs() << "strange offset: " << StructOffset.getSExtValue() << ", " << OtherOffset.getSExtValue() << "\n";
+#endif
 				return UNKNOWNOFFSET;
 			}
 
@@ -67,6 +76,14 @@ struct DecomposedGEP {
 	uint64_t getStructOffset() {
 		assert(StructOffset.getSExtValue() >= 0);
 		return StructOffset.getZExtValue();
+	}
+
+	void copyFrom(DecomposedGEP &other) {
+		Base = other.Base;
+		StructOffset = other.StructOffset;
+		OtherOffset = other.OtherOffset;
+		VarIndices = other.VarIndices;
+		isArray = other.isArray;
 	}
 };
 
@@ -246,13 +263,11 @@ struct ob_state_t {
 	}
 };
 
-typedef DenseMap<const Value *, ob_state_t *> state_t;
-
 void printDecomposedGEP(DecomposedGEP &Decom) {
 	errs() << "Store Base: " << *Decom.Base << "\t";
 	errs() << "Struct Offset: " << Decom.StructOffset << "\t";
 	errs() << "Other Offset: " << Decom.OtherOffset << "\t";
-	errs() << "Has VarIndices: " << Decom.VarIndices.size() << "\t";
+	errs() << "Has VarIndices: " << Decom.VarIndices.size() << "\n";
 }
 
 static inline Value *getPosition(Instruction * I, IRBuilder <> IRB, bool print = false)

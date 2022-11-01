@@ -349,12 +349,12 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 bool PMRobustness::processMemIntrinsic(state_t * map, Instruction * I) {
 	bool updated = false;
 
-    if (MemSetInst *M = dyn_cast<MemSetInst>(I)) {
+    if (dyn_cast<MemSetInst>(I)) {
 		// TODO
 		//errs() << "memset addr: " << M->getArgOperand(0) << "\t";
 		//errs() << "const bit: " << *M->getArgOperand(1) << "\t";
 		//errs() << "size: " << *M->getArgOperand(2) << "\n\n";
-    } else if (MemTransferInst *M = dyn_cast<MemTransferInst>(I)) {
+    } else if (dyn_cast<MemTransferInst>(I)) {
 		// TODO
     }
 	return updated;
@@ -396,7 +396,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 		errs() << "Addr inserted: " << *Addr << "\n";
 		//errs() << "Array encountered\t";
-		errs() << *I << "\n";
+		errs() << *I << "\n  ";
 		//I->getFunction()->dump();
 		getPosition(I, IRB, true);
 		errs() << "\n";
@@ -601,10 +601,10 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
 
-	errs() << "flush wrapper " << *Addr << "\n\tfor " << *FlushSize << "\n";
-	//I->getFunction()->dump();
+	errs() << "flush wrapper " << *Addr << "\n  for " << *FlushSize << "\n  ";
 	IRBuilder<> IRB(I);
 	getPosition(I, IRB, true);
+	//I->getFunction()->dump();
 
 	if (DecompGEP.isArray) {
 		//TODO: compare GEP address
@@ -617,8 +617,10 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		ob_state_t *object_state = (*map)[DecompGEP.Base];
 		if (object_state == NULL) {
 			// TODO: to be solve in interprocedural analysis
+			// public method calls can modify the state of objects e.g. masstress.cpp:320
+			(*map)[DecompGEP.Base] = new ob_state_t(); // FIXME: To be removed
 			errs() << "Flush an unknown address\n";
-			assert(false && "Flush an unknown address");
+			//assert(false && "Flush an unknown address");
 		} else {
 			unsigned size = cast<ConstantInt>(FlushSize)->getZExtValue();
 			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
@@ -857,9 +859,11 @@ bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, Dec
 		if (Instruction *Load = dyn_cast<Instruction>(VBase)) {
 			MemDepResult Res = MDA.getDependency(cast<Instruction>(Load));
 			if (!Res.isNonLocal()) {
-				errs() << "\nDepends on: " << *Res.getInst() << "\n";
-				if (isa<StoreInst>(Res.getInst())) {
-					VBase = Res.getInst()->getOperand(0);
+				if (Res.getInst()) {
+					errs() << "\nDepends on: " << *Res.getInst() << "\n";
+					if (isa<StoreInst>(Res.getInst())) {
+						VBase = Res.getInst()->getOperand(0);
+					}
 				}
 			} else {
 				errs() << "\nNonLocal Inst: " << "\n";
@@ -885,6 +889,7 @@ bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, Dec
 		// Compare offsets and variable indices in decomposed GEP
 		if (compareDecomposedGEP(*targetAddrDecom, DecompGEP)) {
 			AddrSet->erase(it);
+			errs() << "match 1\n";
 			return true;
 		}
 
@@ -921,6 +926,7 @@ bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, Dec
 			// Both addresses are not GEP instructions
 			if (V == targetAddr) {
 				AddrSet->erase(it);
+				errs() << "match 2\n";
 				return true;
 			}
 		} else if (VBase != NULL && targetBase != NULL) {
@@ -941,7 +947,7 @@ bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, Dec
 				}
 
 				if (!diff) {
-					errs() << "Address match!!!\n";
+					errs() << "match 3\n";
 					AddrSet->erase(it);
 					return true;
 				}
@@ -949,7 +955,8 @@ bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, Dec
 		}
 	}
 
-	assert(false && "flush an array address not seen before");
+	errs() << "flush an array address not seen before\n";
+	//assert(false && "flush an array address not seen before");
 	return false;
 }
 

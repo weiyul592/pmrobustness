@@ -185,14 +185,16 @@ struct ob_state_t {
 		unsigned end;
 		if (len == (unsigned)-1) {
 			assert("false");
-		} else if (start + len > end){
+		} else if (start + len > size){
 			end = size;
 		} else {
 			end = start + len;
 		}
 
 		if (start >= size) {
-			assert(false && "Flush unknown bits");
+			errs() << "FIXME: Flush unknown bits\n";
+			return;
+			//assert(false && "Flush unknown bits");
 		}
 
 		flushed_bits.set(start, end);
@@ -204,7 +206,7 @@ struct ob_state_t {
 		unsigned end;
 		if (len == (unsigned)-1) {
 			assert("false");
-		} else if (start + len > end){
+		} else if (start + len > size){
 			end = size;
 		} else {
 			end = start + len;

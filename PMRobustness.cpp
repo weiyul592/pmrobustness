@@ -54,13 +54,13 @@
 #include <llvm/IR/DebugLoc.h>
 
 namespace {
-	struct PMRobustness : public FunctionPass {
-		PMRobustness() : FunctionPass(ID) {}
+	struct PMRobustness : public ModulePass {
+		PMRobustness() : ModulePass(ID) {}
 		StringRef getPassName() const override;
 		bool doInitialization(Module &M) override;
-		bool runOnFunction(Function &F) override;
+		bool runOnModule(Module &M) override;
 		void getAnalysisUsage(AnalysisUsage &AU) const override;
-		void analyze(Function &F);
+		void analyzeFunction(Function &F);
 
 		static char ID;
 		//AliasAnalysis *AA;
@@ -111,7 +111,7 @@ namespace {
 		DenseMap<const Instruction *, state_t *> States;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
-		std::list<BasicBlock *> WorkList;
+		std::list<BasicBlock *> BlockWorklist;
 
 		DenseMap<Function *, addr_set_t *> UnflushedArrays;
 
@@ -141,92 +141,112 @@ bool PMRobustness::doInitialization (Module &M) {
 	return true;
 }
 
-bool PMRobustness::runOnFunction(Function &F) {
-	if (skipFunction(F))
-		return false;
+bool PMRobustness::runOnModule(Module &M) {
+	std::list<Function *> FunctionWorklist;
+	for (Function &F : M) {
+		if (!F.use_empty() && !F.isDeclaration()) {
+			FunctionWorklist.push_back(&F);
+		} else if (F.getName() == "main") {
+			FunctionWorklist.push_back(&F);
+		} else {
+#ifdef PMROBUST_DEBUG
+			if (F.isDeclaration()) {
+				errs() << "{" << F.empty() << "," << !F.isMaterializable() << "}\n";
+				errs() << F.getName() << " isDeclaration ignored\n";
+			}
+#endif
+		}
+	}
 
-	//AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
-	//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
+	while (!FunctionWorklist.empty()) {
+		Function *F = FunctionWorklist.front();
+		FunctionWorklist.pop_front();
 
-	analyze(F);
+		if (skipFunction(*F))
+			continue;
+
+		//AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+		//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
+
+		//errs() << "processing " << F->getName() << "\n";
+		analyzeFunction(*F);
+	}
 
 	return true;
 }
 
-void PMRobustness::analyze(Function &F) {
-	if (true) {
-		//errs() << "\n------\n" << F.getName() << "\n";
-		//F.dump();
+void PMRobustness::analyzeFunction(Function &F) {
+	//errs() << "\n------\n" << F.getName() << "\n";
+	//F.dump();
 
-		// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
-		DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
-		DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
+	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
+	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
+	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
 
-		WorkList.push_back(&F.getEntryBlock());
-		while (!WorkList.empty()) {
-			BasicBlock *block = WorkList.front();
-			WorkList.pop_front();
+	BlockWorklist.push_back(&F.getEntryBlock());
+	while (!BlockWorklist.empty()) {
+		BasicBlock *block = BlockWorklist.front();
+		BlockWorklist.pop_front();
 
-			//errs() << "processing block: "<< block << "\n";
-			bool changed = false;
-			BasicBlock::iterator prev = block->begin();
-			for (BasicBlock::iterator it = block->begin(); it != block->end();) {
-				state_t * state = States[&*it];
+		//errs() << "processing block: "<< block << "\n";
+		bool changed = false;
+		BasicBlock::iterator prev = block->begin();
+		for (BasicBlock::iterator it = block->begin(); it != block->end();) {
+			state_t * state = States[&*it];
 
-				if (state == NULL) {
-					state = new state_t();
-					States[&*it] = state;
-					changed |= true;
-				}
-
-				// Build state from predecessors' states
-				if (it == block->begin()) {
-					// First instruction; take the union of predecessors' states
-					if (BasicBlock *pred = block->getUniquePredecessor()) {
-						// Unique predecessor; copy the state of last instruction in the pred block
-						state_t * prev_s = States[pred->getTerminator()];
-						if (prev_s == NULL)
-							WorkList.push_back(pred);
-						else
-							copyState(prev_s, state);
-					} else {
-						// Multiple predecessors
-						SmallPtrSet<BasicBlock *, 8> *pred_list = block_predecessors[block];
-						if (pred_list == NULL) {
-							pred_list = new SmallPtrSet<BasicBlock *, 8>();
-							block_predecessors[block] = pred_list;
-							for (BasicBlock *pred : predecessors(block)) {
-								pred_list->insert(pred);
-							}
-						}
-
-						copyMergedState(pred_list, state);
-					}
-				} else {
-					// Copy the previous instruction's state
-					copyState(States[&*prev], state);
-				}
-
-				if (update(state, &*it))
-					changed |= true;
-
-				prev = it;
-				it++;
+			if (state == NULL) {
+				state = new state_t();
+				States[&*it] = state;
+				changed |= true;
 			}
 
-			if (changed) {
-				SmallPtrSet<BasicBlock *, 8> *succ_list = block_successors[block];
-				if (succ_list == NULL) {
-					succ_list = new SmallPtrSet<BasicBlock *, 8>();
-					block_successors[block] = succ_list;
-					for (BasicBlock *succ : successors(block)) {
-						succ_list->insert(succ);
+			// Build state from predecessors' states
+			if (it == block->begin()) {
+				// First instruction; take the union of predecessors' states
+				if (BasicBlock *pred = block->getUniquePredecessor()) {
+					// Unique predecessor; copy the state of last instruction in the pred block
+					state_t * prev_s = States[pred->getTerminator()];
+					if (prev_s == NULL)
+						BlockWorklist.push_back(pred);
+					else
+						copyState(prev_s, state);
+				} else {
+					// Multiple predecessors
+					SmallPtrSet<BasicBlock *, 8> *pred_list = block_predecessors[block];
+					if (pred_list == NULL) {
+						pred_list = new SmallPtrSet<BasicBlock *, 8>();
+						block_predecessors[block] = pred_list;
+						for (BasicBlock *pred : predecessors(block)) {
+							pred_list->insert(pred);
+						}
 					}
-				}
 
-				for (BasicBlock *succ : *succ_list) {
-					WorkList.push_back(succ);
+					copyMergedState(pred_list, state);
 				}
+			} else {
+				// Copy the previous instruction's state
+				copyState(States[&*prev], state);
+			}
+
+			if (update(state, &*it))
+				changed |= true;
+
+			prev = it;
+			it++;
+		}
+
+		if (changed) {
+			SmallPtrSet<BasicBlock *, 8> *succ_list = block_successors[block];
+			if (succ_list == NULL) {
+				succ_list = new SmallPtrSet<BasicBlock *, 8>();
+				block_successors[block] = succ_list;
+				for (BasicBlock *succ : successors(block)) {
+					succ_list->insert(succ);
+				}
+			}
+
+			for (BasicBlock *succ : *succ_list) {
+				BlockWorklist.push_back(succ);
 			}
 		}
 	}
@@ -256,7 +276,7 @@ void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, sta
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = States[pred->getTerminator()];
 		if (s == NULL) {
-			WorkList.push_back(pred);
+			BlockWorklist.push_back(pred);
 			continue;
 		}
 
@@ -416,9 +436,6 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 			object_state = new ob_state_t();
 			(*map)[DecompGEP.Base] = object_state;
 			updated |= true;
-#ifdef PMROBUST_DEBUG
-			value_list.push_back(DecompGEP.Base);
-#endif
 		}
 
 		updated |= object_state->setDirty(offset, TypeSize);
@@ -517,9 +534,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 				object_state = new ob_state_t();
 				(*map)[DecompGEP.Base] = object_state;
 				updated |= true;
-#ifdef PMROBUST_DEBUG
-				value_list.push_back(DecompGEP.Base);
-#endif
 			}
 
 			updated |= object_state->setDirty(offset, TypeSize);
@@ -543,9 +557,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 				object_state = new ob_state_t();
 				(*map)[LIDecompGEP.Base] = object_state;
 				updated |= true;
-#ifdef PMROBUST_DEBUG
-				value_list.push_back(I);
-#endif
 			}
 
 			updated |= object_state->setEscape(0, object_state->getSize(), true);
@@ -682,8 +693,9 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 bool PMRobustness::skipFunction(Function &F) {
-	if (F.hasFnAttribute("myflush") || F.hasFnAttribute("ignore"))
+	if (F.hasFnAttribute("myflush") || F.hasFnAttribute("ignore")) {
 		return true;
+	}
 
 	return false;
 }
@@ -1401,12 +1413,13 @@ static void registerPMRobustness(const PassManagerBuilder &,
 	PM.add(new PMRobustness());
 }
 /* Enable the pass when opt level is greater than 0 */
+// Module pass cannot be scheduled with EP_EarlyAsPossible
 static RegisterStandardPasses 
-	RegisterMyPass1(PassManagerBuilder::EP_EarlyAsPossible,
+	RegisterMyPass1(PassManagerBuilder::EP_ModuleOptimizerEarly,
 registerPMRobustness);
 
 /* Enable the pass when opt level is 0 */
 // Don't turn this on when using EP_EarlyAsPossible. Otherwise, the pass will run twice
-//static RegisterStandardPasses
-//	RegisterMyPass2(PassManagerBuilder::EP_EnabledOnOptLevel0,
-//registerPMRobustness);
+static RegisterStandardPasses
+	RegisterMyPass2(PassManagerBuilder::EP_EnabledOnOptLevel0,
+registerPMRobustness);

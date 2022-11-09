@@ -68,7 +68,8 @@ namespace {
 
 	private:
 		void copyState(state_t * src, state_t * dst);
-		void copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst);
+		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
+			state_t * dst);
 		bool update(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
@@ -91,8 +92,10 @@ namespace {
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
 		addr_set_t * getOrCreateUnflushedAddrSet(Function * F);
-		bool checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
+		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
+
+		void analyzeOrLookUpFunctionResult(state_t *map, Instruction *I);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -108,7 +111,7 @@ namespace {
 		void test();
 
 		std::vector<const Value *> value_list;
-		DenseMap<const Instruction *, state_t *> States;
+		DenseMap<Function *, state_map_t *> AbstractStates;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> BlockWorklist;
@@ -116,6 +119,7 @@ namespace {
 		DenseMap<Function *, addr_set_t *> UnflushedArrays;
 
 		unsigned MaxLookupSearchDepth = 100;
+		std::set<std::string> MemAllocatingFunctions;
 	};
 }
 
@@ -125,6 +129,11 @@ StringRef PMRobustness::getPassName() const {
 
 /* annotations -> myflush:[addr|size|ignore] */
 bool PMRobustness::doInitialization (Module &M) {
+	MemAllocatingFunctions = {
+		"operator new(unsigned long)", "operator new[](unsigned long)", "malloc",
+		"calloc", "realloc"
+	};
+
 	GlobalVariable *global_annos = M.getNamedGlobal("llvm.global.annotations");
 	if (global_annos) {
 		ConstantArray *a = cast<ConstantArray>(global_annos->getOperand(0));
@@ -179,6 +188,12 @@ void PMRobustness::analyzeFunction(Function &F) {
 	//errs() << "\n------\n" << F.getName() << "\n";
 	//F.dump();
 
+	state_map_t *AbsState = AbstractStates[&F];
+	if (AbsState == NULL) {
+		AbsState = new state_map_t();
+		AbstractStates[&F] = AbsState;
+	}
+
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
@@ -192,11 +207,11 @@ void PMRobustness::analyzeFunction(Function &F) {
 		bool changed = false;
 		BasicBlock::iterator prev = block->begin();
 		for (BasicBlock::iterator it = block->begin(); it != block->end();) {
-			state_t * state = States[&*it];
+			state_t * state = (*AbsState)[&*it];
 
 			if (state == NULL) {
 				state = new state_t();
-				States[&*it] = state;
+				(*AbsState)[&*it] = state;
 				changed |= true;
 			}
 
@@ -205,7 +220,7 @@ void PMRobustness::analyzeFunction(Function &F) {
 				// First instruction; take the union of predecessors' states
 				if (BasicBlock *pred = block->getUniquePredecessor()) {
 					// Unique predecessor; copy the state of last instruction in the pred block
-					state_t * prev_s = States[pred->getTerminator()];
+					state_t * prev_s = (*AbsState)[pred->getTerminator()];
 					if (prev_s == NULL)
 						BlockWorklist.push_back(pred);
 					else
@@ -221,11 +236,11 @@ void PMRobustness::analyzeFunction(Function &F) {
 						}
 					}
 
-					copyMergedState(pred_list, state);
+					copyMergedState(AbsState, pred_list, state);
 				}
 			} else {
 				// Copy the previous instruction's state
-				copyState(States[&*prev], state);
+				copyState((*AbsState)[&*prev], state);
 			}
 
 			if (update(state, &*it))
@@ -269,12 +284,13 @@ void PMRobustness::copyState(state_t * src, state_t * dst) {
 	}
 }
 
-void PMRobustness::copyMergedState(SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
+void PMRobustness::copyMergedState(state_map_t *AbsState,
+		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
 		(*dst)[it->first]->size = 0;
 
 	for (BasicBlock *pred : *src_list) {
-		state_t *s = States[pred->getTerminator()];
+		state_t *s = (*AbsState)[pred->getTerminator()];
 		if (s == NULL) {
 			BlockWorklist.push_back(pred);
 			continue;
@@ -312,18 +328,28 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 	} else if (isa<StoreInst>(I)) {
 		updated = processStore(map, I);
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+		/* TODO: identify primitive functions that allocate memory
+		CallBase *CallSite = cast<CallBase>(I);
+		if (CallSite->getCalledFunction()) {
+			if (MemAllocatingFunctions.count(llvm::demangle(
+				CallSite->getCalledFunction()->getName().str()))) {}
+		*/
+
 		if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
-		} /*else if (isParamAnnotationFunction(I)) {
-			processParamAnnotationFunction(I);
-		}*/ else if (isFlushWrapperFunction(I)) {
+		} /*else if (isParamAnnotationFunction(I))
+			processParamAnnotationFunction(I);*/
+		else if (isFlushWrapperFunction(I)) {
 			updated |= processFlushWrapperFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
 			if (op == NVM_FENCE) {
 				// TODO: fence operations
 			} else if (op == NVM_CLWB || op == NVM_CLFLUSH) {
+				// TODO: assembly flush operations. Are they used in real code?
 				// updated |= processFlush(map, I, op);
+			} else {
+				analyzeOrLookUpFunctionResult(map, I);
 			}
 		}
 	}
@@ -620,7 +646,7 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	if (DecompGEP.isArray) {
 		//TODO: compare GEP address
 		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction());
-		checkUnflushedAddress(AddrSet, Addr, DecompGEP);
+		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
@@ -835,7 +861,7 @@ addr_set_t * PMRobustness::getOrCreateUnflushedAddrSet(Function * F) {
 	return set;
 }
 
-bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP) {
+bool PMRobustness::checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP) {
 	addr_set_t::iterator it = AddrSet->find(Addr);
 	if (it != AddrSet->end()) {
 		AddrSet->erase(it);
@@ -843,7 +869,7 @@ bool PMRobustness::checkUnflushedAddress(addr_set_t * AddrSet, Value * Addr, Dec
 		return true;
 	}
 
-	MemoryDependenceResults &MDA = getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
+	MemoryDependenceResults &MDA = getAnalysis<MemoryDependenceWrapperPass>(*F).getMemDep();
 
 	Value *V = Addr;
 	Value *VBase = NULL;
@@ -988,6 +1014,10 @@ bool PMRobustness::compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2
 	}
 
 	return true;
+}
+
+void PMRobustness::analyzeOrLookUpFunctionResult(state_t *map, Instruction *I) {
+
 }
 
 

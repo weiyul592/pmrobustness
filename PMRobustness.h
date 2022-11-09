@@ -12,6 +12,7 @@ struct ob_state_t;
 struct DecomposedGEP;
 
 typedef DenseMap<const Value *, ob_state_t *> state_t;
+typedef DenseMap<const Instruction *, state_t *> state_map_t;
 typedef DenseMap<Value *, DecomposedGEP *> addr_set_t;
 
 enum NVMOP {

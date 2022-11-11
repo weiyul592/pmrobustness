@@ -120,6 +120,8 @@ namespace {
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
+
+		DenseMap<Function *, FunctionSummary> FunctionSummaries;
 	};
 }
 
@@ -1017,7 +1019,13 @@ bool PMRobustness::compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2
 }
 
 void PMRobustness::analyzeOrLookUpFunctionResult(state_t *map, Instruction *I) {
+	CallInst *CI = cast<CallInst>(I);
+	Function *F = CI->getCalledFunction();
+	FunctionSummary *FS = FunctionSummaries[F];
 
+	if (FS == NULL) {
+		// push context and function into worklist
+	}
 }
 
 

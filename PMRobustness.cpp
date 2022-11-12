@@ -46,6 +46,7 @@
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils.h"
 #include "PMRobustness.h"
+#include "FunctionSummary.h"
 //#include "andersen/include/AndersenAA.h"
 //#include "llvm/Analysis/AliasAnalysis.h"
 
@@ -60,7 +61,7 @@ namespace {
 		bool doInitialization(Module &M) override;
 		bool runOnModule(Module &M) override;
 		void getAnalysisUsage(AnalysisUsage &AU) const override;
-		void analyzeFunction(Function &F);
+		void analyzeFunction(Function &F, CallingContext &Context);
 
 		static char ID;
 		//AliasAnalysis *AA;
@@ -95,7 +96,8 @@ namespace {
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
-		void analyzeOrLookUpFunctionResult(state_t *map, Instruction *I);
+		CallingContext &computeContext(state_t *map, Instruction *I);
+		void analyzeOrLookUpFunctionResult(state_t *map, Instruction *I, CallingContext &Context);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -121,7 +123,7 @@ namespace {
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
 
-		DenseMap<Function *, FunctionSummary> FunctionSummaries;
+		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
 	};
 }
 
@@ -153,12 +155,12 @@ bool PMRobustness::doInitialization (Module &M) {
 }
 
 bool PMRobustness::runOnModule(Module &M) {
-	std::list<Function *> FunctionWorklist;
+	std::list<std::pair<Function *, CallingContext>> FunctionWorklist;
 	for (Function &F : M) {
 		if (!F.use_empty() && !F.isDeclaration()) {
-			FunctionWorklist.push_back(&F);
+			FunctionWorklist.emplace_back(&F, CallingContext());
 		} else if (F.getName() == "main") {
-			FunctionWorklist.push_back(&F);
+			FunctionWorklist.emplace_back(&F, CallingContext());
 		} else {
 #ifdef PMROBUST_DEBUG
 			if (F.isDeclaration()) {
@@ -170,23 +172,27 @@ bool PMRobustness::runOnModule(Module &M) {
 	}
 
 	while (!FunctionWorklist.empty()) {
-		Function *F = FunctionWorklist.front();
+		std::pair<Function *, CallingContext> &pair = FunctionWorklist.front();
 		FunctionWorklist.pop_front();
 
-		if (skipFunction(*F))
+		Function *F = pair.first;
+		CallingContext &context = pair.second;
+
+		if (skipFunction(*F)) {
 			continue;
+		}
 
 		//AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
 		//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
 
 		//errs() << "processing " << F->getName() << "\n";
-		analyzeFunction(*F);
+		analyzeFunction(*F, context);
 	}
 
 	return true;
 }
 
-void PMRobustness::analyzeFunction(Function &F) {
+void PMRobustness::analyzeFunction(Function &F, CallingContext &Context) {
 	//errs() << "\n------\n" << F.getName() << "\n";
 	//F.dump();
 
@@ -351,7 +357,8 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				// TODO: assembly flush operations. Are they used in real code?
 				// updated |= processFlush(map, I, op);
 			} else {
-				analyzeOrLookUpFunctionResult(map, I);
+				CallingContext &context = computeContext(map, I);
+				analyzeOrLookUpFunctionResult(map, I, context);
 			}
 		}
 	}
@@ -595,7 +602,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 }
 
 bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
-	CallInst *callInst = cast<CallInst>(I);
+	CallBase *callInst = cast<CallBase>(I);
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	Function *callee = callInst->getCalledFunction();
 	assert(callee);
@@ -843,8 +850,8 @@ bool PMRobustness::isParamAnnotationFunction(Instruction *I) {
 }*/
 
 bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
-	if (CallInst *CI = dyn_cast<CallInst>(I)) {
-		if (Function *callee = CI->getCalledFunction()) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("myflush"))
 				return true;
 		}
@@ -1018,9 +1025,14 @@ bool PMRobustness::compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2
 	return true;
 }
 
-void PMRobustness::analyzeOrLookUpFunctionResult(state_t *map, Instruction *I) {
-	CallInst *CI = cast<CallInst>(I);
-	Function *F = CI->getCalledFunction();
+CallingContext& PMRobustness::computeContext(state_t *map, Instruction *I) {
+	CallingContext C;
+	return C;
+}
+
+void PMRobustness::analyzeOrLookUpFunctionResult(state_t *map, Instruction *I, CallingContext &Context) {
+	CallBase *CB = cast<CallBase>(I);
+	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 
 	if (FS == NULL) {

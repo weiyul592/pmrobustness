@@ -6,7 +6,7 @@ using namespace llvm;
 
 #define UNKNOWNOFFSET 0xffffffff
 #define VARIABLEOFFSET 0xfffffffe
-#define FUNC_PARAM_USE 100
+//#define FUNC_PARAM_USE 100
 
 struct ob_state_t;
 struct DecomposedGEP;
@@ -21,35 +21,6 @@ enum NVMOP {
 	NVM_FENCE,
 	NVM_UNKNOWN
 };
-
-enum class AbsInputState {
-	// TODO: Do we need to model the partial order?
-	EMPTY_KEY,		// for hash table key
-	TOMBSTONE_KEY,	// for hash table key
-
-	BOTTOM,
-	NON_PMEM,
-	DIRTY_CAPTURED,
-	DIRTY_ESCAPED,
-	CLWB_CAPTURED,
-	CLWB_ESCAPED,
-	CLEAN_CAPTURED,
-	CLEAN_ESCAPED,
-	TOP
-};
-
-enum class AbsOuputState {
-	BOTTOM,
-	NON_PMEM,
-	DIRTY_CAPTURED,
-	DIRTY_ESCAPED,
-	CLWB_CAPTURED,
-	CLWB_ESCAPED,
-	CLEAN_CAPTURED,
-	CLEAN_ESCAPED,
-	TOP
-};
-
 
 struct VariableGEPIndex {
 	// An opaque Value - we can't decompose this further.
@@ -293,30 +264,6 @@ struct ob_state_t {
 		}
 		errs() << "\n";
 	}
-};
-
-class FunctionSummary {
-	struct SummaryDenseMapInfo {
-		static SmallVector<AbsInputState, 10> getEmptyKey() {
-			return {AbsInputState::EMPTY_KEY};
-		}
-
-		static SmallVector<AbsInputState, 10> getTombstoneKey() {
-			return {AbsInputState::TOMBSTONE_KEY};
-		}
-
-		static unsigned getHashValue(const SmallVector<AbsInputState, 10> &V) {
-			return static_cast<unsigned>(hash_combine_range(V.begin(), V.end()));
-		}
-
-		static bool isEqual(const SmallVector<AbsInputState, 10> &LHS,
-							const SmallVector<AbsInputState, 10> &RHS) {
-			return LHS == RHS;
-		}
-	};
-
-	DenseMap<SmallVector<AbsInputState, 10>, SmallVector<AbsOuputState, 11>, SummaryDenseMapInfo> ResultMap;
-	unsigned ArgSize = 0;
 };
 
 void printDecomposedGEP(DecomposedGEP &Decom) {

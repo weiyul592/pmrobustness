@@ -96,7 +96,7 @@ namespace {
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
-		CallingContext &computeContext(state_t *map, Instruction *I);
+		bool computeContext(state_t *map, Instruction *I, CallingContext &Context);
 		void analyzeOrLookUpFunctionResult(state_t *map, Instruction *I, CallingContext &Context);
 
 		const Value * GetLinearExpression(
@@ -123,6 +123,7 @@ namespace {
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
 
+		// May consider having several DenseMaps for function with different parameter sizes: 4, 8, 12, 16, etc.
 		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
 	};
 }
@@ -155,12 +156,12 @@ bool PMRobustness::doInitialization (Module &M) {
 }
 
 bool PMRobustness::runOnModule(Module &M) {
-	std::list<std::pair<Function *, CallingContext>> FunctionWorklist;
+	std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 	for (Function &F : M) {
 		if (!F.use_empty() && !F.isDeclaration()) {
-			FunctionWorklist.emplace_back(&F, CallingContext());
+			FunctionWorklist.emplace_back(&F, new CallingContext());
 		} else if (F.getName() == "main") {
-			FunctionWorklist.emplace_back(&F, CallingContext());
+			FunctionWorklist.emplace_back(&F, new CallingContext());
 		} else {
 #ifdef PMROBUST_DEBUG
 			if (F.isDeclaration()) {
@@ -172,11 +173,11 @@ bool PMRobustness::runOnModule(Module &M) {
 	}
 
 	while (!FunctionWorklist.empty()) {
-		std::pair<Function *, CallingContext> &pair = FunctionWorklist.front();
+		std::pair<Function *, CallingContext *> &pair = FunctionWorklist.front();
 		FunctionWorklist.pop_front();
 
 		Function *F = pair.first;
-		CallingContext &context = pair.second;
+		CallingContext *context = pair.second;
 
 		if (skipFunction(*F)) {
 			continue;
@@ -186,7 +187,8 @@ bool PMRobustness::runOnModule(Module &M) {
 		//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
 
 		//errs() << "processing " << F->getName() << "\n";
-		analyzeFunction(*F, context);
+		analyzeFunction(*F, *context);
+		delete context;
 	}
 
 	return true;
@@ -343,6 +345,11 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				CallSite->getCalledFunction()->getName().str()))) {}
 		*/
 
+		// Ignore Debug info Instrinsics
+		if (isa<DbgInfoIntrinsic>(I)) {
+			return updated;
+		}
+
 		if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
 		} /*else if (isParamAnnotationFunction(I))
@@ -357,8 +364,11 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				// TODO: assembly flush operations. Are they used in real code?
 				// updated |= processFlush(map, I, op);
 			} else {
-				CallingContext &context = computeContext(map, I);
-				analyzeOrLookUpFunctionResult(map, I, context);
+				CallingContext *context = new CallingContext();
+				bool proceed = computeContext(map, I, *context);
+				if (proceed) {
+					analyzeOrLookUpFunctionResult(map, I, *context);
+				}
 			}
 		}
 	}
@@ -1025,9 +1035,31 @@ bool PMRobustness::compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2
 	return true;
 }
 
-CallingContext& PMRobustness::computeContext(state_t *map, Instruction *I) {
-	CallingContext C;
-	return C;
+bool PMRobustness::computeContext(state_t *map, Instruction *I, CallingContext &Context) {
+	CallBase *CB = cast<CallBase>(I);
+	Function *F = CB->getCalledFunction();
+	//errs() << "Processing function " << F->getName() << "\n";
+
+	if (F->isVarArg()) {
+#ifdef PMROBUST_DEBUG
+		errs() << "Cannot handle variable argument functions for " << F->getName() << "\n";
+#endif
+		return false;
+	}
+
+	errs() << "Function arguments from call base\n";
+	for (unsigned i = 0; i < CB->arg_size(); i++) {
+		Value *op = CB->getArgOperand(i);
+		errs() << *op << "\n";
+
+		if (op->isPointerTy() && isPMAddr(op)) {
+			// TODO: Need to decompose op
+		} else {
+			Context.addAbsInput(InputState::NON_PMEM);
+		}
+	}
+
+	return true;
 }
 
 void PMRobustness::analyzeOrLookUpFunctionResult(state_t *map, Instruction *I, CallingContext &Context) {

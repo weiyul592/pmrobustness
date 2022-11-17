@@ -32,8 +32,12 @@ enum class OuputState {
 };
 
 struct CallingContext {
-	SmallVector<Value *, 10> parameters;
-	SmallVector<InputState, 10> AbstrastInputState;
+	SmallVector<Value *, 8> parameters;
+	SmallVector<InputState, 8> AbstrastInputState;
+
+	void addAbsInput(InputState s) {
+		AbstrastInputState.push_back(s);
+	}
 
 	void dump() {
 		errs() << "Priginal parameters: ";
@@ -53,25 +57,25 @@ struct CallingContext {
 class FunctionSummary {
 public:
 	struct SummaryDenseMapInfo {
-		static SmallVector<InputState, 10> getEmptyKey() {
+		static SmallVector<InputState, 8> getEmptyKey() {
 			return {InputState::EMPTY_KEY};
 		}
 
-		static SmallVector<InputState, 10> getTombstoneKey() {
+		static SmallVector<InputState, 8> getTombstoneKey() {
 			return {InputState::TOMBSTONE_KEY};
 		}
 
-		static unsigned getHashValue(const SmallVector<InputState, 10> &V) {
+		static unsigned getHashValue(const SmallVector<InputState, 8> &V) {
 			return static_cast<unsigned>(hash_combine_range(V.begin(), V.end()));
 		}
 
-		static bool isEqual(const SmallVector<InputState, 10> &LHS,
-							const SmallVector<InputState, 10> &RHS) {
+		static bool isEqual(const SmallVector<InputState, 8> &LHS,
+							const SmallVector<InputState, 8> &RHS) {
 			return LHS == RHS;
 		}
 	};
 
-	DenseMap<SmallVector<InputState, 10>, SmallVector<OuputState, 11>, SummaryDenseMapInfo> ResultMap;
+	DenseMap<SmallVector<InputState, 8>, SmallVector<OuputState, 9>, SummaryDenseMapInfo> ResultMap;
 	unsigned ArgSize = 0;
 };
 

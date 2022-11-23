@@ -1,5 +1,6 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/ADT/BitVector.h"
+#include "FunctionSummary.h"
 #include <cassert>
 
 using namespace llvm;
@@ -247,6 +248,24 @@ struct ob_state_t {
 
 	void setSize(unsigned s) {
 		size = s;
+	}
+
+	ParamState checkState(unsigned startByte) {
+		if (escaped_bits[startByte]) {
+			if (flushed_bits[startByte])
+				return ParamState::CLEAN_ESCAPED;
+			else if (clwb_bits[startByte])
+				return ParamState::CLWB_ESCAPED;
+			else
+				return ParamState::DIRTY_ESCAPED;
+		} else {
+			if (flushed_bits[startByte])
+				return ParamState::CLEAN_CAPTURED;
+			else if (clwb_bits[startByte])
+				return ParamState::CLWB_CAPTURED;
+			else
+				return ParamState::DIRTY_CAPTURED;
+		}
 	}
 
 	void print() {

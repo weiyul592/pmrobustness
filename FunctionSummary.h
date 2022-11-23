@@ -3,7 +3,7 @@
 
 using namespace llvm;
 
-enum class InputState {
+enum class ParamState {
 	// TODO: Do we need to model the partial order?
 	EMPTY_KEY,      // for hash table key
 	TOMBSTONE_KEY,  // for hash table key
@@ -19,23 +19,18 @@ enum class InputState {
 	TOP
 };
 
-enum class OuputState {
-	BOTTOM,
-	NON_PMEM,
-	DIRTY_CAPTURED,
-	DIRTY_ESCAPED,
-	CLWB_CAPTURED,
-	CLWB_ESCAPED,
-	CLEAN_CAPTURED,
-	CLEAN_ESCAPED,
-	TOP
+struct OutputState {
+	SmallVector<ParamState, 8> AbstrastOuputState;
+
+	bool hasRetVal;
+	ParamState retVal;
 };
 
 struct CallingContext {
 	SmallVector<Value *, 8> parameters;
-	SmallVector<InputState, 8> AbstrastInputState;
+	SmallVector<ParamState, 8> AbstrastInputState;
 
-	void addAbsInput(InputState s) {
+	void addAbsInput(ParamState s) {
 		AbstrastInputState.push_back(s);
 	}
 
@@ -46,7 +41,7 @@ struct CallingContext {
 		}
 
 		errs() << "\nAbstract input state: ";
-		for (InputState &I : AbstrastInputState) {
+		for (ParamState &I : AbstrastInputState) {
 			errs() << (int)I << "\n";
 		}
 		errs() << "\n";
@@ -57,25 +52,25 @@ struct CallingContext {
 class FunctionSummary {
 public:
 	struct SummaryDenseMapInfo {
-		static SmallVector<InputState, 8> getEmptyKey() {
-			return {InputState::EMPTY_KEY};
+		static SmallVector<ParamState, 8> getEmptyKey() {
+			return {ParamState::EMPTY_KEY};
 		}
 
-		static SmallVector<InputState, 8> getTombstoneKey() {
-			return {InputState::TOMBSTONE_KEY};
+		static SmallVector<ParamState, 8> getTombstoneKey() {
+			return {ParamState::TOMBSTONE_KEY};
 		}
 
-		static unsigned getHashValue(const SmallVector<InputState, 8> &V) {
+		static unsigned getHashValue(const SmallVector<ParamState, 8> &V) {
 			return static_cast<unsigned>(hash_combine_range(V.begin(), V.end()));
 		}
 
-		static bool isEqual(const SmallVector<InputState, 8> &LHS,
-							const SmallVector<InputState, 8> &RHS) {
+		static bool isEqual(const SmallVector<ParamState, 8> &LHS,
+							const SmallVector<ParamState, 8> &RHS) {
 			return LHS == RHS;
 		}
 	};
 
-	DenseMap<SmallVector<InputState, 8>, SmallVector<OuputState, 9>, SummaryDenseMapInfo> ResultMap;
+	DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo> ResultMap;
 	unsigned ArgSize = 0;
 };
 

@@ -670,11 +670,10 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		// TODO: treat it the same way as array
 	} else {
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-		ob_state_t *object_state = (*map)[DecompGEP.Base];
+		ob_state_t *object_state = map->lookup(DecompGEP.Base);
 		if (object_state == NULL) {
 			// TODO: to be solve in interprocedural analysis
 			// public method calls can modify the state of objects e.g. masstress.cpp:320
-			(*map)[DecompGEP.Base] = new ob_state_t(); // FIXME: To be removed
 			errs() << "Flush an unknown address\n";
 			//assert(false && "Flush an unknown address");
 		} else {
@@ -1052,10 +1051,26 @@ bool PMRobustness::computeContext(state_t *map, Instruction *I, CallingContext &
 		Value *op = CB->getArgOperand(i);
 		errs() << *op << "\n";
 
-		if (op->isPointerTy() && isPMAddr(op)) {
-			// TODO: Need to decompose op
+		if (op->getType()->isPointerTy() && isPMAddr(op)) {
+			const DataLayout &DL = I->getModule()->getDataLayout();
+			DecomposedGEP DecompGEP;
+			decomposeAddress(DecompGEP, op, DL);
+			unsigned offset = DecompGEP.getOffsets();
+
+			if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+				// TODO: We have information about arrays escaping or not.
+				// Dirty array slots are stored in UnflushedArrays
+			} else {
+				ob_state_t *object_state = map->lookup(DecompGEP.Base);
+				ParamState absState = ParamState::BOTTOM;
+				if (object_state != NULL) {
+					absState = object_state->checkState(offset);
+				}
+
+				Context.addAbsInput(absState);
+			}
 		} else {
-			Context.addAbsInput(InputState::NON_PMEM);
+			Context.addAbsInput(ParamState::NON_PMEM);
 		}
 	}
 

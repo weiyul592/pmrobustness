@@ -77,6 +77,8 @@ namespace {
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 		bool processFlushWrapperFunction(state_t * map, Instruction * I);
+		bool processCalls(state_t *map, Instruction *I);
+
 		//bool processParamAnnotationFunction(Instruction * I);
 
 		// TODO: Address check to be implemented
@@ -96,8 +98,8 @@ namespace {
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
-		bool computeContext(state_t *map, Instruction *I, CallingContext &Context);
-		void analyzeOrLookUpFunctionResult(state_t *map, Instruction *I, CallingContext &Context);
+		CallingContext * computeContext(state_t *map, Instruction *I);
+		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -117,6 +119,8 @@ namespace {
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> BlockWorklist;
+
+		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
 		DenseMap<Function *, addr_set_t *> UnflushedArrays;
 
@@ -156,7 +160,6 @@ bool PMRobustness::doInitialization (Module &M) {
 }
 
 bool PMRobustness::runOnModule(Module &M) {
-	std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 	for (Function &F : M) {
 		if (!F.use_empty() && !F.isDeclaration()) {
 			FunctionWorklist.emplace_back(&F, new CallingContext());
@@ -343,18 +346,17 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 		if (CallSite->getCalledFunction()) {
 			if (MemAllocatingFunctions.count(llvm::demangle(
 				CallSite->getCalledFunction()->getName().str()))) {}
+
+		if (isParamAnnotationFunction(I))
+			processParamAnnotationFunction(I);
 		*/
 
 		// Ignore Debug info Instrinsics
 		if (isa<DbgInfoIntrinsic>(I)) {
 			return updated;
-		}
-
-		if (isa<MemIntrinsic>(I)) {
+		} else if (isa<MemIntrinsic>(I)) {
 			updated = processMemIntrinsic(map, I);
-		} /*else if (isParamAnnotationFunction(I))
-			processParamAnnotationFunction(I);*/
-		else if (isFlushWrapperFunction(I)) {
+		} else if (isFlushWrapperFunction(I)) {
 			updated |= processFlushWrapperFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
@@ -364,11 +366,7 @@ bool PMRobustness::update(state_t * map, Instruction * I) {
 				// TODO: assembly flush operations. Are they used in real code?
 				// updated |= processFlush(map, I, op);
 			} else {
-				CallingContext *context = new CallingContext();
-				bool proceed = computeContext(map, I, *context);
-				if (proceed) {
-					analyzeOrLookUpFunctionResult(map, I, *context);
-				}
+				updated |= processCalls(map, I);
 			}
 		}
 	}
@@ -476,7 +474,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		*/
 	} else {
 		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-		ob_state_t *object_state = (*map)[DecompGEP.Base];
+		ob_state_t *object_state = map->lookup(DecompGEP.Base);
 		if (object_state == NULL) {
 			object_state = new ob_state_t();
 			(*map)[DecompGEP.Base] = object_state;
@@ -497,7 +495,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				// e.g. struct { int A; int arr[10]; };
 				// StructOffset is the beginning address of arr.
 				// TODO: can we compute the size of the arr field?
-				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
+				ob_state_t *object_state = map->lookup(ValDecompGEP.Base);
 				if (object_state == NULL) {
 					object_state = new ob_state_t();
 					(*map)[ValDecompGEP.Base] = object_state;
@@ -511,7 +509,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				// TODO: start working here
 				//assert(false && "Fix me");
 			} else {
-				ob_state_t *object_state = (*map)[ValDecompGEP.Base];
+				ob_state_t *object_state = map->lookup(ValDecompGEP.Base);
 				if (object_state == NULL) {
 					object_state = new ob_state_t();
 					(*map)[ValDecompGEP.Base] = object_state;
@@ -574,7 +572,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			// For Atomic RMW, this is already done in processStore
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 
-			ob_state_t *object_state = (*map)[DecompGEP.Base];
+			ob_state_t *object_state = map->lookup(DecompGEP.Base);
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
 				(*map)[DecompGEP.Base] = object_state;
@@ -597,7 +595,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			}
 
 			//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-			ob_state_t *object_state = (*map)[LIDecompGEP.Base];
+			ob_state_t *object_state = map->lookup(LIDecompGEP.Base);
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
 				(*map)[LIDecompGEP.Base] = object_state;
@@ -688,6 +686,29 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	}
 
 	return true;
+}
+
+bool PMRobustness::processCalls(state_t *map, Instruction *I) {
+	CallBase *CB = cast<CallBase>(I);
+	Function *F = CB->getCalledFunction();
+
+	if (F->isVarArg()) {
+#ifdef PMROBUST_DEBUG
+		errs() << "Cannot handle variable argument functions for " << F->getName() << "\n";
+#endif
+		return false;
+	} else if (F->isDeclaration()) {
+		// TODO: think about how to approximate calls to functions with no body
+#ifdef PMROBUST_DEBUG
+		errs() << "Cannot handle functions with no function body: " << F->getName() << "\n";
+#endif
+		return false;
+	}
+
+	CallingContext *context = computeContext(map, I);
+	lookupFunctionResult(map, CB, context);
+
+	return false;
 }
 
 /*
@@ -1034,22 +1055,23 @@ bool PMRobustness::compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2
 	return true;
 }
 
-bool PMRobustness::computeContext(state_t *map, Instruction *I, CallingContext &Context) {
+CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	CallBase *CB = cast<CallBase>(I);
+	//if (CB->arg_size() == 0)
+	//	return NULL;
+
+	CallingContext *context = new CallingContext();
+/*
 	Function *F = CB->getCalledFunction();
-	//errs() << "Processing function " << F->getName() << "\n";
-
-	if (F->isVarArg()) {
-#ifdef PMROBUST_DEBUG
-		errs() << "Cannot handle variable argument functions for " << F->getName() << "\n";
-#endif
-		return false;
-	}
-
-	errs() << "Function arguments from call base\n";
+	errs() << "Function " << F->getName() << ": ";
+	if (CB->arg_size() > 0)
+		errs() << "arguments from call base\n";
+	else
+		errs() << " no arguments\n";
+*/
 	for (unsigned i = 0; i < CB->arg_size(); i++) {
 		Value *op = CB->getArgOperand(i);
-		errs() << *op << "\n";
+		//errs() << "  " << *op << "\n";
 
 		if (op->getType()->isPointerTy() && isPMAddr(op)) {
 			const DataLayout &DL = I->getModule()->getDataLayout();
@@ -1067,24 +1089,32 @@ bool PMRobustness::computeContext(state_t *map, Instruction *I, CallingContext &
 					absState = object_state->checkState(offset);
 				}
 
-				Context.addAbsInput(absState);
+				context->addAbsInput(absState);
 			}
 		} else {
-			Context.addAbsInput(ParamState::NON_PMEM);
+			context->addAbsInput(ParamState::NON_PMEM);
 		}
 	}
 
-	return true;
+	return context;
 }
 
-void PMRobustness::analyzeOrLookUpFunctionResult(state_t *map, Instruction *I, CallingContext &Context) {
-	CallBase *CB = cast<CallBase>(I);
+void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context) {
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 
 	if (FS == NULL) {
-		// push context and function into worklist
+		FunctionWorklist.emplace_back(F, Context);
+		return;
 	}
+
+	OutputState *state = FS->getResult(Context);
+	if (state == NULL) {
+		FunctionWorklist.emplace_back(F, Context);
+		return;
+	}
+
+	// TODO: use cached result to modify parameter states
 }
 
 

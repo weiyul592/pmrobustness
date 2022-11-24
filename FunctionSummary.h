@@ -72,6 +72,10 @@ public:
 
 	DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo> ResultMap;
 	unsigned ArgSize = 0;
+
+	OutputState * getResult(CallingContext *Context) {
+		return ResultMap.lookup(Context->AbstrastInputState);
+	}
 };
 
 #endif

@@ -61,7 +61,7 @@ namespace {
 		bool doInitialization(Module &M) override;
 		bool runOnModule(Module &M) override;
 		void getAnalysisUsage(AnalysisUsage &AU) const override;
-		void analyzeFunction(Function &F, CallingContext &Context);
+		void analyzeFunction(Function &F, CallingContext *Context);
 
 		static char ID;
 		//AliasAnalysis *AA;
@@ -99,7 +99,9 @@ namespace {
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
 		CallingContext * computeContext(state_t *map, Instruction *I);
-		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context);
+		bool lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context);
+		void computeInitialState(state_t *map, Function &F, CallingContext *Context);
+		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
 
 		const Value * GetLinearExpression(
 		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
@@ -114,21 +116,19 @@ namespace {
 		void printMap(state_t * map);
 		void test();
 
-		std::vector<const Value *> value_list;
 		DenseMap<Function *, state_map_t *> AbstractStates;
+		DenseMap<Function *, addr_set_t *> UnflushedArrays;
+		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
+		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetMap;
+		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> BlockWorklist;
-
-		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
-
-		DenseMap<Function *, addr_set_t *> UnflushedArrays;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
 
 		// May consider having several DenseMaps for function with different parameter sizes: 4, 8, 12, 16, etc.
-		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
 	};
 }
 
@@ -162,7 +162,9 @@ bool PMRobustness::doInitialization (Module &M) {
 bool PMRobustness::runOnModule(Module &M) {
 	for (Function &F : M) {
 		if (!F.use_empty() && !F.isDeclaration()) {
-			FunctionWorklist.emplace_back(&F, new CallingContext());
+			// TODO: assume parameters have states TOP or do not push them to worklist?
+			if (F.arg_size() == 0)
+				FunctionWorklist.emplace_back(&F, new CallingContext());
 		} else if (F.getName() == "main") {
 			FunctionWorklist.emplace_back(&F, new CallingContext());
 		} else {
@@ -190,17 +192,14 @@ bool PMRobustness::runOnModule(Module &M) {
 		//AA = &getAnalysis<AndersenAAWrapperPass>().getResult();
 
 		//errs() << "processing " << F->getName() << "\n";
-		analyzeFunction(*F, *context);
+		analyzeFunction(*F, context);
 		delete context;
 	}
 
 	return true;
 }
 
-void PMRobustness::analyzeFunction(Function &F, CallingContext &Context) {
-	//errs() << "\n------\n" << F.getName() << "\n";
-	//F.dump();
-
+void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	state_map_t *AbsState = AbstractStates[&F];
 	if (AbsState == NULL) {
 		AbsState = new state_map_t();
@@ -211,12 +210,21 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext &Context) {
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
 
+	// Collect all return statements of Function F
+	SmallPtrSet<Instruction *, 8> &retSet = FunctionRetMap[&F];
+	if (retSet.empty()) {
+		for (BasicBlock &BB : F) {
+			if (isa<ReturnInst>(BB.getTerminator()))
+				retSet.insert(BB.getTerminator());
+		}
+	}
+
+	// Analyze F
 	BlockWorklist.push_back(&F.getEntryBlock());
 	while (!BlockWorklist.empty()) {
 		BasicBlock *block = BlockWorklist.front();
 		BlockWorklist.pop_front();
 
-		//errs() << "processing block: "<< block << "\n";
 		bool changed = false;
 		BasicBlock::iterator prev = block->begin();
 		for (BasicBlock::iterator it = block->begin(); it != block->end();) {
@@ -231,7 +239,11 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext &Context) {
 			// Build state from predecessors' states
 			if (it == block->begin()) {
 				// First instruction; take the union of predecessors' states
-				if (BasicBlock *pred = block->getUniquePredecessor()) {
+				if (block == &F.getEntryBlock()) {
+					// Entry block: has no precedessors
+					// Prepare initial state based on parameters
+					computeInitialState(state, F, Context);
+				} else if (BasicBlock *pred = block->getUniquePredecessor()) {
 					// Unique predecessor; copy the state of last instruction in the pred block
 					state_t * prev_s = (*AbsState)[pred->getTerminator()];
 					if (prev_s == NULL)
@@ -278,6 +290,11 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext &Context) {
 			}
 		}
 	}
+
+	bool state_changed = computeFinalState(AbsState, F, Context);
+	if (state_changed) {
+		// push callers
+	}
 }
 
 // DenseMap<Value *, ob_state_t *> state_t;
@@ -300,7 +317,7 @@ void PMRobustness::copyState(state_t * src, state_t * dst) {
 void PMRobustness::copyMergedState(state_map_t *AbsState,
 		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
-		(*dst)[it->first]->size = 0;
+		(*dst)[it->first]->setSize(0);
 
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = (*AbsState)[pred->getTerminator()];
@@ -318,7 +335,7 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 				ob_state_t *B = it->second;
 
 				if (A->getSize() == 0) {
-					A->setSize(B->getSize());
+					A->setSize(B->getSize());	// TODO: useless? 
 					A->copyFrom(B);
 				} else {
 					A->mergeFrom(B);
@@ -451,6 +468,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
 
+	//printDecomposedGEP(DecompGEP);
 	if (DecompGEP.isArray) {
 		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction());
 		DecomposedGEP * tmp = new DecomposedGEP();
@@ -706,9 +724,9 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	}
 
 	CallingContext *context = computeContext(map, I);
-	lookupFunctionResult(map, CB, context);
+	bool updated = lookupFunctionResult(map, CB, context);
 
-	return false;
+	return updated;
 }
 
 /*
@@ -1084,9 +1102,9 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 				// Dirty array slots are stored in UnflushedArrays
 			} else {
 				ob_state_t *object_state = map->lookup(DecompGEP.Base);
-				ParamState absState = ParamState::BOTTOM;
+				ParamState absState = ParamState::TOP;
 				if (object_state != NULL) {
-					absState = object_state->checkState(offset);
+					absState = object_state->checkState(offset);	// TODO: only checks one bit
 				}
 
 				context->addAbsInput(absState);
@@ -1099,22 +1117,151 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	return context;
 }
 
-void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context) {
+bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context) {
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 
+	errs() << "hahaha: " << F->getName() << "\n";
+
+	// Function has not been analyzed before
 	if (FS == NULL) {
 		FunctionWorklist.emplace_back(F, Context);
-		return;
+		return false;
 	}
 
 	OutputState *state = FS->getResult(Context);
+	// Function has not been analyzed with the context
 	if (state == NULL) {
 		FunctionWorklist.emplace_back(F, Context);
-		return;
+		return false;
 	}
 
 	// TODO: use cached result to modify parameter states
+	errs() << "***Dumping output state***\n";
+	state->dump();
+	return false;
+}
+
+// Get initial states of parameters from Context
+void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext *Context) {
+	assert(F.arg_size() == Context->AbstrastInputState.size());
+	const DataLayout &DL = F.getParent()->getDataLayout();
+
+	unsigned i = 0;
+	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
+		ParamState &PS = Context->AbstrastInputState[i++];
+		if (PS == ParamState::NON_PMEM)
+			continue;
+
+		Argument *Arg = &*it;
+		ob_state_t *object_state = map->lookup(Arg);
+		if (object_state == NULL) {
+			object_state = new ob_state_t();
+			(*map)[Arg] = object_state;
+		}
+
+		unsigned TypeSize = getFieldSize(Arg, DL);
+		object_state->setMaxSize(TypeSize);
+
+		if (PS == ParamState::DIRTY_CAPTURED) {
+			//object_state->setDirty(0, TypeSize);
+			//object_state->setEscape(0, TypeSize);
+		} else if (PS == ParamState::DIRTY_ESCAPED) {
+			object_state->setEscape(0, TypeSize);
+		} else if (PS == ParamState::CLWB_CAPTURED) {
+			object_state->setClwb(0, TypeSize);
+		} else if (PS == ParamState::CLWB_ESCAPED) {
+			object_state->setClwb(0, TypeSize);
+			object_state->setEscape(0, TypeSize);
+		} else if (PS == ParamState::CLWB_CAPTURED) {
+			object_state->setFlush(0, TypeSize);
+		} else if (PS == ParamState::CLWB_ESCAPED) {
+			object_state->setFlush(0, TypeSize);
+			object_state->setEscape(0, TypeSize);
+		} else {
+			// TOP, BOTTOM, etc.
+			// Not sure what to do
+		}
+	}
+}
+
+// Get final states of parameters and return value from Function F
+bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context) {
+	const DataLayout &DL = F.getParent()->getDataLayout();
+	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetMap[&F];
+
+	FunctionSummary *FS = FunctionSummaries[&F];
+	if (FS == NULL) {
+		FS = new FunctionSummary();
+		FunctionSummaries[&F] = FS;
+	}
+	OutputState *Output = FS->getOrCreateResult(Context);
+
+	state_t final_state;
+	for (Instruction *I : RetSet) {
+		// Get the state at each return statements
+		state_t *s = AbsState->lookup(I);
+
+		// Merge the state of each function paremeter. This is a conservative approximation.
+		for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
+			Argument *Arg = &*it;
+			ob_state_t *A = final_state.lookup(Arg);
+			ob_state_t *B = s->lookup(Arg);
+
+			if (B == NULL)
+				continue;
+
+			if (A == NULL)
+				final_state[Arg] = new ob_state_t(B);
+			else {
+				A->mergeFrom(B);
+			}
+		}
+	}
+
+	bool updated = false;
+	unsigned i = 0;
+	Output->AbstrastOutputState.resize(F.arg_size());
+	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
+		Argument *Arg = &*it;
+		ob_state_t *object_state = final_state.lookup(Arg);
+		if (object_state == NULL) {
+			if (Output->AbstrastOutputState[i] != ParamState::NON_PMEM) {
+				Output->AbstrastOutputState[i] = ParamState::NON_PMEM;
+				updated = true;
+			}
+
+			continue;
+		}
+
+		unsigned TypeSize = getFieldSize(Arg, DL);
+		ParamState absState = object_state->checkState(0, TypeSize);
+
+		if (Output->AbstrastOutputState[i] != absState) {
+			Output->AbstrastOutputState[i] = absState;
+			updated = true;
+		}
+	}
+
+	// Cache return Type
+	/*
+	Type *RetType = F.getReturnType();
+	if (RetType->isVoidTy()) {
+		Output->hasRetVal = false;
+	} else if (RetType->isPointerTy()) {
+		Output->hasRetVal = true;
+		Output->retVal = ParamState::TOP; // TODO: Check return type
+	} else {
+		Output->hasRetVal = true;
+		Output->retVal = ParamState::NON_PMEM;
+	}*/
+
+	// Free memory allocated in final_state
+	for (state_t::iterator it = final_state.begin(); it != final_state.end(); it++) {
+		delete it->second;
+	}
+
+	return updated;
 }
 
 
@@ -1505,12 +1652,6 @@ void PMRobustness::printMap(state_t * map) {
 		object_state->print();
 	}
 
-//	errs() << "map size: " << map->size() << "\n";
-//	for (unsigned i = 0; i < value_list.size(); i++) {
-//		Value * val = (Value *)value_list[i];
-//		ob_state_t *object_state = (*map)[val];
-//		object_state->print();
-//	}
 	errs() << "\n**\n";
 }
 

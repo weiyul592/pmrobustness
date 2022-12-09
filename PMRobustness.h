@@ -93,15 +93,31 @@ struct DecomposedGEP {
  * TODO: may need to track the size of fields
  **/
 // <flushed_bit, clwb_bit> is either <1, 0>, <0, 1>, or <0, 0>
-struct ob_state_t {
+class ob_state_t {
+private:
 	unsigned size;
+	unsigned maxSize;
 	BitVector flushed_bits;
 	BitVector clwb_bits;
 	BitVector escaped_bits;
 	bool escaped;
 
+	void resize(unsigned s) {
+		assert(s <= (1 << 12));
+		assert(maxSize == 0 || s <= maxSize);
+
+		if (size < s) {
+			size = s;
+			flushed_bits.resize(s);
+			clwb_bits.resize(s);
+			escaped_bits.resize(s, escaped);
+		}
+	}
+
+public:
 	ob_state_t() :
 		size(0),
+		maxSize(0),
 		flushed_bits(),
 		clwb_bits(),
 		escaped_bits(),
@@ -110,6 +126,7 @@ struct ob_state_t {
 
 	ob_state_t(unsigned s) :
 		size(s),
+		maxSize(0),
 		flushed_bits(s),
 		clwb_bits(s),
 		escaped_bits(s),
@@ -118,6 +135,7 @@ struct ob_state_t {
 
 	ob_state_t(ob_state_t * other) :
 		size(other->size),
+		maxSize(other->maxSize),
 		flushed_bits(other->flushed_bits),
 		clwb_bits(other->clwb_bits),
 		escaped_bits(other->escaped_bits),
@@ -147,20 +165,11 @@ struct ob_state_t {
 		//assert(size == src->size);
 
 		size = src->size;
+		maxSize = src->maxSize;
 		flushed_bits = src->flushed_bits;
 		clwb_bits = src->clwb_bits;
 		escaped_bits = src->escaped_bits;
 		escaped = src->escaped;
-	}
-
-	void resize(unsigned s) {
-		assert(s <= (1 << 12));
-		if (size < s) {
-			size = s;
-			flushed_bits.resize(size);
-			clwb_bits.resize(size);
-			escaped_bits.resize(size, escaped);
-		}
 	}
 
 	// return true: modified; return else: unchanged
@@ -169,6 +178,9 @@ struct ob_state_t {
 		if (end > size) {
 			resize(end);
 		}
+
+		//errs() << "start: " << start << "; len: " << len << "; end:" << end << "\n";
+		//errs() << "max size: " << maxSize << "; actual size: " << size << "\n";
 
 		int index1 = flushed_bits.find_first_in(start, end);
 		int index2 = clwb_bits.find_first_in(start, end);
@@ -183,11 +195,13 @@ struct ob_state_t {
 	}
 
 	// TODO: start + len and size?
+	// Flushed cache lines may exceed the size of this object
 	void setFlush(unsigned start, unsigned len) {
 		unsigned end;
 		if (len == (unsigned)-1) {
 			assert("false");
 		} else if (start + len > size){
+			// Only need to flush bits that have been written to
 			end = size;
 		} else {
 			end = start + len;
@@ -209,6 +223,7 @@ struct ob_state_t {
 		if (len == (unsigned)-1) {
 			assert("false");
 		} else if (start + len > size){
+			// Only need to flushopt bits that have been written to
 			end = size;
 		} else {
 			end = start + len;
@@ -250,6 +265,10 @@ struct ob_state_t {
 		size = s;
 	}
 
+	void setMaxSize(unsigned s) {
+		maxSize = s;
+	}
+
 	ParamState checkState(unsigned startByte) {
 		if (escaped_bits[startByte]) {
 			if (flushed_bits[startByte])
@@ -265,6 +284,41 @@ struct ob_state_t {
 				return ParamState::CLWB_CAPTURED;
 			else
 				return ParamState::DIRTY_CAPTURED;
+		}
+	}
+
+	ParamState checkState(unsigned startByte, unsigned len) {
+		unsigned endByte = startByte + len;
+		//errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "; maxsize: " << maxSize << "\n";
+		if (startByte >= maxSize || endByte > maxSize)
+			assert(false && "out of bound error");
+
+		if (startByte >= size)
+			assert(false);
+
+		if (endByte > size)
+			endByte = size;
+
+		if (escaped_bits.find_first_unset_in(startByte, endByte) == -1) {
+			// All bits escaped
+			if (flushed_bits.find_first_unset_in(startByte, endByte) == -1)
+				return ParamState::CLEAN_ESCAPED;
+			else if (clwb_bits.find_first_unset_in(startByte, endByte) == -1)
+				return ParamState::CLWB_ESCAPED;
+			else
+				return ParamState::DIRTY_ESCAPED;
+		} else if (escaped_bits.find_first_in(startByte, endByte) == -1) {
+			// All bits captured
+			if (flushed_bits.find_first_unset_in(startByte, endByte) == -1)
+				return ParamState::CLEAN_CAPTURED;
+			else if (clwb_bits.find_first_unset_in(startByte, endByte) == -1)
+				return ParamState::CLWB_CAPTURED;
+			else
+				return ParamState::DIRTY_CAPTURED;
+		} else {
+			// Some bits escaped
+			// TODO: Need to be more accurate?
+			return ParamState::TOP;
 		}
 	}
 

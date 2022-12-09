@@ -11,19 +11,32 @@ enum class ParamState {
 	BOTTOM,
 	NON_PMEM,
 	DIRTY_CAPTURED,
-	DIRTY_ESCAPED,
+	DIRTY_ESCAPED,	// 0x5
 	CLWB_CAPTURED,
 	CLWB_ESCAPED,
 	CLEAN_CAPTURED,
 	CLEAN_ESCAPED,
-	TOP
+	TOP				// 0xa
 };
 
 struct OutputState {
-	SmallVector<ParamState, 8> AbstrastOuputState;
+	SmallVector<ParamState, 8> AbstrastOutputState;
 
 	bool hasRetVal;
 	ParamState retVal;
+
+	void dump() {
+		errs() << "Abstract output state: ";
+		for (ParamState &I : AbstrastOutputState) {
+			errs() << (int)I << "\n";
+		}
+
+		if (hasRetVal)
+			errs() << "Abstrast return state: " << (int)retVal << "\n";
+
+		errs() << "\n";
+	}
+
 };
 
 struct CallingContext {
@@ -35,7 +48,7 @@ struct CallingContext {
 	}
 
 	void dump() {
-		errs() << "Priginal parameters: ";
+		errs() << "Original parameters: ";
 		for (Value *V : parameters) {
 			errs() << *V << "\n";
 		}
@@ -75,6 +88,16 @@ public:
 
 	OutputState * getResult(CallingContext *Context) {
 		return ResultMap.lookup(Context->AbstrastInputState);
+	}
+
+	OutputState * getOrCreateResult(CallingContext *Context) {
+		OutputState *state = ResultMap.lookup(Context->AbstrastInputState);
+		if (state == NULL) {
+			state = new OutputState();
+			ResultMap[Context->AbstrastInputState] = state;
+		}
+
+		return state;
 	}
 };
 

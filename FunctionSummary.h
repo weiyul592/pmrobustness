@@ -64,6 +64,11 @@ struct CallingContext {
 
 class FunctionSummary {
 public:
+	struct SummaryDenseMapInfo;
+
+	using iterator = DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo>::iterator;
+	typedef DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo> result_map_t;
+
 	struct SummaryDenseMapInfo {
 		static SmallVector<ParamState, 8> getEmptyKey() {
 			return {ParamState::EMPTY_KEY};
@@ -83,9 +88,6 @@ public:
 		}
 	};
 
-	DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo> ResultMap;
-	unsigned ArgSize = 0;
-
 	OutputState * getResult(CallingContext *Context) {
 		return ResultMap.lookup(Context->AbstrastInputState);
 	}
@@ -99,6 +101,14 @@ public:
 
 		return state;
 	}
+
+	result_map_t * getResultMap() {
+		return &ResultMap;
+	}
+
+private:
+	result_map_t ResultMap;
+	unsigned ArgSize = 0;
 };
 
 #endif

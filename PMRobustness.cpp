@@ -119,7 +119,10 @@ namespace {
 		DenseMap<Function *, state_map_t *> AbstractStates;
 		DenseMap<Function *, addr_set_t *> UnflushedArrays;
 		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
-		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetMap;
+		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetInstMap;
+
+		// Map a Function to its call sites
+		DenseMap<Function *, SmallPtrSet<Function *, 32> > FunctionCallerMap;
 		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
@@ -209,13 +212,14 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
+	DenseMap<const BasicBlock *, bool> visited_blocks;
 
 	// Collect all return statements of Function F
-	SmallPtrSet<Instruction *, 8> &retSet = FunctionRetMap[&F];
-	if (retSet.empty()) {
+	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
+	if (RetSet.empty()) {
 		for (BasicBlock &BB : F) {
 			if (isa<ReturnInst>(BB.getTerminator()))
-				retSet.insert(BB.getTerminator());
+				RetSet.insert(BB.getTerminator());
 		}
 	}
 
@@ -275,7 +279,9 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 			it++;
 		}
 
-		if (changed) {
+		if (changed || !visited_blocks[block]) {
+			visited_blocks[block] = true;
+
 			SmallPtrSet<BasicBlock *, 8> *succ_list = block_successors[block];
 			if (succ_list == NULL) {
 				succ_list = new SmallPtrSet<BasicBlock *, 8>();
@@ -291,9 +297,21 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		}
 	}
 
+	// Only verify if output states have been changed
 	bool state_changed = computeFinalState(AbsState, F, Context);
 	if (state_changed) {
 		// push callers
+		SmallPtrSetImpl<Function *> &Callers = FunctionCallerMap[&F];
+		for (Function *Caller : Callers) {
+			// for each calling contexts that have been analyzed
+			FunctionSummary *FS = FunctionSummaries[Caller];
+			FunctionSummary::result_map_t * ResultMap = FS->getResultMap();
+			for (FunctionSummary::iterator it = ResultMap->begin(); it != ResultMap->end(); it++) {
+				CallingContext *Context = new CallingContext();
+				Context->AbstrastInputState = it->first;
+				FunctionWorklist.emplace_back(Caller, Context);
+			}
+		}
 	}
 }
 
@@ -723,6 +741,10 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 		return false;
 	}
 
+	// Update FunctionCallerMap
+	SmallPtrSetImpl<Function *> &Callers = FunctionCallerMap[F];
+	Callers.insert(CB->getCaller());
+
 	CallingContext *context = computeContext(map, I);
 	bool updated = lookupFunctionResult(map, CB, context);
 
@@ -1121,7 +1143,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 
-	errs() << "hahaha: " << F->getName() << "\n";
+	errs() << "lookup results for function: " << F->getName() << "\n";
 
 	// Function has not been analyzed before
 	if (FS == NULL) {
@@ -1188,7 +1210,7 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 // Get final states of parameters and return value from Function F
 bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context) {
 	const DataLayout &DL = F.getParent()->getDataLayout();
-	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetMap[&F];
+	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
 
 	FunctionSummary *FS = FunctionSummaries[&F];
 	if (FS == NULL) {

@@ -71,7 +71,7 @@ namespace {
 		void copyState(state_t * src, state_t * dst);
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
 			state_t * dst);
-		bool update(state_t * map, Instruction * I);
+		bool processInstruction(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
@@ -120,6 +120,11 @@ namespace {
 		DenseMap<Function *, addr_set_t *> UnflushedArrays;
 		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
 		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetInstMap;
+
+		CallingContext *CurrentContext;
+		// Arguments of the function being analyzed
+		DenseSet<Value *> FunctionArguments;
+		//DenseSet<std::pair<Function *, CallingContext *>, DupFuncDenseMapInfo> DuplicateFunctions;
 
 		// Map a Function to its call sites
 		DenseMap<Function *, SmallPtrSet<Function *, 32> > FunctionCallerMap;
@@ -209,6 +214,12 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		AbstractStates[&F] = AbsState;
 	}
 
+	CurrentContext = Context;
+	FunctionArguments.clear();
+	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
+		FunctionArguments.insert(&*it);
+	}
+
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
@@ -272,7 +283,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				copyState((*AbsState)[&*prev], state);
 			}
 
-			if (update(state, &*it))
+			if (processInstruction(state, &*it))
 				changed |= true;
 
 			prev = it;
@@ -310,6 +321,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				CallingContext *Context = new CallingContext();
 				Context->AbstrastInputState = it->first;
 				FunctionWorklist.emplace_back(Caller, Context);
+				errs() << "Function " << Caller->getName() << " added to worklist\n";
 			}
 		}
 	}
@@ -366,7 +378,7 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 	}
 }
 
-bool PMRobustness::update(state_t * map, Instruction * I) {
+bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
 
 	if (I->isAtomic()) {
@@ -1111,7 +1123,6 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 */
 	for (unsigned i = 0; i < CB->arg_size(); i++) {
 		Value *op = CB->getArgOperand(i);
-		//errs() << "  " << *op << "\n";
 
 		if (op->getType()->isPointerTy() && isPMAddr(op)) {
 			const DataLayout &DL = I->getModule()->getDataLayout();
@@ -1126,7 +1137,15 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 				ob_state_t *object_state = map->lookup(DecompGEP.Base);
 				ParamState absState = ParamState::TOP;
 				if (object_state != NULL) {
-					absState = object_state->checkState(offset);	// TODO: only checks one bit
+					//errs() << "Base: " << *DecompGEP.Base << " of instruction " << *I <<"\n";
+					//errs() << "op: " << *op << "\n";
+
+					if (object_state->getSize() == 0 && FunctionArguments.find(op) != FunctionArguments.end()) {
+						// The parent function's parameter is passed to call site without any modification
+						absState = CurrentContext->AbstrastInputState[i];
+					} else {
+						absState = object_state->checkState(offset);	// TODO: only checks one bit
+					}
 				}
 
 				context->addAbsInput(absState);
@@ -1147,20 +1166,28 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 	// Function has not been analyzed before
 	if (FS == NULL) {
+		//errs() << "Function " << F->getName() << " added to worklist\n";
 		FunctionWorklist.emplace_back(F, Context);
+
 		return false;
 	}
 
 	OutputState *state = FS->getResult(Context);
 	// Function has not been analyzed with the context
 	if (state == NULL) {
+		//errs() << "Function " << F->getName() << " added to worklist\n";
 		FunctionWorklist.emplace_back(F, Context);
+
 		return false;
 	}
 
+	errs() << "Function cache found\n";
 	// TODO: use cached result to modify parameter states
-	errs() << "***Dumping output state***\n";
-	state->dump();
+	//errs() << "***Dumping input state***\n";
+	//Context->dump();
+
+	//errs() << "***Dumping output state***\n";
+	//state->dump();
 	return false;
 }
 
@@ -1256,13 +1283,20 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			continue;
 		}
 
-		unsigned TypeSize = getFieldSize(Arg, DL);
-		ParamState absState = object_state->checkState(0, TypeSize);
+		ParamState absState;
+		if (object_state->getSize() == 0) {
+			absState = Context->AbstrastInputState[i];
+		} else {
+			unsigned TypeSize = getFieldSize(Arg, DL);
+			absState = object_state->checkState(0, TypeSize);
+		}
 
 		if (Output->AbstrastOutputState[i] != absState) {
 			Output->AbstrastOutputState[i] = absState;
 			updated = true;
 		}
+
+		i++;
 	}
 
 	// Cache return Type

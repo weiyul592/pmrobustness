@@ -20,19 +20,20 @@ enum class ParamState {
 };
 
 struct OutputState {
-	SmallVector<ParamState, 8> AbstrastOutputState;
+	SmallVector<ParamState, 8> AbstractOutputState;
 
 	bool hasRetVal;
 	ParamState retVal;
 
 	void dump() {
 		errs() << "Abstract output state: ";
-		for (ParamState &I : AbstrastOutputState) {
-			errs() << (int)I << "\n";
+		for (ParamState &I : AbstractOutputState) {
+			errs() << (int)I << "\t";
 		}
+		errs() << "\n";
 
 		if (hasRetVal)
-			errs() << "Abstrast return state: " << (int)retVal << "\n";
+			errs() << "Abstract return state: " << (int)retVal << "\n";
 
 		errs() << "\n";
 	}
@@ -41,26 +42,28 @@ struct OutputState {
 
 struct CallingContext {
 	SmallVector<Value *, 8> parameters;
-	SmallVector<ParamState, 8> AbstrastInputState;
+	SmallVector<ParamState, 8> AbstractInputState;
 
 	void addAbsInput(ParamState s) {
-		AbstrastInputState.push_back(s);
+		AbstractInputState.push_back(s);
 	}
 
 	void dump() {
+		/*
 		errs() << "Original parameters: ";
 		for (Value *V : parameters) {
-			errs() << *V << "\n";
+			errs() << *V << "\t";
 		}
+		errs() << "\n";
+		*/
 
-		errs() << "\nAbstract input state: ";
-		for (ParamState &I : AbstrastInputState) {
-			errs() << (int)I << "\n";
+		errs() << "Abstract input state:  ";
+		for (ParamState &I : AbstractInputState) {
+			errs() << (int)I << "\t";
 		}
 		errs() << "\n";
 	}
 };
-
 
 class FunctionSummary {
 public:
@@ -89,14 +92,14 @@ public:
 	};
 
 	OutputState * getResult(CallingContext *Context) {
-		return ResultMap.lookup(Context->AbstrastInputState);
+		return ResultMap.lookup(Context->AbstractInputState);
 	}
 
 	OutputState * getOrCreateResult(CallingContext *Context) {
-		OutputState *state = ResultMap.lookup(Context->AbstrastInputState);
+		OutputState *state = ResultMap.lookup(Context->AbstractInputState);
 		if (state == NULL) {
 			state = new OutputState();
-			ResultMap[Context->AbstrastInputState] = state;
+			ResultMap[Context->AbstractInputState] = state;
 		}
 
 		return state;

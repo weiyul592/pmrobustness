@@ -270,6 +270,7 @@ public:
 	}
 
 	ParamState checkState(unsigned startByte) {
+		//errs() << "size: " << size << "; startByte: " << startByte << "\n";
 		if (escaped_bits[startByte]) {
 			if (flushed_bits[startByte])
 				return ParamState::CLEAN_ESCAPED;
@@ -322,7 +323,30 @@ public:
 		}
 	}
 
-	void print() {
+	void computeDirtyBtyes(DirtyBytesInfo *info) {
+		dump();
+
+		int i = flushed_bits.find_first_unset();
+		assert(i != -1);
+
+		while (i != -1) {
+			// Store [i, j)
+			int j = flushed_bits.find_next(i);
+
+			if (j == -1) {
+				j = size;
+				info->push(i, j);
+				break;
+			}
+
+			info->push(i, j);
+			i = flushed_bits.find_next_unset(j);
+		}
+
+		info->finalize();
+	}
+
+	void dump() {
 		errs() << "bit vector size: " << size << "\n";
 		for (unsigned i = 0; i < size; i++) {
 			errs() << flushed_bits[i];

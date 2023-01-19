@@ -630,7 +630,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			updated |= object_state->setDirty(offset, TypeSize);
 		}
 
-		// Rule 2.2: x = *p (where p is a heap address) => x escapes
+		// Rule 2.2: p = *x (where x is a heap address) => p escapes
 		if (I->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
 			DecomposedGEP LIDecompGEP;
 			decomposeAddress(LIDecompGEP, I, DL);
@@ -1176,9 +1176,9 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		return false;
 	}
 
-	OutputState *state = FS->getResult(Context);
+	OutputState *out_state = FS->getResult(Context);
 	// Function has not been analyzed with the context
-	if (state == NULL) {
+	if (out_state == NULL) {
 		//errs() << "Function " << F->getName() << " added to worklist\n";
 		FunctionWorklist.emplace_back(F, Context);
 
@@ -1192,12 +1192,13 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		Value *op =  *it;
 
 		if (Context->AbstractInputState[i] == ParamState::NON_PMEM) {
-			// Ignore NON_PMEM parameters
-			assert(state->AbstractOutputState[i] == ParamState::NON_PMEM);
+			// Ignore NON_PMEM input parameters
+			assert(out_state->AbstractOutputState[i] == ParamState::NON_PMEM);
 
 			i++;
 			continue;
-		} else if (state->AbstractOutputState[i] == ParamState::NON_PMEM) {
+		} else if (out_state->AbstractOutputState[i] == ParamState::NON_PMEM) {
+			// It has happened that when the input is top, the output is NON_PMEM
 			i++;
 			continue;
 		}
@@ -1220,25 +1221,34 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				errs() << "call base: " << *CB << "\n";
 				CB->getFunction()->dump();
 
-				assert(false && "fix me");
+				assert(false);
 			}*/
 
 			unsigned TypeSize = getFieldSize(op, DL);
 
-			ParamState &param_state = state->AbstractOutputState[i];
+			ParamState &param_state = out_state->AbstractOutputState[i];
 			if (param_state == ParamState::DIRTY_CAPTURED) {
 				// FIXME: How to approximate dirty?
-				object_state->setDirty(offset, TypeSize);
+				if (Context->AbstractInputState[i] == ParamState::CLEAN_CAPTURED ||
+					Context->AbstractInputState[i] == ParamState::CLEAN_ESCAPED) {
+					// Note: We don't recapture escaped objects
+					// If input state is clean, then use DirtyBytesInfo to get dirty bytes
+					DirtyBytesInfo *info = out_state->getDirtyBtyesInfo(i);
+					std::vector<std::pair<int, int>> *lst = info->getDirtyBtyes();
+					//object_state->();
+				} else {
+					object_state->setDirty(offset, TypeSize);
+				}
+			} else if (param_state == ParamState::DIRTY_ESCAPED) {
+				// TODO: How to approximate dirty and partial escaped?
+				object_state->setEscape(offset, TypeSize, true);
+				assert(false);
 			} else if (param_state == ParamState::CLWB_CAPTURED) {
+				object_state->setClwb(offset, TypeSize);
+			} else if (param_state == ParamState::CLWB_ESCAPED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamState::CLEAN_CAPTURED) {
 				object_state->setFlush(offset, TypeSize);
-			} else if (param_state == ParamState::DIRTY_ESCAPED) {
-				// TODO: How to approximate dirty?
-				object_state->setEscape(offset, TypeSize, true);
-				assert(false);
-			} else if (param_state == ParamState::CLWB_ESCAPED) {
-				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamState::CLEAN_ESCAPED) {
 				object_state->setFlush(offset, TypeSize);
 				object_state->setEscape(offset, TypeSize, true);
@@ -1282,18 +1292,18 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		object_state->setMaxSize(TypeSize);
 
 		if (PS == ParamState::DIRTY_CAPTURED) {
-			//object_state->setDirty(0, TypeSize);
-			//object_state->setEscape(0, TypeSize);
+			// FIXME: how to approximate dirty
 		} else if (PS == ParamState::DIRTY_ESCAPED) {
+			// FIXME: how to approximate dirty and partial escaped
 			object_state->setEscape(0, TypeSize);
 		} else if (PS == ParamState::CLWB_CAPTURED) {
 			object_state->setClwb(0, TypeSize);
 		} else if (PS == ParamState::CLWB_ESCAPED) {
 			object_state->setClwb(0, TypeSize);
 			object_state->setEscape(0, TypeSize);
-		} else if (PS == ParamState::CLWB_CAPTURED) {
+		} else if (PS == ParamState::CLEAN_CAPTURED) {
 			object_state->setFlush(0, TypeSize);
-		} else if (PS == ParamState::CLWB_ESCAPED) {
+		} else if (PS == ParamState::CLEAN_ESCAPED) {
 			object_state->setFlush(0, TypeSize);
 			object_state->setEscape(0, TypeSize);
 		} else {
@@ -1356,10 +1366,23 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 		ParamState absState;
 		if (object_state->getSize() == 0) {
+			// No store to the parameter; TODO: how about loads?
 			absState = Context->AbstractInputState[i];
 		} else {
 			unsigned TypeSize = getFieldSize(Arg, DL);
 			absState = object_state->checkState(0, TypeSize);
+
+			// Weiyu: work here
+			// If the input state is clean, add dirty btyes to list
+			if (Context->AbstractInputState[i] == ParamState::CLEAN_CAPTURED ||
+				Context->AbstractInputState[i] == ParamState::CLEAN_ESCAPED) {
+
+				if (absState == ParamState::DIRTY_CAPTURED || absState == ParamState::DIRTY_ESCAPED) {
+					DirtyBytesInfo *info = Output->getOrCreateDirtyBtyesInfo(i);
+					object_state->computeDirtyBtyes(info);
+				} // TODO: else if (CLWB_CAPTURED/CLWB_ESCAPED)
+			}
+
 		}
 
 		if (Output->AbstractOutputState[i] != absState) {
@@ -1383,7 +1406,7 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 		Output->retVal = ParamState::NON_PMEM;
 	}*/
 
-	// Free memory allocated in final_state
+	// Free memory in temporarily allocated final_state object
 	for (state_t::iterator it = final_state.begin(); it != final_state.end(); it++) {
 		delete it->second;
 	}
@@ -1776,7 +1799,7 @@ void PMRobustness::printMap(state_t * map) {
 	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
 		ob_state_t *object_state = it->second;
 		errs() << "loc: " << *it->first << "\n";
-		object_state->print();
+		object_state->dump();
 	}
 
 	errs() << "\n***\n";

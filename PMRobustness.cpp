@@ -418,11 +418,12 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		}
 	}
 
+/*
 	if (updated) {
-		//errs() << "After " << *I << "\n";
-		//printMap(map);
+		errs() << "After " << *I << "\n";
+		printMap(map);
 	}
-
+*/
 	return updated;
 }
 
@@ -1216,14 +1217,20 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 			ParamState &param_state = out_state->AbstractOutputState[i];
 			if (param_state == ParamState::DIRTY_CAPTURED) {
-				// FIXME: How to approximate dirty?
+				// Approximate dirty
 				if (Context->AbstractInputState[i] == ParamState::CLEAN_CAPTURED ||
 					Context->AbstractInputState[i] == ParamState::CLEAN_ESCAPED) {
 					// Note: We don't recapture escaped objects
 					// If input state is clean, then use DirtyBytesInfo to get dirty bytes
 					DirtyBytesInfo *info = out_state->getDirtyBtyesInfo(i);
 					std::vector<std::pair<int, int>> *lst = info->getDirtyBtyes();
-					//object_state->();
+
+					unsigned offsets = DecompGEP.getOffsets();
+					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
+					for (unsigned i = 0; i < lst->size(); i++) {
+						std::pair<int, int> &elem = (*lst)[i];
+						object_state->setDirty(offsets + elem.first, elem.second - elem.first);
+					}
 				} else {
 					object_state->setDirty(offset, TypeSize);
 				}

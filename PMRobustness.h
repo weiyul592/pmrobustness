@@ -321,15 +321,17 @@ public:
 	}
 
 	void computeDirtyBtyes(DirtyBytesInfo *info) {
-		/* TODO
 		dump();
 
-		int i = flushed_bytes.find_first_unset();
+		BitVector only_dirty_bytes(dirty_bytes);
+		only_dirty_bytes ^= clwb_bytes;
+
+		int i = only_dirty_bytes.find_first();
 		assert(i != -1);
 
 		while (i != -1) {
 			// Store [i, j)
-			int j = flushed_bytes.find_next(i);
+			int j = only_dirty_bytes.find_next_unset(i);
 
 			if (j == -1) {
 				j = size;
@@ -338,11 +340,10 @@ public:
 			}
 
 			info->push(i, j);
-			i = flushed_bytes.find_next_unset(j);
+			i = dirty_bytes.find_next(j);
 		}
 
 		info->finalize();
-		*/
 	}
 
 	void dump() {

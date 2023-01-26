@@ -532,7 +532,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		updated |= object_state->setDirty(offset, TypeSize);
 
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
-		// TODO: Val should be PM Addr
+		// TODO: Val(i.e. p) should be PM Addr
 		if (Val && Val->getType()->isPointerTy() &&
 			mayInHeap(DecompGEP.Base)) {
 			DecomposedGEP ValDecompGEP;
@@ -550,9 +550,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 					updated |= true;
 				}
 
-				// Mark the start byte of the arr as escaped
-				unsigned startByte = ValDecompGEP.getStructOffset();
-				updated |= object_state->setEscape(startByte, 1);
+				// Mark it as escaped
+				updated |= object_state->setEscape();
 			} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 				// TODO: start working here
 				//assert(false && "Fix me");
@@ -564,19 +563,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 					updated |= true;
 				}
 
-				if (offset == 0) {
-					// Mark the entire object as escaped
-					// FIXME: the offset of the first field is also 0;
-					// could not tell if the object or the first field escapes
-					updated |= object_state->setEscape(0, object_state->getSize(), true);
-				} else {
-					// Only mark this field as escaped
-					// Example: *x = &p->f;
-
-					// Get the size of the field p->f
-					unsigned TypeSize = getFieldSize(Val, DL);
-					updated |= object_state->setEscape(offset, TypeSize);
-				}
+				// Note: if *x = &p->f, then *p is potentially reachabled; so mark it as escaped
+				updated |= object_state->setEscape();
 			}
 		}
 	}
@@ -650,7 +638,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 				updated |= true;
 			}
 
-			updated |= object_state->setEscape(0, object_state->getSize(), true);
+			updated |= object_state->setEscape();
 		}
 	}
 
@@ -1240,18 +1228,19 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					object_state->setDirty(offset, TypeSize);
 				}
 			} else if (param_state == ParamState::DIRTY_ESCAPED) {
-				// TODO: How to approximate dirty and partial escaped?
-				object_state->setEscape(offset, TypeSize, true);
+				// TODO: How to approximate dirty?
+				object_state->setEscape();
 				assert(false);
 			} else if (param_state == ParamState::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamState::CLWB_ESCAPED) {
 				object_state->setClwb(offset, TypeSize);
+				object_state->setEscape();
 			} else if (param_state == ParamState::CLEAN_CAPTURED) {
 				object_state->setFlush(offset, TypeSize);
 			} else if (param_state == ParamState::CLEAN_ESCAPED) {
 				object_state->setFlush(offset, TypeSize);
-				object_state->setEscape(offset, TypeSize, true);
+				object_state->setEscape();
 			} else {
 				assert(false && "other cases");
 			}
@@ -1294,18 +1283,18 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		if (PS == ParamState::DIRTY_CAPTURED) {
 			// FIXME: how to approximate dirty
 		} else if (PS == ParamState::DIRTY_ESCAPED) {
-			// FIXME: how to approximate dirty and partial escaped
-			object_state->setEscape(0, TypeSize);
+			// FIXME: how to approximate dirty
+			object_state->setEscape();
 		} else if (PS == ParamState::CLWB_CAPTURED) {
 			object_state->setClwb(0, TypeSize);
 		} else if (PS == ParamState::CLWB_ESCAPED) {
 			object_state->setClwb(0, TypeSize);
-			object_state->setEscape(0, TypeSize);
+			object_state->setEscape();
 		} else if (PS == ParamState::CLEAN_CAPTURED) {
 			object_state->setFlush(0, TypeSize);
 		} else if (PS == ParamState::CLEAN_ESCAPED) {
 			object_state->setFlush(0, TypeSize);
-			object_state->setEscape(0, TypeSize);
+			object_state->setEscape();
 		} else {
 			// TOP, BOTTOM, etc.
 			// Not sure what to do

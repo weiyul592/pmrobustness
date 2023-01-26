@@ -92,14 +92,13 @@ struct DecomposedGEP {
 /**
  * TODO: may need to track the size of fields
  **/
-// <flushed_bit, clwb_bit> is either <1, 0>, <0, 1>, or <0, 0>
+// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <1, 1>
 class ob_state_t {
 private:
 	unsigned size;
 	unsigned maxSize;
-	BitVector flushed_bits;
-	BitVector clwb_bits;
-	BitVector escaped_bits;
+	BitVector dirty_bytes;
+	BitVector clwb_bytes;
 	bool escaped;
 
 	void resize(unsigned s) {
@@ -108,9 +107,8 @@ private:
 
 		if (size < s) {
 			size = s;
-			flushed_bits.resize(s);
-			clwb_bits.resize(s);
-			escaped_bits.resize(s, escaped);
+			dirty_bytes.resize(s);
+			clwb_bytes.resize(s);
 		}
 	}
 
@@ -118,46 +116,46 @@ public:
 	ob_state_t() :
 		size(0),
 		maxSize(0),
-		flushed_bits(),
-		clwb_bits(),
-		escaped_bits(),
+		dirty_bytes(),
+		clwb_bytes(),
 		escaped(false)
 	{}
 
 	ob_state_t(unsigned s) :
 		size(s),
 		maxSize(0),
-		flushed_bits(s),
-		clwb_bits(s),
-		escaped_bits(s),
+		dirty_bytes(s),
+		clwb_bytes(s),
 		escaped(false)
 	{ assert(s <= (1 << 12)); }
 
 	ob_state_t(ob_state_t * other) :
 		size(other->size),
 		maxSize(other->maxSize),
-		flushed_bits(other->flushed_bits),
-		clwb_bits(other->clwb_bits),
-		escaped_bits(other->escaped_bits),
+		dirty_bytes(other->dirty_bytes),
+		clwb_bytes(other->clwb_bytes),
 		escaped(other->escaped)
 	{ assert(size <= (1 << 12)); }
 
 	void mergeFrom(ob_state_t * other) {
 		//assert(size == other->size);
 
-		//BitVector clwb_bits = clwb_bits & other->clwb_bits |
-		//	((clwb_bits ^ other->clwb_bits) & (flushed_bits ^ other->flushed_bits));
-		BitVector tmp1(clwb_bits);
-		BitVector tmp2(flushed_bits);
-		tmp1 ^= other->clwb_bits;
-		tmp2 ^= other->flushed_bits;
-		tmp1 &= tmp2;
+		// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <1, 1>
+		// clwb_bytes = (clwb_bytes | other->clwb_bytes) &
+		// ~((dirty_bytes ^ clwb_bytes) | (other->dirty_bytes ^ other->clwb_bytes));
+		// dirty_bytes = dirty_bytes | other->dirty_bytes
 
-		clwb_bits &= other->clwb_bits;
-		clwb_bits |= tmp1;
+		// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <0, 1>
+		// dirty_byte = dirty_byte | other->dirty_byte
+		// clwb_byte = (clwb_byte | other->clwb_byte) & ~dirty_byte [result from last line]
+		// TODO: Fix other methods
+		dirty_bytes |= other->dirty_bytes;
+		BitVector tmp(dirty_bytes);
+		tmp.flip();
 
-		flushed_bits &= other->flushed_bits;
-		escaped_bits |= other->escaped_bits;
+		clwb_bytes |= other->clwb_bytes;
+		clwb_bytes &= tmp;
+
 		escaped |= other->escaped;
 	}
 
@@ -166,9 +164,8 @@ public:
 
 		size = src->size;
 		maxSize = src->maxSize;
-		flushed_bits = src->flushed_bits;
-		clwb_bits = src->clwb_bits;
-		escaped_bits = src->escaped_bits;
+		dirty_bytes = src->dirty_bytes;
+		clwb_bytes = src->clwb_bytes;
 		escaped = src->escaped;
 	}
 
@@ -181,17 +178,17 @@ public:
 
 		//errs() << "start: " << start << "; len: " << len << "; end:" << end << "\n";
 		//errs() << "max size: " << maxSize << "; actual size: " << size << "\n";
+		int index1 = dirty_bytes.find_first_unset_in(start, end);
+		int index2 = clwb_bytes.find_first_in(start, end);
 
-		int index1 = flushed_bits.find_first_in(start, end);
-		int index2 = clwb_bits.find_first_in(start, end);
-
+		// dirty_byte are all 1 and clwb_bytes are all 0, then no change
 		if (index1 == -1 && index2 == -1)
 			return false;
-		else {
-			flushed_bits.reset(start, end);
-			clwb_bits.reset(start, end);
-			return true;
-		}
+
+		dirty_bytes.set(start, end);
+		clwb_bytes.reset(start, end);
+
+		return true;
 	}
 
 	// TODO: start + len and size?
@@ -201,20 +198,20 @@ public:
 		if (len == (unsigned)-1) {
 			assert("false");
 		} else if (start + len > size){
-			// Only need to flush bits that have been written to
+			// Only need to flush bytes that have been written to
 			end = size;
 		} else {
 			end = start + len;
 		}
 
 		if (start >= size) {
-			errs() << "FIXME: Flush unknown bits\n";
+			errs() << "FIXME: Flush unknown bytes\n";
 			return;
-			//assert(false && "Flush unknown bits");
+			//assert(false && "Flush unknown bytes");
 		}
 
-		flushed_bits.set(start, end);
-		clwb_bits.reset(start, end);
+		dirty_bytes.reset(start, end);
+		clwb_bytes.reset(start, end);
 	}
 
 	// TODO: start + len and size?
@@ -223,38 +220,32 @@ public:
 		if (len == (unsigned)-1) {
 			assert("false");
 		} else if (start + len > size){
-			// Only need to flushopt bits that have been written to
+			// Only need to flushopt bytes that have been written to
 			end = size;
 		} else {
 			end = start + len;
 		}
 
 		if (start >= size) {
-			assert(false && "Clwb unknown bits");
+			assert(false && "Clwb unknown bytes");
 		}
 
-		BitVector tmp(flushed_bits);
-		tmp.flip();
+		// set clwb_bytes for bytes in dirty_bytes
+		BitVector tmp(dirty_bytes);
+		tmp.reset(0, start);
+		tmp.reset(end, tmp.size());
 
-		clwb_bits.set(start, end);
-		clwb_bits &= tmp;
+		clwb_bytes |= tmp;
 	}
 
 	// return true: modified; return else: unchanged
-	bool setEscape(unsigned start, unsigned len, bool objectEscape = false) {
-		escaped = objectEscape;
-		unsigned end = start + len;
-		if (end > size) {
-			resize(end);
-		}
-
-		int index = escaped_bits.find_first_unset_in(start, end);
-		if (index == -1)
-			return false;
-		else {
-			escaped_bits.set(start, end);
+	bool setEscape() {
+		if (escaped == false) {
+			escaped = true;
 			return true;
 		}
+
+		return false;
 	}
 
 	unsigned getSize() {
@@ -271,20 +262,23 @@ public:
 
 	ParamState checkState(unsigned startByte) {
 		//errs() << "size: " << size << "; startByte: " << startByte << "\n";
-		if (escaped_bits[startByte]) {
-			if (flushed_bits[startByte])
-				return ParamState::CLEAN_ESCAPED;
-			else if (clwb_bits[startByte])
+		if (size == 0 && startByte == 0)
+			return ParamState::TOP;
+
+		if (escaped) {
+			if (clwb_bytes[startByte])
 				return ParamState::CLWB_ESCAPED;
-			else
+			else if (dirty_bytes[startByte])
 				return ParamState::DIRTY_ESCAPED;
-		} else {
-			if (flushed_bits[startByte])
-				return ParamState::CLEAN_CAPTURED;
-			else if (clwb_bits[startByte])
-				return ParamState::CLWB_CAPTURED;
 			else
+				return ParamState::CLEAN_ESCAPED;
+		} else {
+			if (clwb_bytes[startByte])
+				return ParamState::CLWB_CAPTURED;
+			else if (dirty_bytes[startByte])
 				return ParamState::DIRTY_CAPTURED;
+			else
+				return ParamState::CLEAN_CAPTURED;
 		}
 	}
 
@@ -300,38 +294,42 @@ public:
 		if (endByte > size)
 			endByte = size;
 
-		if (escaped_bits.find_first_unset_in(startByte, endByte) == -1) {
-			// All bits escaped
-			if (flushed_bits.find_first_unset_in(startByte, endByte) == -1)
+		int index = dirty_bytes.find_first_in(startByte, endByte);
+		BitVector tmp(dirty_bytes);
+		tmp &= clwb_bytes;
+
+		if (escaped) {
+			if (dirty_bytes.find_first_in(startByte, endByte) == -1) {
+				// dirty_bytes are all 0
 				return ParamState::CLEAN_ESCAPED;
-			else if (clwb_bits.find_first_unset_in(startByte, endByte) == -1)
+			} else if (tmp.find_first_unset_in(startByte, endByte) == -1) {
+				// dirty_bytes and clwb_bytes are all set;
 				return ParamState::CLWB_ESCAPED;
-			else
+			} else
 				return ParamState::DIRTY_ESCAPED;
-		} else if (escaped_bits.find_first_in(startByte, endByte) == -1) {
-			// All bits captured
-			if (flushed_bits.find_first_unset_in(startByte, endByte) == -1)
-				return ParamState::CLEAN_CAPTURED;
-			else if (clwb_bits.find_first_unset_in(startByte, endByte) == -1)
-				return ParamState::CLWB_CAPTURED;
-			else
-				return ParamState::DIRTY_CAPTURED;
 		} else {
-			// Some bits escaped
-			// TODO: Need to be more accurate?
-			return ParamState::TOP;
+
+			if (dirty_bytes.find_first_in(startByte, endByte) == -1) {
+				// dirty_bytes are all 0
+				return ParamState::CLEAN_CAPTURED;
+			} else if (tmp.find_first_unset_in(startByte, endByte) == -1) {
+				// dirty_bytes and clwb_bytes are all set;
+				return ParamState::CLWB_CAPTURED;
+			} else
+				return ParamState::DIRTY_CAPTURED;
 		}
 	}
 
 	void computeDirtyBtyes(DirtyBytesInfo *info) {
+		/* TODO
 		dump();
 
-		int i = flushed_bits.find_first_unset();
+		int i = flushed_bytes.find_first_unset();
 		assert(i != -1);
 
 		while (i != -1) {
 			// Store [i, j)
-			int j = flushed_bits.find_next(i);
+			int j = flushed_bytes.find_next(i);
 
 			if (j == -1) {
 				j = size;
@@ -340,25 +338,29 @@ public:
 			}
 
 			info->push(i, j);
-			i = flushed_bits.find_next_unset(j);
+			i = flushed_bytes.find_next_unset(j);
 		}
 
 		info->finalize();
+		*/
 	}
 
 	void dump() {
 		errs() << "bit vector size: " << size << "\n";
 		for (unsigned i = 0; i < size; i++) {
-			errs() << flushed_bits[i];
+			errs() << dirty_bytes[i];
 		}
 		errs() << "\n";
 		for (unsigned i = 0; i < size; i++) {
-			errs() << clwb_bits[i];
+			errs() << clwb_bytes[i];
 		}
 		errs() << "\n";
-		for (unsigned i = 0; i < size; i++) {
-			errs() << escaped_bits[i];
-		}
+
+		if (escaped)
+			errs() << "escaped";
+		else
+			errs() << "captured";
+
 		errs() << "\n";
 	}
 };

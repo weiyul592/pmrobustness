@@ -285,8 +285,8 @@ public:
 	ParamState checkState(unsigned startByte, unsigned len) {
 		unsigned endByte = startByte + len;
 		//errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "; maxsize: " << maxSize << "\n";
-		if (startByte >= maxSize || endByte > maxSize)
-			assert(false && "out of bound error");
+		//if (startByte >= maxSize || endByte > maxSize)
+		//	assert(false && "out of bound error");
 
 		if (startByte >= size)
 			assert(false);

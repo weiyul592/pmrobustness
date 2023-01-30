@@ -1127,14 +1127,16 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 				ob_state_t *object_state = map->lookup(DecompGEP.Base);
 				ParamState absState = ParamState::TOP;
 				if (object_state != NULL) {
+					unsigned TypeSize = getFieldSize(op, DL);
 					//errs() << "Base: " << *DecompGEP.Base << " of instruction " << *I <<"\n";
+					//errs() << "offset: " << offset << "; field size: " << TypeSize << "\n";
 					//errs() << "op: " << *op << "\n";
 
 					if (object_state->getSize() == 0 && FunctionArguments.find(op) != FunctionArguments.end()) {
 						// The parent function's parameter is passed to call site without any modification
 						absState = CurrentContext->AbstractInputState[i];
 					} else {
-						absState = object_state->checkState(offset);	// TODO: only checks one bit
+						absState = object_state->checkState(offset, TypeSize);
 					}
 				}
 
@@ -1257,13 +1259,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	}
 	// TODO: use cached result to modify parameter states
 
-	//errs() << "***Dumping input state***\n";
-	//Context->dump();
-
-	//errs() << "***Dumping output state***\n";
-	//state->dump();
-
-	return false;
+	return true;
 }
 
 // Get initial states of parameters from Context

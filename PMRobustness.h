@@ -294,7 +294,6 @@ public:
 		if (endByte > size)
 			endByte = size;
 
-		int index = dirty_bytes.find_first_in(startByte, endByte);
 		BitVector tmp(dirty_bytes);
 		tmp &= clwb_bytes;
 
@@ -321,7 +320,7 @@ public:
 	}
 
 	void computeDirtyBtyes(DirtyBytesInfo *info) {
-		dump();
+		//dump();
 
 		BitVector only_dirty_bytes(dirty_bytes);
 		only_dirty_bytes ^= clwb_bytes;

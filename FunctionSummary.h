@@ -30,7 +30,7 @@ struct DirtyBytesInfo {
 		if (tmp_lst == NULL)
 			tmp_lst = new std::vector<std::pair<int, int>>();
 
-		errs() << "[" << i << ", " << j << ") is pushed\n";
+		//errs() << "[" << i << ", " << j << ") is pushed\n";
 		tmp_lst->emplace_back(i, j);
 	}
 
@@ -124,6 +124,13 @@ struct CallingContext {
 		AbstractInputState.push_back(s);
 	}
 
+	CallingContext() {}
+
+	CallingContext(CallingContext *other) {
+		parameters = other->parameters;
+		AbstractInputState = other->AbstractInputState;
+	}
+
 	void dump() {
 		/*
 		errs() << "Original parameters: ";
@@ -189,5 +196,26 @@ private:
 	result_map_t ResultMap;
 	unsigned ArgSize = 0;
 };
+
+namespace llvm {
+template<> struct DenseMapInfo<CallingContext> {
+	static CallingContext * getEmptyKey() {
+		return new CallingContext();
+	}
+
+	static CallingContext * getTombstoneKey() {
+		return new CallingContext();
+	}
+
+	static unsigned getHashValue(const CallingContext *V) {
+		return static_cast<unsigned>(hash_combine_range(V->AbstractInputState.begin(), V->AbstractInputState.end()));
+	}
+
+	static bool isEqual(const CallingContext *LHS,
+						const CallingContext *RHS) {
+		return LHS->AbstractInputState == RHS->AbstractInputState;
+	}
+};
+}
 
 #endif

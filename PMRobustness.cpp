@@ -45,6 +45,8 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/None.h"
 #include "PMRobustness.h"
 #include "FunctionSummary.h"
 //#include "andersen/include/AndersenAA.h"
@@ -71,13 +73,13 @@ namespace {
 		void copyState(state_t * src, state_t * dst);
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
 			state_t * dst);
-		bool processInstruction(state_t * map, Instruction * I);
+		bool processInstruction(state_t * map, Instruction * I, CallingContext * ParentContext);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 		bool processFlushWrapperFunction(state_t * map, Instruction * I);
-		bool processCalls(state_t *map, Instruction *I);
+		bool processCalls(state_t *map, Instruction *I, CallingContext *ParentContext);
 
 		//bool processParamAnnotationFunction(Instruction * I);
 
@@ -127,7 +129,7 @@ namespace {
 		//DenseSet<std::pair<Function *, CallingContext *>, DupFuncDenseMapInfo> DuplicateFunctions;
 
 		// Map a Function to its call sites
-		DenseMap<Function *, SmallPtrSet<Function *, 32> > FunctionCallerMap;
+		DenseMap<Function *, SmallSet<std::pair<Function *, CallingContext *>, 32> > FunctionCallerMap;
 		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
@@ -283,7 +285,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				copyState((*AbsState)[&*prev], state);
 			}
 
-			if (processInstruction(state, &*it))
+			if (processInstruction(state, &*it, Context))
 				changed |= true;
 
 			prev = it;
@@ -311,18 +313,13 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	// Only verify if output states have been changed
 	bool state_changed = computeFinalState(AbsState, F, Context);
 	if (state_changed) {
-		// push callers
-		SmallPtrSetImpl<Function *> &Callers = FunctionCallerMap[&F];
-		for (Function *Caller : Callers) {
-			// for each calling contexts that have been analyzed
-			FunctionSummary *FS = FunctionSummaries[Caller];
-			FunctionSummary::result_map_t * ResultMap = FS->getResultMap();
-			for (FunctionSummary::iterator it = ResultMap->begin(); it != ResultMap->end(); it++) {
-				CallingContext *Context = new CallingContext();
-				Context->AbstractInputState = it->first;
-				FunctionWorklist.emplace_back(Caller, Context);
-				errs() << "Function " << Caller->getName() << " added to worklist\n";
-			}
+		// push callers with their contexts
+		SmallSet<std::pair<Function *, CallingContext *>, 32> &Callers = FunctionCallerMap[&F];
+		for (const std::pair<Function *, CallingContext *> &C : Callers) {
+			Function *Function = C.first;
+			CallingContext *CallerContext = new CallingContext(C.second);
+			FunctionWorklist.emplace_back(Function, CallerContext);
+			errs() << "Function " << Function->getName() << " added to worklist\n";
 		}
 	}
 }
@@ -378,7 +375,7 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 	}
 }
 
-bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
+bool PMRobustness::processInstruction(state_t * map, Instruction * I, CallingContext * ParentContext) {
 	bool updated = false;
 
 	if (I->isAtomic()) {
@@ -413,7 +410,7 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 				// TODO: assembly flush operations. Are they used in real code?
 				// updated |= processFlush(map, I, op);
 			} else {
-				updated |= processCalls(map, I);
+				updated |= processCalls(map, I, ParentContext);
 			}
 		}
 	}
@@ -725,7 +722,7 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	return true;
 }
 
-bool PMRobustness::processCalls(state_t *map, Instruction *I) {
+bool PMRobustness::processCalls(state_t *map, Instruction *I, CallingContext *ParentContext) {
 	CallBase *CB = cast<CallBase>(I);
 	Function *F = CB->getCalledFunction();
 
@@ -743,8 +740,12 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	}
 
 	// Update FunctionCallerMap
-	SmallPtrSetImpl<Function *> &Callers = FunctionCallerMap[F];
-	Callers.insert(CB->getCaller());
+	SmallSet<std::pair<Function *, CallingContext *>, 32> &Callers = FunctionCallerMap[F];
+	CallingContext *ContextCopy = new CallingContext(ParentContext);
+	std::pair<NoneType, bool> ret_val = Callers.insert(std::make_pair(CB->getCaller(), ContextCopy));
+	if (ret_val.second == false) {
+		delete ContextCopy;
+	}
 
 	CallingContext *context = computeContext(map, I);
 	bool updated = lookupFunctionResult(map, CB, context);

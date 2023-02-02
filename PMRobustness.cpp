@@ -73,13 +73,13 @@ namespace {
 		void copyState(state_t * src, state_t * dst);
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
 			state_t * dst);
-		bool processInstruction(state_t * map, Instruction * I, CallingContext * ParentContext);
+		bool processInstruction(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 		bool processFlushWrapperFunction(state_t * map, Instruction * I);
-		bool processCalls(state_t *map, Instruction *I, CallingContext *ParentContext);
+		bool processCalls(state_t *map, Instruction *I);
 
 		//bool processParamAnnotationFunction(Instruction * I);
 
@@ -171,6 +171,7 @@ bool PMRobustness::doInitialization (Module &M) {
 
 bool PMRobustness::runOnModule(Module &M) {
 	for (Function &F : M) {
+#ifdef INTERPROCEDURAL
 		if (!F.use_empty() && !F.isDeclaration()) {
 			// TODO: assume parameters have states TOP or do not push them to worklist?
 			if (F.arg_size() == 0)
@@ -185,6 +186,10 @@ bool PMRobustness::runOnModule(Module &M) {
 			}
 #endif
 		}
+#else
+		if (!F.isDeclaration())
+			FunctionWorklist.emplace_back(&F, new CallingContext());
+#endif
 	}
 
 	while (!FunctionWorklist.empty()) {
@@ -216,17 +221,20 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		AbstractStates[&F] = AbsState;
 	}
 
+#ifdef INTERPROCEDURAL
 	CurrentContext = Context;
 	FunctionArguments.clear();
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
 		FunctionArguments.insert(&*it);
 	}
+#endif
 
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
 	DenseMap<const BasicBlock *, bool> visited_blocks;
 
+#ifdef INTERPROCEDURAL
 	// Collect all return statements of Function F
 	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
 	if (RetSet.empty()) {
@@ -235,6 +243,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				RetSet.insert(BB.getTerminator());
 		}
 	}
+#endif
 
 	// Analyze F
 	BlockWorklist.push_back(&F.getEntryBlock());
@@ -259,7 +268,9 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				if (block == &F.getEntryBlock()) {
 					// Entry block: has no precedessors
 					// Prepare initial state based on parameters
+#ifdef INTERPROCEDURAL
 					computeInitialState(state, F, Context);
+#endif
 				} else if (BasicBlock *pred = block->getUniquePredecessor()) {
 					// Unique predecessor; copy the state of last instruction in the pred block
 					state_t * prev_s = (*AbsState)[pred->getTerminator()];
@@ -285,7 +296,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				copyState((*AbsState)[&*prev], state);
 			}
 
-			if (processInstruction(state, &*it, Context))
+			if (processInstruction(state, &*it))
 				changed |= true;
 
 			prev = it;
@@ -310,6 +321,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		}
 	}
 
+#ifdef INTERPROCEDURAL
 	// Only verify if output states have been changed
 	bool state_changed = computeFinalState(AbsState, F, Context);
 	if (state_changed) {
@@ -319,9 +331,10 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 			Function *Function = C.first;
 			CallingContext *CallerContext = new CallingContext(C.second);
 			FunctionWorklist.emplace_back(Function, CallerContext);
-			errs() << "Function " << Function->getName() << " added to worklist\n";
+			errs() << "Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
 		}
 	}
+#endif
 }
 
 // DenseMap<Value *, ob_state_t *> state_t;
@@ -375,7 +388,7 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 	}
 }
 
-bool PMRobustness::processInstruction(state_t * map, Instruction * I, CallingContext * ParentContext) {
+bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
 
 	if (I->isAtomic()) {
@@ -410,7 +423,9 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I, CallingCon
 				// TODO: assembly flush operations. Are they used in real code?
 				// updated |= processFlush(map, I, op);
 			} else {
-				updated |= processCalls(map, I, ParentContext);
+#ifdef INTERPROCEDURAL
+				updated |= processCalls(map, I);
+#endif
 			}
 		}
 	}
@@ -722,7 +737,7 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	return true;
 }
 
-bool PMRobustness::processCalls(state_t *map, Instruction *I, CallingContext *ParentContext) {
+bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	CallBase *CB = cast<CallBase>(I);
 	Function *F = CB->getCalledFunction();
 
@@ -741,7 +756,7 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I, CallingContext *Pa
 
 	// Update FunctionCallerMap
 	SmallSet<std::pair<Function *, CallingContext *>, 32> &Callers = FunctionCallerMap[F];
-	CallingContext *ContextCopy = new CallingContext(ParentContext);
+	CallingContext *ContextCopy = new CallingContext(CurrentContext);
 	std::pair<NoneType, bool> ret_val = Callers.insert(std::make_pair(CB->getCaller(), ContextCopy));
 	if (ret_val.second == false) {
 		delete ContextCopy;
@@ -1162,7 +1177,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 	// Function has not been analyzed before
 	if (FS == NULL) {
-		//errs() << "Function " << F->getName() << " added to worklist\n";
+		//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
 		FunctionWorklist.emplace_back(F, Context);
 
 		return false;
@@ -1171,7 +1186,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	OutputState *out_state = FS->getResult(Context);
 	// Function has not been analyzed with the context
 	if (out_state == NULL) {
-		//errs() << "Function " << F->getName() << " added to worklist\n";
+		//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
 		FunctionWorklist.emplace_back(F, Context);
 
 		return false;

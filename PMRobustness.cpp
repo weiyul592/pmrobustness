@@ -529,13 +529,14 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		DecomposedGEP * tmp = new DecomposedGEP();
 		tmp->copyFrom(DecompGEP);
 		unflushed_addr->insert({Addr, tmp});
-
+/*
 		errs() << "Addr inserted: " << *Addr << "\n";
 		//errs() << "Array encountered\t";
 		errs() << *I << "\n  ";
 		//I->getFunction()->dump();
 		getPosition(I, IRB, true);
 		errs() << "\n";
+		*/
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 		/*
@@ -716,10 +717,12 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
 
+/*
 	errs() << "flush wrapper " << *Addr << "\n  for " << *FlushSize << "\n  ";
 	IRBuilder<> IRB(I);
 	getPosition(I, IRB, true);
-	//I->getFunction()->dump();
+	I->getFunction()->dump();
+*/
 
 	if (DecompGEP.isArray) {
 		//TODO: compare GEP address
@@ -740,9 +743,9 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
 
 			if (FlushOp == NVM_CLFLUSH)
-				object_state->setFlush(offset, size);
+				object_state->setFlush(offset, size, true);
 			else if (FlushOp == NVM_CLWB)
-				object_state->setClwb(offset, size);
+				object_state->setClwb(offset, size, true);
 		}
 	}
 
@@ -1131,14 +1134,10 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	//	return NULL;
 
 	CallingContext *context = new CallingContext();
-/*
-	Function *F = CB->getCalledFunction();
-	errs() << "Function " << F->getName() << ": ";
-	if (CB->arg_size() > 0)
-		errs() << "arguments from call base\n";
-	else
-		errs() << " no arguments\n";
-*/
+
+	//Function *F = CB->getCalledFunction();
+	//F->dump();
+
 	unsigned i = 0;
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 		Value *op = *it;
@@ -1184,6 +1183,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 	const DataLayout &DL = CB->getModule()->getDataLayout();
+	bool updated = false;
 
 	errs() << "lookup results for function: " << F->getName() << "\n";
 
@@ -1198,7 +1198,36 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			delete Context;
 		}
 
-		return false;
+		// Mark all parameters as TOP (clean and captured)
+		unsigned i = 0;
+		for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
+			Value *op = *it;
+
+			if (op->getType()->isPointerTy() && isPMAddr(op)) {
+				DecomposedGEP DecompGEP;
+				decomposeAddress(DecompGEP, op, DL);
+				unsigned offset = DecompGEP.getOffsets();
+
+				if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+					// TODO: What do we do here?
+				} else {
+					ob_state_t *object_state = map->lookup(DecompGEP.Base);
+
+					if (object_state == NULL) {
+						object_state = new ob_state_t();
+						(*map)[DecompGEP.Base] = object_state;
+					}
+
+					unsigned TypeSize = getFieldSize(op, DL);
+					updated |= object_state->setFlush(offset, TypeSize);
+					updated |= object_state->setCaptured();
+				}
+			} // Else case: op is NON_PMEM, so don't do anything
+
+			i++;
+		}
+
+		return updated;
 	}
 
 	OutputState *out_state = FS->getResult(Context);
@@ -1214,7 +1243,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			delete Context;
 		}
 
-		return false;
+		return updated;
 	}
 
 	errs() << "Function cache found\n";
@@ -1222,12 +1251,11 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	// Use cached result to modify parameter states
 	unsigned i = 0;
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
-		Value *op =  *it;
+		Value *op = *it;
 
 		if (Context->AbstractInputState[i] == ParamState::NON_PMEM) {
 			// Ignore NON_PMEM input parameters
 			assert(out_state->AbstractOutputState[i] == ParamState::NON_PMEM);
-
 			i++;
 			continue;
 		} else if (out_state->AbstractOutputState[i] == ParamState::NON_PMEM) {
@@ -1273,25 +1301,25 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
 					for (unsigned i = 0; i < lst->size(); i++) {
 						std::pair<int, int> &elem = (*lst)[i];
-						object_state->setDirty(offsets + elem.first, elem.second - elem.first);
+						updated |= object_state->setDirty(offsets + elem.first, elem.second - elem.first);
 					}
 				} else {
-					object_state->setDirty(offset, TypeSize);
+					updated |= object_state->setDirty(offset, TypeSize);
 				}
 			} else if (param_state == ParamState::DIRTY_ESCAPED) {
 				// TODO: How to approximate dirty?
-				object_state->setEscape();
+				updated |= object_state->setEscape();
 				assert(false);
 			} else if (param_state == ParamState::CLWB_CAPTURED) {
-				object_state->setClwb(offset, TypeSize);
+				updated |= object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamState::CLWB_ESCAPED) {
-				object_state->setClwb(offset, TypeSize);
-				object_state->setEscape();
+				updated |= object_state->setClwb(offset, TypeSize);
+				updated |= object_state->setEscape();
 			} else if (param_state == ParamState::CLEAN_CAPTURED) {
-				object_state->setFlush(offset, TypeSize);
+				updated |= object_state->setFlush(offset, TypeSize);
 			} else if (param_state == ParamState::CLEAN_ESCAPED) {
-				object_state->setFlush(offset, TypeSize);
-				object_state->setEscape();
+				updated |= object_state->setFlush(offset, TypeSize);
+				updated |= object_state->setEscape();
 			} else {
 				assert(false && "other cases");
 			}
@@ -1300,7 +1328,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		i++;
 	}
 
-	return true;
+	return updated;
 }
 
 // Get initial states of parameters from Context

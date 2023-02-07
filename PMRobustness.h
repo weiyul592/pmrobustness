@@ -192,56 +192,73 @@ public:
 	}
 
 	// TODO: start + len and size?
-	// Flushed cache lines may exceed the size of this object
-	void setFlush(unsigned start, unsigned len) {
-		unsigned end;
-		if (len == (unsigned)-1) {
-			assert("false");
-		} else if (start + len > size){
-			// Only need to flush bytes that have been written to
-			end = size;
-		} else {
-			end = start + len;
-		}
-
-		if (start >= size) {
+	// Flush wrapper function may flush cache lines exceeding the size of this object
+	bool setFlush(unsigned start, unsigned len, bool onlyFlushWrittenBytes = false) {
+		if (start >= size && onlyFlushWrittenBytes) {
 			errs() << "FIXME: Flush unknown bytes\n";
-			return;
+			return false;
 			//assert(false && "Flush unknown bytes");
 		}
 
+		unsigned end = start + len;
+		if (end > size && onlyFlushWrittenBytes) {
+			end = size;
+		} else if (end > size)
+			resize(end);
+
+		int index1 = dirty_bytes.find_first_in(start, end);
+		int index2 = clwb_bytes.find_first_in(start, end);
+
+		// dirty_byte and clwb_bytes are all 0, then no change
+		if (index1 == -1 && index2 == -1)
+			return false;
+
 		dirty_bytes.reset(start, end);
 		clwb_bytes.reset(start, end);
+
+		return true;
 	}
 
 	// TODO: start + len and size?
-	void setClwb(unsigned start, unsigned len) {
-		unsigned end;
-		if (len == (unsigned)-1) {
-			assert("false");
-		} else if (start + len > size){
-			// Only need to flushopt bytes that have been written to
-			end = size;
-		} else {
-			end = start + len;
-		}
-
-		if (start >= size) {
+	// Flush wrapper function may flush cache lines exceeding the size of this object
+	bool setClwb(unsigned start, unsigned len, bool onlyFlushWrittenBytes = false) {
+		if (start >= size && onlyFlushWrittenBytes) {
 			assert(false && "Clwb unknown bytes");
 		}
+
+		unsigned end = start + len;
+		if (end > size && onlyFlushWrittenBytes) {
+			end = size;
+		} else if (end > size)
+			resize(end);
 
 		// set clwb_bytes for bytes in dirty_bytes
 		BitVector tmp(dirty_bytes);
 		tmp.reset(0, start);
 		tmp.reset(end, tmp.size());
 
+		BitVector old_clwb_bytes(clwb_bytes);
 		clwb_bytes |= tmp;
+
+		if (old_clwb_bytes == clwb_bytes)
+			return false;	// No change
+
+		return true;
 	}
 
 	// return true: modified; return else: unchanged
 	bool setEscape() {
 		if (escaped == false) {
 			escaped = true;
+			return true;
+		}
+
+		return false;
+	}
+
+	bool setCaptured() {
+		if (escaped == true) {
+			escaped = false;
 			return true;
 		}
 
@@ -370,6 +387,13 @@ void printDecomposedGEP(DecomposedGEP &Decom) {
 	errs() << "Struct Offset: " << Decom.StructOffset << "\t";
 	errs() << "Other Offset: " << Decom.OtherOffset << "\t";
 	errs() << "Has VarIndices: " << Decom.VarIndices.size() << "\n";
+	/*
+	for (unsigned i = 0 ; i < Decom.VarIndices.size(); i++) {
+		VariableGEPIndex &VI = Decom.VarIndices[i];
+		errs() << *VI.V << "\n";
+		errs() << "(" << VI.ZExtBits << ", " << VI.SExtBits << ")\t";
+		errs() << "Scale: " << VI.Scale << "\n";
+	}*/
 }
 
 static inline Value *getPosition(Instruction * I, IRBuilder <> IRB, bool print = false)
@@ -386,6 +410,22 @@ static inline Value *getPosition(Instruction * I, IRBuilder <> IRB, bool print =
 	}
 
 	return IRB.CreateGlobalStringPtr (position_string);
+}
+
+bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)
+{
+	const DebugLoc & debug_location = I->getDebugLoc ();
+	std::string position_string;
+	{
+		llvm::raw_string_ostream position_stream (position_string);
+		debug_location . print (position_stream);
+	}
+
+	std::size_t found = position_string.find(sub);
+	if (found!=std::string::npos)
+		return true;
+
+	return false;
 }
 
 /// To ensure a pointer offset fits in an integer of size PointerSize

@@ -198,13 +198,17 @@ private:
 };
 
 namespace llvm {
-template<> struct DenseMapInfo<CallingContext> {
-	static CallingContext * getEmptyKey() {
-		return new CallingContext();
+template<> struct DenseMapInfo<CallingContext *> {
+	static inline CallingContext * getEmptyKey() {
+		uintptr_t Val = static_cast<uintptr_t>(-1);
+		Val <<= PointerLikeTypeTraits<CallingContext *>::NumLowBitsAvailable;
+		return reinterpret_cast<CallingContext *>(Val);
 	}
 
-	static CallingContext * getTombstoneKey() {
-		return new CallingContext();
+	static inline CallingContext * getTombstoneKey() {
+		uintptr_t Val = static_cast<uintptr_t>(~1U);
+		Val <<= PointerLikeTypeTraits<CallingContext *>::NumLowBitsAvailable;
+		return reinterpret_cast<CallingContext *>(Val);
 	}
 
 	static unsigned getHashValue(const CallingContext *V) {
@@ -213,6 +217,10 @@ template<> struct DenseMapInfo<CallingContext> {
 
 	static bool isEqual(const CallingContext *LHS,
 						const CallingContext *RHS) {
+		if (LHS == getEmptyKey() || RHS == getEmptyKey() ||
+			LHS == getTombstoneKey() || RHS == getTombstoneKey())
+			return LHS == RHS;
+
 		return LHS->AbstractInputState == RHS->AbstractInputState;
 	}
 };

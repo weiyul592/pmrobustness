@@ -45,7 +45,6 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/None.h"
 #include "PMRobustness.h"
 #include "FunctionSummary.h"
@@ -53,6 +52,7 @@
 //#include "llvm/Analysis/AliasAnalysis.h"
 
 //#define PMROBUST_DEBUG
+#define INTERPROCEDURAL
 #define DEBUG_TYPE "PMROBUST_DEBUG"
 #include <llvm/IR/DebugLoc.h>
 
@@ -126,11 +126,14 @@ namespace {
 		CallingContext *CurrentContext;
 		// Arguments of the function being analyzed
 		DenseSet<Value *> FunctionArguments;
-		//DenseSet<std::pair<Function *, CallingContext *>, DupFuncDenseMapInfo> DuplicateFunctions;
 
 		// Map a Function to its call sites
-		DenseMap<Function *, SmallSet<std::pair<Function *, CallingContext *>, 32> > FunctionCallerMap;
+		DenseMap<Function *, SmallDenseSet<std::pair<Function *, CallingContext *>> > FunctionCallerMap;
+
 		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
+
+		// The set of items in FunctionWorklist; used to avoid insert duplicate items to FunctionWorklist
+		DenseSet<std::pair<Function *, CallingContext *>> UniqueFunctionSet;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> BlockWorklist;
@@ -174,10 +177,15 @@ bool PMRobustness::runOnModule(Module &M) {
 #ifdef INTERPROCEDURAL
 		if (!F.use_empty() && !F.isDeclaration()) {
 			// TODO: assume parameters have states TOP or do not push them to worklist?
-			if (F.arg_size() == 0)
-				FunctionWorklist.emplace_back(&F, new CallingContext());
+			if (F.arg_size() == 0) {
+				CallingContext *Context = new CallingContext();
+				FunctionWorklist.emplace_back(&F, Context);
+				UniqueFunctionSet.insert(std::make_pair(&F, Context));
+			}
 		} else if (F.getName() == "main") {
-			FunctionWorklist.emplace_back(&F, new CallingContext());
+			CallingContext *Context = new CallingContext();
+			FunctionWorklist.emplace_back(&F, Context);
+			UniqueFunctionSet.insert(std::make_pair(&F, Context));
 		} else {
 #ifdef PMROBUST_DEBUG
 			if (F.isDeclaration()) {
@@ -195,6 +203,7 @@ bool PMRobustness::runOnModule(Module &M) {
 	while (!FunctionWorklist.empty()) {
 		std::pair<Function *, CallingContext *> &pair = FunctionWorklist.front();
 		FunctionWorklist.pop_front();
+		UniqueFunctionSet.erase(pair);
 
 		Function *F = pair.first;
 		CallingContext *context = pair.second;
@@ -227,14 +236,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
 		FunctionArguments.insert(&*it);
 	}
-#endif
 
-	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
-	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
-	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
-	DenseMap<const BasicBlock *, bool> visited_blocks;
-
-#ifdef INTERPROCEDURAL
 	// Collect all return statements of Function F
 	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
 	if (RetSet.empty()) {
@@ -244,6 +246,11 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		}
 	}
 #endif
+
+	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
+	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
+	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
+	DenseMap<const BasicBlock *, bool> visited_blocks;
 
 	// Analyze F
 	BlockWorklist.push_back(&F.getEntryBlock());
@@ -326,12 +333,17 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	bool state_changed = computeFinalState(AbsState, F, Context);
 	if (state_changed) {
 		// push callers with their contexts
-		SmallSet<std::pair<Function *, CallingContext *>, 32> &Callers = FunctionCallerMap[&F];
+		SmallDenseSet<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[&F];
 		for (const std::pair<Function *, CallingContext *> &C : Callers) {
-			Function *Function = C.first;
-			CallingContext *CallerContext = new CallingContext(C.second);
-			FunctionWorklist.emplace_back(Function, CallerContext);
-			errs() << "Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
+			if (UniqueFunctionSet.find(C) == UniqueFunctionSet.end()) {
+				// Not found in FunctionWorklist
+				Function *Function = C.first;
+				CallingContext *CallerContext = new CallingContext(C.second);
+				FunctionWorklist.emplace_back(Function, CallerContext);
+				UniqueFunctionSet.insert(std::make_pair(Function, CallerContext));
+
+				errs() << "Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
+			}
 		}
 	}
 #endif
@@ -755,11 +767,11 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	}
 
 	// Update FunctionCallerMap
-	SmallSet<std::pair<Function *, CallingContext *>, 32> &Callers = FunctionCallerMap[F];
-	CallingContext *ContextCopy = new CallingContext(CurrentContext);
-	std::pair<NoneType, bool> ret_val = Callers.insert(std::make_pair(CB->getCaller(), ContextCopy));
-	if (ret_val.second == false) {
-		delete ContextCopy;
+	SmallDenseSet<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[F];
+	if (Callers.find(std::make_pair(CB->getCaller(), CurrentContext)) == Callers.end()) {
+		// If Caller w/ Context is not found
+		CallingContext *ContextCopy = new CallingContext(CurrentContext);
+		Callers.insert(std::make_pair(CB->getCaller(), ContextCopy));
 	}
 
 	CallingContext *context = computeContext(map, I);
@@ -1001,7 +1013,7 @@ bool PMRobustness::checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Valu
 				}
 			} else {
 				errs() << "\nNonLocal Inst: " << "\n";
-				Load->getFunction()->dump();
+				//Load->getFunction()->dump();
 			}
 		} else {
 			errs() << "GEP Base not a load: " << *VBase << "\n";
@@ -1177,23 +1189,37 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 	// Function has not been analyzed before
 	if (FS == NULL) {
-		//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
-		FunctionWorklist.emplace_back(F, Context);
+		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
+			FunctionWorklist.emplace_back(F, Context);
+			UniqueFunctionSet.insert(std::make_pair(F, Context));
+
+			errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
+		} else {
+			delete Context;
+		}
 
 		return false;
 	}
 
 	OutputState *out_state = FS->getResult(Context);
 	// Function has not been analyzed with the context
+	// TODO: If there is a context higher than the current context, use the alternative results
 	if (out_state == NULL) {
-		//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
-		FunctionWorklist.emplace_back(F, Context);
+		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
+			FunctionWorklist.emplace_back(F, Context);
+			UniqueFunctionSet.insert(std::make_pair(F, Context));
+
+			errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
+		} else {
+			delete Context;
+		}
 
 		return false;
 	}
 
 	errs() << "Function cache found\n";
 
+	// Use cached result to modify parameter states
 	unsigned i = 0;
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 		Value *op =  *it;
@@ -1273,7 +1299,6 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 		i++;
 	}
-	// TODO: use cached result to modify parameter states
 
 	return true;
 }
@@ -1380,7 +1405,6 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			unsigned TypeSize = getFieldSize(Arg, DL);
 			absState = object_state->checkState(0, TypeSize);
 
-			// Weiyu: work here
 			// If the input state is clean, add dirty btyes to list
 			if (Context->AbstractInputState[i] == ParamState::CLEAN_CAPTURED ||
 				Context->AbstractInputState[i] == ParamState::CLEAN_ESCAPED) {

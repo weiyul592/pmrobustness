@@ -754,8 +754,12 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 
 bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	CallBase *CB = cast<CallBase>(I);
-	Function *F = CB->getCalledFunction();
+	if (CallInst *CI = dyn_cast<CallInst>(CB)) {
+		if (CI->isInlineAsm())
+			return false;
+	}
 
+	Function *F = CB->getCalledFunction();
 	if (F->isVarArg()) {
 #ifdef PMROBUST_DEBUG
 		errs() << "Cannot handle variable argument functions for " << F->getName() << "\n";
@@ -1150,6 +1154,9 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 			if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 				// TODO: We have information about arrays escaping or not.
 				// Dirty array slots are stored in UnflushedArrays
+
+				// FIXME
+				context->addAbsInput(ParamState::TOP);
 			} else {
 				ob_state_t *object_state = map->lookup(DecompGEP.Base);
 				ParamState absState = ParamState::TOP;
@@ -1157,7 +1164,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 					unsigned TypeSize = getFieldSize(op, DL);
 					//errs() << "Base: " << *DecompGEP.Base << " of instruction " << *I <<"\n";
 					//errs() << "offset: " << offset << "; field size: " << TypeSize << "\n";
-					//errs() << "op: " << *op << "\n";
+					//errs() << "checking state of op: " << *op << "\n";
 
 					if (object_state->getSize() == 0 && FunctionArguments.find(op) != FunctionArguments.end()) {
 						// The parent function's parameter is passed to call site without any modification
@@ -1353,9 +1360,11 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		object_state->setMaxSize(TypeSize);
 
 		if (PS == ParamState::DIRTY_CAPTURED) {
-			// FIXME: how to approximate dirty
+			// TODO: how to better approximate dirty
+			object_state->setDirty(0, TypeSize);
 		} else if (PS == ParamState::DIRTY_ESCAPED) {
-			// FIXME: how to approximate dirty
+			// TODO: how to better approximate dirty
+			object_state->setDirty(0, TypeSize);
 			object_state->setEscape();
 		} else if (PS == ParamState::CLWB_CAPTURED) {
 			object_state->setClwb(0, TypeSize);
@@ -1367,8 +1376,11 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		} else if (PS == ParamState::CLEAN_ESCAPED) {
 			object_state->setFlush(0, TypeSize);
 			object_state->setEscape();
+		} else if (PS == ParamState::TOP) {
+			// TOP: clean and captured
+			object_state->setFlush(0, TypeSize);
 		} else {
-			// TOP, BOTTOM, etc.
+			// BOTTOM, etc.
 			// Not sure what to do
 		}
 	}

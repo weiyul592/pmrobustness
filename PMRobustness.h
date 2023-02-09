@@ -277,6 +277,7 @@ public:
 		maxSize = s;
 	}
 
+/*
 	ParamState checkState(unsigned startByte) {
 		//errs() << "size: " << size << "; startByte: " << startByte << "\n";
 		if (size == 0 && startByte == 0)
@@ -298,12 +299,20 @@ public:
 				return ParamState::CLEAN_CAPTURED;
 		}
 	}
+*/
 
 	ParamState checkState(unsigned startByte, unsigned len) {
 		unsigned endByte = startByte + len;
 		//errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "; maxsize: " << maxSize << "\n";
 		//if (startByte >= maxSize || endByte > maxSize)
 		//	assert(false && "out of bound error");
+
+		if (size == 0) {
+			if (escaped)
+				return ParamState::CLEAN_ESCAPED;
+			else
+				return ParamState::TOP;
+		}
 
 		if (startByte >= size)
 			assert(false);

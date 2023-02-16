@@ -71,8 +71,13 @@ namespace {
 
 	private:
 		void copyState(state_t * src, state_t * dst);
+		void copyArrayState(addr_set_t *src, addr_set_t *dst);
+
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
 			state_t * dst);
+		void copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
+			SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst);
+
 		bool processInstruction(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
@@ -96,7 +101,7 @@ namespace {
 		NVMOP analyzeFlushType(Function &F);
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
-		addr_set_t * getOrCreateUnflushedAddrSet(Function * F);
+		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
@@ -119,7 +124,7 @@ namespace {
 		void test();
 
 		DenseMap<Function *, state_map_t *> AbstractStates;
-		DenseMap<Function *, addr_set_t *> UnflushedArrays;
+		DenseMap<Function *, DenseMap<BasicBlock *, addr_set_t *> *> UnflushedArrays;
 		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
 		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetInstMap;
 
@@ -225,9 +230,15 @@ bool PMRobustness::runOnModule(Module &M) {
 
 void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	state_map_t *AbsState = AbstractStates[&F];
+	DenseMap<BasicBlock *, addr_set_t *> *ArraySets = UnflushedArrays[&F];
 	if (AbsState == NULL) {
 		AbsState = new state_map_t();
 		AbstractStates[&F] = AbsState;
+	}
+
+	if (ArraySets == NULL) {
+		ArraySets = new DenseMap<BasicBlock *, addr_set_t *>();
+		UnflushedArrays[&F] = ArraySets;
 	}
 
 #ifdef INTERPROCEDURAL
@@ -271,6 +282,12 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 
 			// Build state from predecessors' states
 			if (it == block->begin()) {
+				addr_set_t * addr_set = (*ArraySets)[block];
+				if (addr_set == NULL) {
+					addr_set = new addr_set_t();
+					(*ArraySets)[block] = addr_set;
+				}
+
 				// First instruction; take the union of predecessors' states
 				if (block == &F.getEntryBlock()) {
 					// Entry block: has no precedessors
@@ -279,12 +296,15 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 					computeInitialState(state, F, Context);
 #endif
 				} else if (BasicBlock *pred = block->getUniquePredecessor()) {
-					// Unique predecessor; copy the state of last instruction in the pred block
+					// Unique predecessor; copy the state of last instruction and unflushed arrays in the pred block
 					state_t * prev_s = (*AbsState)[pred->getTerminator()];
 					if (prev_s == NULL)
 						BlockWorklist.push_back(pred);
-					else
+					else {
 						copyState(prev_s, state);
+						assert(addr_set);
+						copyArrayState((*ArraySets)[pred], addr_set);
+					}
 				} else {
 					// Multiple predecessors
 					SmallPtrSet<BasicBlock *, 8> *pred_list = block_predecessors[block];
@@ -297,6 +317,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 					}
 
 					copyMergedState(AbsState, pred_list, state);
+					copyMergedArrayState(ArraySets, pred_list, addr_set);
 				}
 			} else {
 				// Copy the previous instruction's state
@@ -366,6 +387,18 @@ void PMRobustness::copyState(state_t * src, state_t * dst) {
 	}
 }
 
+void PMRobustness::copyArrayState(addr_set_t *src, addr_set_t *dst) {
+	for (addr_set_t::iterator it = src->begin(); it != src->end(); it++) {
+		ArrayInfo *info = (*dst)[it->first];
+		if (info == NULL) {
+			info = new ArrayInfo(it->second);
+			(*dst)[it->first] = info;
+		} else {
+			info->copyFrom(it->second);
+		}
+	}
+}
+
 void PMRobustness::copyMergedState(state_map_t *AbsState,
 		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
@@ -399,6 +432,33 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 		}
 	}
 }
+
+void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
+		SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst) {
+//	for (addr_set_t::iterator it = dst->begin(); it != dst->end(); it++)
+//		(*dst)[it->first]->setSize(0);
+
+	for (BasicBlock *pred : *src_list) {
+		addr_set_t *s = (*ArraySets)[pred];
+		if (s == NULL) {
+			continue;
+		}
+
+		//DenseMap<Value *, ArrayInfo *> state_t;
+		for (addr_set_t::iterator it = s->begin(); it != s->end(); it++) {
+			addr_set_t::iterator item = dst->find(it->first);
+			if (item != dst->end()) {
+				// (Loc, vector<VarState>) pair found
+				ArrayInfo *A = item->second;
+				ArrayInfo *B = it->second;
+				A->mergeFrom(B);;
+			} else {
+				(*dst)[it->first] = new ArrayInfo(it->second);
+			}
+		}
+	}
+}
+
 
 bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
@@ -525,10 +585,10 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 	//printDecomposedGEP(DecompGEP);
 	if (DecompGEP.isArray) {
-		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction());
-		DecomposedGEP * tmp = new DecomposedGEP();
-		tmp->copyFrom(DecompGEP);
-		unflushed_addr->insert({Addr, tmp});
+		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+		ArrayInfo * tmp = new ArrayInfo();
+		tmp->copyGEP(&DecompGEP);
+		(*unflushed_addr)[Addr] = tmp;
 /*
 		errs() << "Addr inserted: " << *Addr << "\n";
 		//errs() << "Array encountered\t";
@@ -726,7 +786,7 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 
 	if (DecompGEP.isArray) {
 		//TODO: compare GEP address
-		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction());
+		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
 		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
@@ -966,11 +1026,17 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	return false;
 }
 
-addr_set_t * PMRobustness::getOrCreateUnflushedAddrSet(Function * F) {
-	addr_set_t * set = UnflushedArrays[F];
+addr_set_t * PMRobustness::getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B) {
+	DenseMap<BasicBlock *, addr_set_t *> * ArraySets = UnflushedArrays[F];
+	if (ArraySets == NULL) {
+		ArraySets = new DenseMap<BasicBlock *, addr_set_t *>();
+		UnflushedArrays[F] = ArraySets;
+	}
+
+	addr_set_t * set = (*ArraySets)[B];
 	if (set == NULL) {
 		set = new addr_set_t();
-		UnflushedArrays[F] = set;
+		(*ArraySets)[B] = set;
 	}
 
 	return set;
@@ -1345,7 +1411,7 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 
 	unsigned i = 0;
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
-		ParamState &PS = Context->AbstractInputState[i++];
+		ParamState PS = Context->AbstractInputState[i++];
 		if (PS == ParamState::NON_PMEM)
 			continue;
 

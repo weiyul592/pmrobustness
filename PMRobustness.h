@@ -10,11 +10,11 @@ using namespace llvm;
 //#define FUNC_PARAM_USE 100
 
 struct ob_state_t;
-struct DecomposedGEP;
+struct ArrayInfo;
 
 typedef DenseMap<const Value *, ob_state_t *> state_t;
 typedef DenseMap<const Instruction *, state_t *> state_map_t;
-typedef DenseMap<Value *, DecomposedGEP *> addr_set_t;
+typedef DenseMap<Value *, ArrayInfo *> addr_set_t;
 
 enum NVMOP {
 	NVM_CLWB,
@@ -79,13 +79,49 @@ struct DecomposedGEP {
 		assert(StructOffset.getSExtValue() >= 0);
 		return StructOffset.getZExtValue();
 	}
+};
 
-	void copyFrom(DecomposedGEP &other) {
-		Base = other.Base;
-		StructOffset = other.StructOffset;
-		OtherOffset = other.OtherOffset;
-		VarIndices = other.VarIndices;
-		isArray = other.isArray;
+struct ArrayInfo : public DecomposedGEP {
+	ParamState state;
+
+	ArrayInfo(ArrayInfo *other) :
+		state(other->state)
+	{
+		Base = other->Base;
+		StructOffset = other->StructOffset;
+		OtherOffset = other->OtherOffset;
+		VarIndices = other->VarIndices;
+		isArray = other->isArray;
+	}
+
+	ArrayInfo() {}
+
+	void copyGEP(DecomposedGEP *other) {
+		Base = other->Base;
+		StructOffset = other->StructOffset;
+		OtherOffset = other->OtherOffset;
+		VarIndices = other->VarIndices;
+		isArray = other->isArray;
+	}
+
+	void copyFrom(ArrayInfo *other) {
+		Base = other->Base;
+		StructOffset = other->StructOffset;
+		OtherOffset = other->OtherOffset;
+		VarIndices = other->VarIndices;
+		isArray = other->isArray;
+		state = other->state;
+	}
+
+	void mergeFrom(ArrayInfo *other) {
+		assert(Base == other->Base);
+		assert(StructOffset == other->StructOffset);
+		assert(OtherOffset == other->OtherOffset);
+		assert(VarIndices == other->VarIndices);
+
+		if (state == ParamState::DIRTY_ESCAPED) {
+			// TODO
+		}
 	}
 };
 
@@ -148,7 +184,6 @@ public:
 		// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <0, 1>
 		// dirty_byte = dirty_byte | other->dirty_byte
 		// clwb_byte = (clwb_byte | other->clwb_byte) & ~dirty_byte [result from last line]
-		// TODO: Fix other methods
 		dirty_bytes |= other->dirty_bytes;
 		BitVector tmp(dirty_bytes);
 		tmp.flip();
@@ -276,30 +311,6 @@ public:
 	void setMaxSize(unsigned s) {
 		maxSize = s;
 	}
-
-/*
-	ParamState checkState(unsigned startByte) {
-		//errs() << "size: " << size << "; startByte: " << startByte << "\n";
-		if (size == 0 && startByte == 0)
-			return ParamState::TOP;
-
-		if (escaped) {
-			if (clwb_bytes[startByte])
-				return ParamState::CLWB_ESCAPED;
-			else if (dirty_bytes[startByte])
-				return ParamState::DIRTY_ESCAPED;
-			else
-				return ParamState::CLEAN_ESCAPED;
-		} else {
-			if (clwb_bytes[startByte])
-				return ParamState::CLWB_CAPTURED;
-			else if (dirty_bytes[startByte])
-				return ParamState::DIRTY_CAPTURED;
-			else
-				return ParamState::CLEAN_CAPTURED;
-		}
-	}
-*/
 
 	ParamState checkState(unsigned startByte, unsigned len) {
 		unsigned endByte = startByte + len;

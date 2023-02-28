@@ -189,6 +189,11 @@ bool PMRobustness::runOnModule(Module &M) {
 			}
 		} else if (F.getName() == "main") {
 			CallingContext *Context = new CallingContext();
+			if (F.arg_size() != 0) {
+				Context->addAbsInput(ParamStateType::NON_PMEM);
+				Context->addAbsInput(ParamStateType::NON_PMEM);
+			}
+
 			FunctionWorklist.emplace_back(&F, Context);
 			UniqueFunctionSet.insert(std::make_pair(&F, Context));
 		} else {
@@ -1222,10 +1227,10 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 				// Dirty array slots are stored in UnflushedArrays
 
 				// FIXME
-				context->addAbsInput(ParamState::TOP);
+				context->addAbsInput(ParamStateType::TOP);
 			} else {
 				ob_state_t *object_state = map->lookup(DecompGEP.Base);
-				ParamState absState = ParamState::TOP;
+				ParamStateType absState = ParamStateType::TOP;
 				if (object_state != NULL) {
 					unsigned TypeSize = getFieldSize(op, DL);
 					//errs() << "Base: " << *DecompGEP.Base << " of instruction " << *I <<"\n";
@@ -1234,7 +1239,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 
 					if (object_state->getSize() == 0 && FunctionArguments.find(op) != FunctionArguments.end()) {
 						// The parent function's parameter is passed to call site without any modification
-						absState = CurrentContext->AbstractInputState[i];
+						absState = CurrentContext->getStateType(i);
 					} else {
 						absState = object_state->checkState(offset, TypeSize);
 					}
@@ -1243,7 +1248,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 				context->addAbsInput(absState);
 			}
 		} else {
-			context->addAbsInput(ParamState::NON_PMEM);
+			context->addAbsInput(ParamStateType::NON_PMEM);
 		}
 
 		i++;
@@ -1326,12 +1331,12 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 		Value *op = *it;
 
-		if (Context->AbstractInputState[i] == ParamState::NON_PMEM) {
+		if (Context->getStateType(i) == ParamStateType::NON_PMEM) {
 			// Ignore NON_PMEM input parameters
-			assert(out_state->AbstractOutputState[i] == ParamState::NON_PMEM);
+			assert(out_state->getStateType(i) == ParamStateType::NON_PMEM);
 			i++;
 			continue;
-		} else if (out_state->AbstractOutputState[i] == ParamState::NON_PMEM) {
+		} else if (out_state->getStateType(i) == ParamStateType::NON_PMEM) {
 			// It has happened that when the input is top, the output is NON_PMEM
 			i++;
 			continue;
@@ -1360,11 +1365,10 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 			unsigned TypeSize = getFieldSize(op, DL);
 
-			ParamState &param_state = out_state->AbstractOutputState[i];
-			if (param_state == ParamState::DIRTY_CAPTURED) {
+			ParamStateType param_state = out_state->getStateType(i);
+			if (param_state == ParamStateType::DIRTY_CAPTURED) {
 				// Approximate dirty
-				if (Context->AbstractInputState[i] == ParamState::CLEAN_CAPTURED ||
-					Context->AbstractInputState[i] == ParamState::CLEAN_ESCAPED) {
+				if (Context->getState(i).isClean()) {
 					// Note: We don't recapture escaped objects
 					// If input state is clean, then use DirtyBytesInfo to get dirty bytes
 					DirtyBytesInfo *info = out_state->getDirtyBtyesInfo(i);
@@ -1379,20 +1383,23 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				} else {
 					updated |= object_state->setDirty(offset, TypeSize);
 				}
-			} else if (param_state == ParamState::DIRTY_ESCAPED) {
+			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
 				// TODO: How to approximate dirty?
 				updated |= object_state->setEscape();
 				assert(false);
-			} else if (param_state == ParamState::CLWB_CAPTURED) {
+			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				updated |= object_state->setClwb(offset, TypeSize);
-			} else if (param_state == ParamState::CLWB_ESCAPED) {
+			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
 				updated |= object_state->setClwb(offset, TypeSize);
 				updated |= object_state->setEscape();
-			} else if (param_state == ParamState::CLEAN_CAPTURED) {
+			} else if (param_state == ParamStateType::CLEAN_CAPTURED) {
 				updated |= object_state->setFlush(offset, TypeSize);
-			} else if (param_state == ParamState::CLEAN_ESCAPED) {
+			} else if (param_state == ParamStateType::CLEAN_ESCAPED) {
 				updated |= object_state->setFlush(offset, TypeSize);
 				updated |= object_state->setEscape();
+			} else if (param_state == ParamStateType::TOP) {
+				updated |= object_state->setFlush(offset, TypeSize);
+				updated |= object_state->setCaptured();
 			} else {
 				assert(false && "other cases");
 			}
@@ -1411,8 +1418,9 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 
 	unsigned i = 0;
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
-		ParamState PS = Context->AbstractInputState[i++];
-		if (PS == ParamState::NON_PMEM)
+		ParamStateType PS = Context->getStateType(i);
+		i++;
+		if (PS == ParamStateType::NON_PMEM)
 			continue;
 
 		Argument *Arg = &*it;
@@ -1425,24 +1433,24 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		unsigned TypeSize = getFieldSize(Arg, DL);
 		object_state->setMaxSize(TypeSize);
 
-		if (PS == ParamState::DIRTY_CAPTURED) {
+		if (PS == ParamStateType::DIRTY_CAPTURED) {
 			// TODO: how to better approximate dirty
 			object_state->setDirty(0, TypeSize);
-		} else if (PS == ParamState::DIRTY_ESCAPED) {
+		} else if (PS == ParamStateType::DIRTY_ESCAPED) {
 			// TODO: how to better approximate dirty
 			object_state->setDirty(0, TypeSize);
 			object_state->setEscape();
-		} else if (PS == ParamState::CLWB_CAPTURED) {
+		} else if (PS == ParamStateType::CLWB_CAPTURED) {
 			object_state->setClwb(0, TypeSize);
-		} else if (PS == ParamState::CLWB_ESCAPED) {
+		} else if (PS == ParamStateType::CLWB_ESCAPED) {
 			object_state->setClwb(0, TypeSize);
 			object_state->setEscape();
-		} else if (PS == ParamState::CLEAN_CAPTURED) {
+		} else if (PS == ParamStateType::CLEAN_CAPTURED) {
 			object_state->setFlush(0, TypeSize);
-		} else if (PS == ParamState::CLEAN_ESCAPED) {
+		} else if (PS == ParamStateType::CLEAN_ESCAPED) {
 			object_state->setFlush(0, TypeSize);
 			object_state->setEscape();
-		} else if (PS == ParamState::TOP) {
+		} else if (PS == ParamStateType::TOP) {
 			// TOP: clean and captured
 			object_state->setFlush(0, TypeSize);
 		} else {
@@ -1494,8 +1502,8 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 		ob_state_t *object_state = final_state.lookup(Arg);
 		if (object_state == NULL) {
-			if (Output->AbstractOutputState[i] != ParamState::NON_PMEM) {
-				Output->AbstractOutputState[i] = ParamState::NON_PMEM;
+			if (Output->getStateType(i) != ParamStateType::NON_PMEM) {
+				Output->AbstractOutputState[i].setState(ParamStateType::NON_PMEM);
 				updated = true;
 			}
 
@@ -1503,19 +1511,18 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			continue;
 		}
 
-		ParamState absState;
+		ParamStateType absState;
 		if (object_state->getSize() == 0) {
 			// No store to the parameter; TODO: how about loads?
-			absState = Context->AbstractInputState[i];
+			absState = Context->getStateType(i);
 		} else {
 			unsigned TypeSize = getFieldSize(Arg, DL);
 			absState = object_state->checkState(0, TypeSize);
 
 			// If the input state is clean, add dirty btyes to list
-			if (Context->AbstractInputState[i] == ParamState::CLEAN_CAPTURED ||
-				Context->AbstractInputState[i] == ParamState::CLEAN_ESCAPED) {
-
-				if (absState == ParamState::DIRTY_CAPTURED || absState == ParamState::DIRTY_ESCAPED) {
+			ParamState &input_state = Context->getState(i);
+			if (input_state.isClean()) {
+				if (absState == ParamStateType::DIRTY_CAPTURED || absState == ParamStateType::DIRTY_ESCAPED) {
 					DirtyBytesInfo *info = Output->getOrCreateDirtyBtyesInfo(i);
 					object_state->computeDirtyBtyes(info);
 				} // TODO: else if (CLWB_CAPTURED/CLWB_ESCAPED)
@@ -1523,8 +1530,8 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 		}
 
-		if (Output->AbstractOutputState[i] != absState) {
-			Output->AbstractOutputState[i] = absState;
+		if (Output->getStateType(i) != absState) {
+			Output->AbstractOutputState[i].setState(absState);
 			updated = true;
 		}
 
@@ -1538,10 +1545,10 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 		Output->hasRetVal = false;
 	} else if (RetType->isPointerTy()) {
 		Output->hasRetVal = true;
-		Output->retVal = ParamState::TOP; // TODO: Check return type
+		Output->retVal = ParamStateType::TOP; // TODO: Check return type
 	} else {
 		Output->hasRetVal = true;
-		Output->retVal = ParamState::NON_PMEM;
+		Output->retVal = ParamStateType::NON_PMEM;
 	}*/
 
 	// Free memory in temporarily allocated final_state object

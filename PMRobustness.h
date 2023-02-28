@@ -82,7 +82,7 @@ struct DecomposedGEP {
 };
 
 struct ArrayInfo : public DecomposedGEP {
-	ParamState state;
+	ParamStateType state;
 
 	ArrayInfo(ArrayInfo *other) :
 		state(other->state)
@@ -119,7 +119,7 @@ struct ArrayInfo : public DecomposedGEP {
 		assert(OtherOffset == other->OtherOffset);
 		assert(VarIndices == other->VarIndices);
 
-		if (state == ParamState::DIRTY_ESCAPED) {
+		if (state == ParamStateType::DIRTY_ESCAPED) {
 			// TODO
 		}
 	}
@@ -312,7 +312,7 @@ public:
 		maxSize = s;
 	}
 
-	ParamState checkState(unsigned startByte, unsigned len) {
+	ParamStateType checkState(unsigned startByte, unsigned len) {
 		unsigned endByte = startByte + len;
 		//errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "; maxsize: " << maxSize << "\n";
 		//if (startByte >= maxSize || endByte > maxSize)
@@ -320,9 +320,9 @@ public:
 
 		if (size == 0) {
 			if (escaped)
-				return ParamState::CLEAN_ESCAPED;
+				return ParamStateType::CLEAN_ESCAPED;
 			else
-				return ParamState::TOP;
+				return ParamStateType::TOP;
 		}
 
 		if (startByte >= size)
@@ -337,22 +337,22 @@ public:
 		if (escaped) {
 			if (dirty_bytes.find_first_in(startByte, endByte) == -1) {
 				// dirty_bytes are all 0
-				return ParamState::CLEAN_ESCAPED;
+				return ParamStateType::CLEAN_ESCAPED;
 			} else if (tmp.find_first_unset_in(startByte, endByte) == -1) {
 				// dirty_bytes and clwb_bytes are all set;
-				return ParamState::CLWB_ESCAPED;
+				return ParamStateType::CLWB_ESCAPED;
 			} else
-				return ParamState::DIRTY_ESCAPED;
+				return ParamStateType::DIRTY_ESCAPED;
 		} else {
 
 			if (dirty_bytes.find_first_in(startByte, endByte) == -1) {
 				// dirty_bytes are all 0
-				return ParamState::CLEAN_CAPTURED;
+				return ParamStateType::CLEAN_CAPTURED;
 			} else if (tmp.find_first_unset_in(startByte, endByte) == -1) {
 				// dirty_bytes and clwb_bytes are all set;
-				return ParamState::CLWB_CAPTURED;
+				return ParamStateType::CLWB_CAPTURED;
 			} else
-				return ParamState::DIRTY_CAPTURED;
+				return ParamStateType::DIRTY_CAPTURED;
 		}
 	}
 

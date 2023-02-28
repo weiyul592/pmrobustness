@@ -3,7 +3,7 @@
 
 using namespace llvm;
 
-enum class ParamState {
+enum class ParamStateType {
 	// TODO: Do we need to model the partial order?
 	EMPTY_KEY,      // for hash table key
 	TOMBSTONE_KEY,  // for hash table key
@@ -17,6 +17,95 @@ enum class ParamState {
 	CLEAN_CAPTURED,
 	CLEAN_ESCAPED,
 	TOP				// 0xa
+};
+
+class ParamState {
+public:
+	ParamState() : state(ParamStateType::TOP) {}
+
+	ParamState(ParamStateType state) : state(state) {}
+
+	ParamStateType get_state() const {
+		return state;
+	}
+
+	void setState(ParamStateType s) {
+		state = s;
+	}
+
+	bool isDirty() {
+		return state == ParamStateType::DIRTY_CAPTURED || state == ParamStateType::DIRTY_ESCAPED;
+	}
+
+	bool isClwb() {
+		return state == ParamStateType::CLWB_CAPTURED || state == ParamStateType::CLWB_ESCAPED;
+	}
+
+	bool isClean() {
+		return state == ParamStateType::CLEAN_CAPTURED || state == ParamStateType::CLEAN_ESCAPED;
+	}
+
+	bool isCaptured() {
+		return state == ParamStateType::DIRTY_CAPTURED || state == ParamStateType::CLWB_CAPTURED ||
+			state == ParamStateType::CLEAN_CAPTURED;
+	}
+
+	bool isEscaped() {
+		return state == ParamStateType::DIRTY_ESCAPED || state == ParamStateType::CLWB_ESCAPED ||
+			state == ParamStateType::CLEAN_ESCAPED;
+	}
+
+	inline bool operator <(const ParamState& other) const {
+		ParamStateType other_state = other.get_state();
+		switch (state) {
+			case ParamStateType::BOTTOM:
+				if (other_state != ParamStateType::BOTTOM)
+					return true;
+				break;
+			case ParamStateType::DIRTY_ESCAPED:
+				if (other_state != ParamStateType::BOTTOM && other_state != ParamStateType::DIRTY_ESCAPED)
+					return true;
+				break;
+			case ParamStateType::DIRTY_CAPTURED:
+				if (other_state == ParamStateType::CLWB_CAPTURED ||
+					other_state == ParamStateType::CLEAN_CAPTURED ||
+					other_state == ParamStateType::TOP)
+					return true;
+				break;
+			case ParamStateType::CLWB_ESCAPED:
+				if (other_state == ParamStateType::CLWB_CAPTURED ||
+					other_state == ParamStateType::CLEAN_ESCAPED ||
+					other_state == ParamStateType::CLEAN_CAPTURED ||
+					other_state == ParamStateType::TOP)
+					return true;
+				break;
+			case ParamStateType::CLWB_CAPTURED:
+			case ParamStateType::CLEAN_ESCAPED:
+				if (other_state == ParamStateType::CLEAN_CAPTURED ||
+					other_state == ParamStateType::TOP)
+					return true;
+				break;
+			case ParamStateType::CLEAN_CAPTURED:
+				if (other_state == ParamStateType::TOP)
+					return true;
+				break;
+			case ParamStateType::TOP:
+				if (other_state != ParamStateType::TOP)
+					return true;
+				break;
+			default:
+				break;
+		}
+
+		return false;
+	}
+
+	inline bool operator ==(const ParamState& other) const {
+		return state == other.get_state();
+	}
+
+	private:
+		ParamStateType state;
 };
 
 struct DirtyBytesInfo {
@@ -79,7 +168,7 @@ struct OutputState {
 	std::vector<DirtyBytesInfo *> *DirtyBytesList;
 
 	bool hasRetVal;
-	ParamState retVal;
+	ParamStateType retVal;
 
 	DirtyBytesInfo * getOrCreateDirtyBtyesInfo(unsigned i) {
 		if (DirtyBytesList == NULL)
@@ -101,10 +190,14 @@ struct OutputState {
 		return (*DirtyBytesList)[i];
 	}
 
+	ParamStateType getStateType(unsigned i) {
+		return AbstractOutputState[i].get_state();
+	}
+
 	void dump() {
 		errs() << "Abstract output state: ";
 		for (ParamState &I : AbstractOutputState) {
-			errs() << (int)I << "\t";
+			errs() << (int)I.get_state() << "\t";
 		}
 		errs() << "\n";
 
@@ -120,15 +213,23 @@ struct CallingContext {
 	SmallVector<Value *, 8> parameters;
 	SmallVector<ParamState, 8> AbstractInputState;
 
-	void addAbsInput(ParamState s) {
-		AbstractInputState.push_back(s);
-	}
-
 	CallingContext() {}
 
 	CallingContext(CallingContext *other) {
 		parameters = other->parameters;
 		AbstractInputState = other->AbstractInputState;
+	}
+
+	void addAbsInput(ParamStateType s) {
+		AbstractInputState.push_back(ParamState(s));
+	}
+
+	ParamStateType getStateType(unsigned i) {
+		return AbstractInputState[i].get_state();
+	}
+
+	ParamState& getState(unsigned i) {
+		return AbstractInputState[i];
 	}
 
 	void dump() {
@@ -141,27 +242,32 @@ struct CallingContext {
 		*/
 
 		errs() << "Abstract input state:  ";
-		for (ParamState &I : AbstractInputState) {
-			errs() << (int)I << "\t";
+		for (ParamState&I : AbstractInputState) {
+			errs() << (int)I.get_state() << "\t";
 		}
 		errs() << "\n";
 	}
 };
 
+hash_code hash_value(const ParamState &value) {
+	return ::llvm::hashing::detail::hash_integer_value(
+		static_cast<uint64_t>(value.get_state()));
+}
+
 class FunctionSummary {
 public:
 	struct SummaryDenseMapInfo;
 
-	using iterator = DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo>::iterator;
+	//using iterator = DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo>::iterator;
 	typedef DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo> result_map_t;
 
 	struct SummaryDenseMapInfo {
 		static SmallVector<ParamState, 8> getEmptyKey() {
-			return {ParamState::EMPTY_KEY};
+			return {ParamState(ParamStateType::EMPTY_KEY)};
 		}
 
 		static SmallVector<ParamState, 8> getTombstoneKey() {
-			return {ParamState::TOMBSTONE_KEY};
+			return {ParamState(ParamStateType::TOMBSTONE_KEY)};
 		}
 
 		static unsigned getHashValue(const SmallVector<ParamState, 8> &V) {

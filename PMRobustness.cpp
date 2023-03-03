@@ -187,6 +187,18 @@ bool PMRobustness::runOnModule(Module &M) {
 				FunctionWorklist.emplace_back(&F, Context);
 				UniqueFunctionSet.insert(std::make_pair(&F, Context));
 			}
+		} else if (F.use_empty() && !F.isDeclaration()) {
+			CallingContext *Context = new CallingContext();
+			for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
+				Argument *Arg = &*it;
+				if (Arg->getType()->isPointerTy())
+					Context->addAbsInput(ParamStateType::TOP);
+				else
+					Context->addAbsInput(ParamStateType::NON_PMEM);
+			}
+
+			FunctionWorklist.emplace_back(&F, Context);
+			UniqueFunctionSet.insert(std::make_pair(&F, Context));
 		} else if (F.getName() == "main") {
 			CallingContext *Context = new CallingContext();
 			if (F.arg_size() != 0) {
@@ -368,7 +380,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				FunctionWorklist.emplace_back(Function, CallerContext);
 				UniqueFunctionSet.insert(std::make_pair(Function, CallerContext));
 
-				errs() << "Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
+				//errs() << "Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
 			}
 		}
 	}
@@ -506,7 +518,6 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			}
 		}
 	}
-
 /*
 	if (updated) {
 		errs() << "After " << *I << "\n";
@@ -804,9 +815,15 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 			errs() << "Flush an unknown address\n";
 			//assert(false && "Flush an unknown address");
 		} else {
-			unsigned size = cast<ConstantInt>(FlushSize)->getZExtValue();
-			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
+			unsigned size;
+			if (isa<ConstantInt>(FlushSize))
+				size = cast<ConstantInt>(FlushSize)->getZExtValue();
+			else {
+				// FIXME: flush size can be a variable, such as `sizeof(leafvalue) + len`
+				size = object_state->getSize();
+			}
 
+			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
 			if (FlushOp == NVM_CLFLUSH)
 				object_state->setFlush(offset, size, true);
 			else if (FlushOp == NVM_CLWB)
@@ -825,6 +842,12 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	}
 
 	Function *F = CB->getCalledFunction();
+	if (F == NULL) {
+		// TODO: why this happens?
+		//assert(false);
+		return false;
+	}
+
 	if (F->isVarArg()) {
 #ifdef PMROBUST_DEBUG
 		errs() << "Cannot handle variable argument functions for " << F->getName() << "\n";
@@ -883,7 +906,12 @@ unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
 unsigned PMRobustness::getFieldSize(Value *Addr, const DataLayout &DL) {
 	Type *OrigPtrTy = Addr->getType();
 	Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
-	assert(OrigTy->isSized());
+	if (!OrigTy->isSized()) {
+		if (OrigTy->isFunctionTy())
+			return -1;
+		else
+			assert("false && OrigTy is not sized");
+	}
 	unsigned TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
 
 	return TypeSize / 8;
@@ -1263,15 +1291,13 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	const DataLayout &DL = CB->getModule()->getDataLayout();
 	bool updated = false;
 
-	errs() << "lookup results for function: " << F->getName() << "\n";
-
+	//errs() << "lookup results for function: " << F->getName() << "\n";
 	// Function has not been analyzed before
 	if (FS == NULL) {
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
 			UniqueFunctionSet.insert(std::make_pair(F, Context));
-
-			errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
+			//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName();
 		} else {
 			delete Context;
 		}
@@ -1297,7 +1323,14 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					}
 
 					unsigned TypeSize = getFieldSize(op, DL);
-					updated |= object_state->setFlush(offset, TypeSize);
+					//errs() << "TypeSize: " << TypeSize << "\n";
+					//errs() << *op << "\n";
+
+					if (TypeSize == (unsigned)-1)
+						updated |= object_state->setFlush(offset, TypeSize, true);
+					else
+						updated |= object_state->setFlush(offset, TypeSize);
+
 					updated |= object_state->setCaptured();
 				}
 			} // Else case: op is NON_PMEM, so don't do anything
@@ -1315,8 +1348,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
 			UniqueFunctionSet.insert(std::make_pair(F, Context));
-
-			errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
+			//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
 		} else {
 			delete Context;
 		}
@@ -1324,7 +1356,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		return updated;
 	}
 
-	errs() << "Function cache found\n";
+	//errs() << "Function cache found\n";
 
 	// Use cached result to modify parameter states
 	unsigned i = 0;
@@ -1350,6 +1382,12 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			// TODO: We have information about arrays escaping or not.
 			// Dirty array slots are stored in UnflushedArrays
 		} else {
+			unsigned TypeSize = getFieldSize(op, DL);
+			if (TypeSize == (unsigned)-1) {
+				i++;
+				continue;
+			}
+
 			ob_state_t *object_state = map->lookup(DecompGEP.Base);
 
 			if (object_state == NULL) {
@@ -1362,8 +1400,6 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 				assert(false);
 			}*/
-
-			unsigned TypeSize = getFieldSize(op, DL);
 
 			ParamStateType param_state = out_state->getStateType(i);
 			if (param_state == ParamStateType::DIRTY_CAPTURED) {
@@ -1385,8 +1421,9 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				}
 			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
 				// TODO: How to approximate dirty?
+				//assert(false);
 				updated |= object_state->setEscape();
-				assert(false);
+				updated |= object_state->setDirty(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				updated |= object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
@@ -1431,7 +1468,9 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		}
 
 		unsigned TypeSize = getFieldSize(Arg, DL);
-		object_state->setMaxSize(TypeSize);
+		if (TypeSize == (unsigned)-1) {
+			continue;
+		}
 
 		if (PS == ParamStateType::DIRTY_CAPTURED) {
 			// TODO: how to better approximate dirty
@@ -1539,17 +1578,28 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	}
 
 	// Cache return Type
-	/*
 	Type *RetType = F.getReturnType();
 	if (RetType->isVoidTy()) {
 		Output->hasRetVal = false;
 	} else if (RetType->isPointerTy()) {
 		Output->hasRetVal = true;
-		Output->retVal = ParamStateType::TOP; // TODO: Check return type
+		ParamState PS(ParamStateType::TOP);
+		for (Instruction *I : RetSet) {
+			Value *Ret = cast<ReturnInst>(I)->getReturnValue();
+			ob_state_t *RetState = final_state.lookup(Ret);
+
+			if (RetState != NULL) {
+				ParamStateType tmp = RetState->checkState();
+				if (PS < tmp)
+					PS.setState(tmp);
+			}
+		}
+
+		Output->retVal = PS.get_state();
 	} else {
 		Output->hasRetVal = true;
 		Output->retVal = ParamStateType::NON_PMEM;
-	}*/
+	}
 
 	// Free memory in temporarily allocated final_state object
 	for (state_t::iterator it = final_state.begin(); it != final_state.end(); it++) {

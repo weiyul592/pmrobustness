@@ -132,15 +132,15 @@ struct ArrayInfo : public DecomposedGEP {
 class ob_state_t {
 private:
 	unsigned size;
-	unsigned maxSize;
 	BitVector dirty_bytes;
 	BitVector clwb_bytes;
 	bool escaped;
 
 	void resize(unsigned s) {
-		assert(s <= (1 << 12));
-		assert(maxSize == 0 || s <= maxSize);
+		if (s > (1 << 12))
+			errs() << "oversize s: " << s << "\n";
 
+		//assert(s <= (1 << 12));
 		if (size < s) {
 			size = s;
 			dirty_bytes.resize(s);
@@ -151,7 +151,6 @@ private:
 public:
 	ob_state_t() :
 		size(0),
-		maxSize(0),
 		dirty_bytes(),
 		clwb_bytes(),
 		escaped(false)
@@ -159,19 +158,17 @@ public:
 
 	ob_state_t(unsigned s) :
 		size(s),
-		maxSize(0),
 		dirty_bytes(s),
 		clwb_bytes(s),
 		escaped(false)
-	{ assert(s <= (1 << 12)); }
+	{ /*assert(s <= (1 << 12));*/ }
 
 	ob_state_t(ob_state_t * other) :
 		size(other->size),
-		maxSize(other->maxSize),
 		dirty_bytes(other->dirty_bytes),
 		clwb_bytes(other->clwb_bytes),
 		escaped(other->escaped)
-	{ assert(size <= (1 << 12)); }
+	{ /*assert(size <= (1 << 12));*/ }
 
 	void mergeFrom(ob_state_t * other) {
 		//assert(size == other->size);
@@ -198,7 +195,6 @@ public:
 		//assert(size == src->size);
 
 		size = src->size;
-		maxSize = src->maxSize;
 		dirty_bytes = src->dirty_bytes;
 		clwb_bytes = src->clwb_bytes;
 		escaped = src->escaped;
@@ -212,7 +208,7 @@ public:
 		}
 
 		//errs() << "start: " << start << "; len: " << len << "; end:" << end << "\n";
-		//errs() << "max size: " << maxSize << "; actual size: " << size << "\n";
+		//errs() << "actual size: " << size << "\n";
 		int index1 = dirty_bytes.find_first_unset_in(start, end);
 		int index2 = clwb_bytes.find_first_in(start, end);
 
@@ -308,15 +304,13 @@ public:
 		size = s;
 	}
 
-	void setMaxSize(unsigned s) {
-		maxSize = s;
+	ParamStateType checkState() {
+		return checkState(0, size);
 	}
 
 	ParamStateType checkState(unsigned startByte, unsigned len) {
 		unsigned endByte = startByte + len;
-		//errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "; maxsize: " << maxSize << "\n";
-		//if (startByte >= maxSize || endByte > maxSize)
-		//	assert(false && "out of bound error");
+		//errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "\n";
 
 		if (size == 0) {
 			if (escaped)

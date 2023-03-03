@@ -134,6 +134,7 @@ struct DirtyBytesInfo {
 	}
 
 	void finalize() {
+/*
 		if (lst != NULL) {
 			// FIXME: Compare elements in lst and tmp_list (is this needed? We are static)
 			bool should_assert = false;
@@ -154,6 +155,9 @@ struct DirtyBytesInfo {
 			if (should_assert)
 				assert(false && "dirty btyes are different");
 		}
+*/
+		if (lst != NULL)
+			delete lst;
 
 		lst = tmp_lst;
 		tmp_lst = NULL;

@@ -135,10 +135,11 @@ private:
 	BitVector dirty_bytes;
 	BitVector clwb_bytes;
 	bool escaped;
+	bool nonpmem;
 
 	void resize(unsigned s) {
-		if (s > (1 << 12))
-			errs() << "oversize s: " << s << "\n";
+		//if (s > (1 << 12))
+		//	errs() << "oversize s: " << s << "\n";
 
 		//assert(s <= (1 << 12));
 		if (size < s) {
@@ -153,21 +154,24 @@ public:
 		size(0),
 		dirty_bytes(),
 		clwb_bytes(),
-		escaped(false)
+		escaped(false),
+		nonpmem(false)
 	{}
 
 	ob_state_t(unsigned s) :
 		size(s),
 		dirty_bytes(s),
 		clwb_bytes(s),
-		escaped(false)
+		escaped(false),
+		nonpmem(false)
 	{ /*assert(s <= (1 << 12));*/ }
 
 	ob_state_t(ob_state_t * other) :
 		size(other->size),
 		dirty_bytes(other->dirty_bytes),
 		clwb_bytes(other->clwb_bytes),
-		escaped(other->escaped)
+		escaped(other->escaped),
+		nonpmem(other->nonpmem)
 	{ /*assert(size <= (1 << 12));*/ }
 
 	void mergeFrom(ob_state_t * other) {
@@ -198,10 +202,19 @@ public:
 		dirty_bytes = src->dirty_bytes;
 		clwb_bytes = src->clwb_bytes;
 		escaped = src->escaped;
+
+//		if (nonpmem != src->nonpmem) {
+//			assert(false);
+//		}
+		//
+		//nonpmem |= src->nonpmem;
 	}
 
 	// return true: modified; return else: unchanged
 	bool setDirty(unsigned start, unsigned len) {
+		if (nonpmem)
+			return false;
+
 		unsigned end = start + len;
 		if (end > size) {
 			resize(end);
@@ -225,6 +238,9 @@ public:
 	// TODO: start + len and size?
 	// Flush wrapper function may flush cache lines exceeding the size of this object
 	bool setFlush(unsigned start, unsigned len, bool onlyFlushWrittenBytes = false) {
+		if (nonpmem)
+			return false;
+
 		if (start >= size && onlyFlushWrittenBytes) {
 			errs() << "FIXME: Flush unknown bytes\n";
 			return false;
@@ -253,6 +269,9 @@ public:
 	// TODO: start + len and size?
 	// Flush wrapper function may flush cache lines exceeding the size of this object
 	bool setClwb(unsigned start, unsigned len, bool onlyFlushWrittenBytes = false) {
+		if (nonpmem)
+			return false;
+
 		if (start >= size && onlyFlushWrittenBytes) {
 			assert(false && "Clwb unknown bytes");
 		}
@@ -294,6 +313,14 @@ public:
 		}
 
 		return false;
+	}
+
+	void setNonPmem() {
+		nonpmem = true;
+	}
+
+	bool isNonPmem() {
+		return nonpmem;
 	}
 
 	unsigned getSize() {
@@ -350,6 +377,16 @@ public:
 		}
 	}
 
+	bool checkDirty() {
+		BitVector tmp(dirty_bytes);
+		tmp ^= clwb_bytes;
+
+		if (tmp.any())
+			return true;
+
+		return false;
+	}
+
 	void computeDirtyBtyes(DirtyBytesInfo *info) {
 		//dump();
 
@@ -378,20 +415,26 @@ public:
 
 	void dump() {
 		errs() << "bit vector size: " << size << "\n";
-		for (unsigned i = 0; i < size; i++) {
-			errs() << dirty_bytes[i];
+		if (size != 0) {
+			for (unsigned i = 0; i < size; i++) {
+				errs() << dirty_bytes[i];
+			}
+			errs() << "\n";
+			for (unsigned i = 0; i < size; i++) {
+				errs() << clwb_bytes[i];
+			}
+			errs() << "\n";
 		}
-		errs() << "\n";
-		for (unsigned i = 0; i < size; i++) {
-			errs() << clwb_bytes[i];
-		}
-		errs() << "\n";
 
 		if (escaped)
 			errs() << "escaped";
 		else
 			errs() << "captured";
 
+		if (nonpmem)
+			errs() << "; nonpmem";
+		else
+			errs() << "; pmem";
 		errs() << "\n";
 	}
 };

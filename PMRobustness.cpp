@@ -90,7 +90,7 @@ namespace {
 
 		// TODO: Address check to be implemented
 		bool skipFunction(Function &F);
-		bool isPMAddr(const Value * Addr) { return true; }
+		bool isPMAddr(const Value * Addr);
 		bool mayInHeap(const Value * Addr);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
@@ -130,7 +130,7 @@ namespace {
 
 		CallingContext *CurrentContext;
 		// Arguments of the function being analyzed
-		DenseSet<Value *> FunctionArguments;
+		DenseMap<Value *, unsigned> FunctionArguments;
 
 		// Map a Function to its call sites
 		DenseMap<Function *, SmallDenseSet<std::pair<Function *, CallingContext *>> > FunctionCallerMap;
@@ -261,8 +261,9 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 #ifdef INTERPROCEDURAL
 	CurrentContext = Context;
 	FunctionArguments.clear();
+	unsigned i = 0;
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
-		FunctionArguments.insert(&*it);
+		FunctionArguments[&*it] = i;
 	}
 
 	// Collect all return statements of Function F
@@ -287,9 +288,10 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		BlockWorklist.pop_front();
 
 		bool changed = false;
+		bool predsNotAnalyzed = false;
 		BasicBlock::iterator prev = block->begin();
 		for (BasicBlock::iterator it = block->begin(); it != block->end();) {
-			state_t * state = (*AbsState)[&*it];
+			state_t * state = AbsState->lookup(&*it);
 
 			if (state == NULL) {
 				state = new state_t();
@@ -310,14 +312,18 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 					// Entry block: has no precedessors
 					// Prepare initial state based on parameters
 #ifdef INTERPROCEDURAL
+					state->clear();
 					computeInitialState(state, F, Context);
 #endif
 				} else if (BasicBlock *pred = block->getUniquePredecessor()) {
 					// Unique predecessor; copy the state of last instruction and unflushed arrays in the pred block
-					state_t * prev_s = (*AbsState)[pred->getTerminator()];
-					if (prev_s == NULL)
+					state_t * prev_s = AbsState->lookup(pred->getTerminator());
+
+					if (!visited_blocks[pred]) {
 						BlockWorklist.push_back(pred);
-					else {
+						predsNotAnalyzed = true;
+						break;
+					} else {
 						copyState(prev_s, state);
 						assert(addr_set);
 						copyArrayState((*ArraySets)[pred], addr_set);
@@ -331,6 +337,19 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 						for (BasicBlock *pred : predecessors(block)) {
 							pred_list->insert(pred);
 						}
+					}
+
+					bool visited_any = false;
+					for (BasicBlock *pred : *pred_list) {
+						if (visited_blocks[pred])
+							visited_any = true;
+						else
+							BlockWorklist.push_back(pred);
+					}
+
+					if (!visited_any) {
+						predsNotAnalyzed = true;
+						break;
 					}
 
 					copyMergedState(AbsState, pred_list, state);
@@ -347,6 +366,9 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 			prev = it;
 			it++;
 		}
+
+		if (predsNotAnalyzed)
+			continue;
 
 		if (changed || !visited_blocks[block]) {
 			visited_blocks[block] = true;
@@ -390,7 +412,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 // DenseMap<Value *, ob_state_t *> state_t;
 void PMRobustness::copyState(state_t * src, state_t * dst) {
 	for (state_t::iterator it = src->begin(); it != src->end(); it++) {
-		ob_state_t *object_state = (*dst)[it->first];
+		ob_state_t *object_state = dst->lookup(it->first);
 		if (object_state == NULL) {
 			object_state = new ob_state_t(it->second);
 			(*dst)[it->first] = object_state;
@@ -422,9 +444,8 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 		(*dst)[it->first]->setSize(0);
 
 	for (BasicBlock *pred : *src_list) {
-		state_t *s = (*AbsState)[pred->getTerminator()];
+		state_t *s = AbsState->lookup(pred->getTerminator());
 		if (s == NULL) {
-			BlockWorklist.push_back(pred);
 			continue;
 		}
 
@@ -934,6 +955,18 @@ bool PMRobustness::skipFunction(Function &F) {
 	return false;
 }
 
+bool PMRobustness::isPMAddr(const Value * Addr) {
+	for (auto &u : Addr->uses()) {
+		if (isa<AllocaInst>(u)) {
+			//errs() << *Addr << " is non pmem\n";
+			return false;
+		}
+	}
+
+	//errs() << "*** " << *Addr << " is PMEM\n";
+	return true;
+}
+
 /** Simple may-analysis for checking if an address is in the heap
  *  TODO: may need more sophisticated checks
  **/
@@ -1267,7 +1300,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 
 					if (object_state->getSize() == 0 && FunctionArguments.find(op) != FunctionArguments.end()) {
 						// The parent function's parameter is passed to call site without any modification
-						absState = CurrentContext->getStateType(i);
+						absState = CurrentContext->getStateType(FunctionArguments.lookup(op));
 					} else {
 						absState = object_state->checkState(offset, TypeSize);
 					}
@@ -1457,14 +1490,17 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
 		ParamStateType PS = Context->getStateType(i);
 		i++;
-		if (PS == ParamStateType::NON_PMEM)
-			continue;
 
 		Argument *Arg = &*it;
 		ob_state_t *object_state = map->lookup(Arg);
 		if (object_state == NULL) {
 			object_state = new ob_state_t();
 			(*map)[Arg] = object_state;
+		}
+
+		if (PS == ParamStateType::NON_PMEM) {
+			object_state->setNonPmem();
+			continue;
 		}
 
 		unsigned TypeSize = getFieldSize(Arg, DL);
@@ -1583,20 +1619,25 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 		Output->hasRetVal = false;
 	} else if (RetType->isPointerTy()) {
 		Output->hasRetVal = true;
+		//Output->retVal = object_state->checkState();
 		ParamState PS(ParamStateType::TOP);
 		for (Instruction *I : RetSet) {
+			state_t *s = AbsState->lookup(I);
 			Value *Ret = cast<ReturnInst>(I)->getReturnValue();
-			ob_state_t *RetState = final_state.lookup(Ret);
+			ob_state_t *RetState = s->lookup(Ret);
 
 			if (RetState != NULL) {
 				ParamStateType tmp = RetState->checkState();
-				if (PS < tmp)
+				if (PS < tmp) {
+					//errs() << (int)PS.get_state() << " < " << (int)tmp << "\n";
 					PS.setState(tmp);
+				}
 			}
 		}
 
 		Output->retVal = PS.get_state();
 	} else {
+		//errs() << "RetVal non PMEM\n";
 		Output->hasRetVal = true;
 		Output->retVal = ParamStateType::NON_PMEM;
 	}
@@ -1608,7 +1649,6 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 	return updated;
 }
-
 
 //===----------------------------------------------------------------------===//
 // GetElementPtr Instruction Decomposition and Analysis
@@ -1991,6 +2031,17 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 }
 
 void PMRobustness::printMap(state_t * map) {
+	errs() << "## Printng Map\n";
+	if (map == NULL) {
+		errs() << "NULL Map\n";
+		return;
+	}
+
+	if (map->empty()) {
+		errs() << "Empty Map\n";
+		return;
+	}
+
 	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
 		ob_state_t *object_state = it->second;
 		errs() << "loc: " << *it->first << "\n";

@@ -88,10 +88,11 @@ namespace {
 
 		//bool processParamAnnotationFunction(Instruction * I);
 
-		// TODO: Address check to be implemented
 		bool skipFunction(Function &F);
+		// TODO: Address check to be implemented
 		bool isPMAddr(const Value * Addr);
 		bool mayInHeap(const Value * Addr);
+		void checkError(state_map_t *AbsState, Function &F, state_t *final_state);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
@@ -111,9 +112,9 @@ namespace {
 		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
 
 		const Value * GetLinearExpression(
-		    const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
-		    unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
-		    AssumptionCache *AC, DominatorTree *DT, bool &NSW, bool &NUW
+			const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
+			unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
+			AssumptionCache *AC, DominatorTree *DT, bool &NSW, bool &NUW
 		);
 
 		bool DecomposeGEPExpression(const Value *V, DecomposedGEP &Decomposed,
@@ -581,14 +582,14 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 bool PMRobustness::processMemIntrinsic(state_t * map, Instruction * I) {
 	bool updated = false;
 
-    if (dyn_cast<MemSetInst>(I)) {
+	if (dyn_cast<MemSetInst>(I)) {
 		// TODO
 		//errs() << "memset addr: " << M->getArgOperand(0) << "\t";
 		//errs() << "const bit: " << *M->getArgOperand(1) << "\t";
 		//errs() << "size: " << *M->getArgOperand(2) << "\n\n";
-    } else if (dyn_cast<MemTransferInst>(I)) {
+	} else if (dyn_cast<MemTransferInst>(I)) {
 		// TODO
-    }
+	}
 	return updated;
 }
 
@@ -913,13 +914,13 @@ unsigned PMRobustness::getMemoryAccessSize(Value *Addr, const DataLayout &DL) {
 	Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
 	assert(OrigTy->isSized());
 	unsigned TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
-    if (TypeSize != 8  && TypeSize != 16 &&
+	if (TypeSize != 8  && TypeSize != 16 &&
 		TypeSize != 32 && TypeSize != 64 && TypeSize != 128) {
 		//NumAccessesWithBadSize++;
 		// Ignore all unusual sizes.
 
 		assert(false && "Bad size access\n");
-    }
+	}
 
 	return TypeSize / 8;
 }
@@ -997,6 +998,37 @@ bool PMRobustness::mayInHeap(const Value * Addr /*, Instruction *I*/) {
 
 	// Address may be in the heap. We don't know for sure.
 	return true;
+}
+
+void PMRobustness::checkError(state_map_t *AbsState, Function &F, state_t *final_state) {
+	const DataLayout &DL = F.getParent()->getDataLayout();
+	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
+
+	for (Instruction *I : RetSet) {
+		// Get the state at each return statements
+		state_t *s = AbsState->lookup(I);
+
+		unsigned i = 0;
+		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
+			// Anything other than then the parameters/return value that are dirty is an error.
+			if (FunctionArguments.find(it->first) != FunctionArguments.end())
+				continue;
+
+			Value *Ret = cast<ReturnInst>(I)->getReturnValue();
+			if (Ret == it->first)
+				continue;
+
+			ob_state_t *object_state = it->second;
+			IRBuilder<> IRB(I);
+
+			if (object_state->checkDirty()) {
+				errs() << *it->first << "\n";
+				errs() << "\n";
+				errs() << "Errrrrror!!!!!!! at ";
+				getPosition(I, IRB, true);
+			}
+		}
+	}
 }
 
 void PMRobustness::decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL) {
@@ -1192,10 +1224,10 @@ bool PMRobustness::checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Valu
 				break;
 			}
 
-	        // Don't attempt to analyze GEPs over unsized objects.
+			// Don't attempt to analyze GEPs over unsized objects.
 			if (!GEPOp->getSourceElementType()->isSized()) {
 				continue;
-	        }
+			}
 
 			targetBase = GEPOp->getOperand(0);
 			break;
@@ -1576,7 +1608,7 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 		Argument *Arg = &*it;
 
 		ob_state_t *object_state = final_state.lookup(Arg);
-		if (object_state == NULL) {
+		if (object_state == NULL || object_state->isNonPmem()) {
 			if (Output->getStateType(i) != ParamStateType::NON_PMEM) {
 				Output->AbstractOutputState[i].setState(ParamStateType::NON_PMEM);
 				updated = true;

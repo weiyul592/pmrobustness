@@ -193,6 +193,7 @@ public:
 		clwb_bytes &= tmp;
 
 		escaped |= other->escaped;
+		nonpmem = other->nonpmem;
 	}
 
 	void copyFrom(ob_state_t * src) {
@@ -206,8 +207,9 @@ public:
 //		if (nonpmem != src->nonpmem) {
 //			assert(false);
 //		}
-		//
-		//nonpmem |= src->nonpmem;
+
+		// Calling Contexts can be different, while only the initial state is reset each time analyzing functions
+		nonpmem = src->nonpmem;
 	}
 
 	// return true: modified; return else: unchanged

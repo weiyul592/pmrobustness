@@ -90,9 +90,9 @@ namespace {
 
 		bool skipFunction(Function &F);
 		// TODO: Address check to be implemented
-		bool isPMAddr(const Value * Addr);
+		bool isPMAddr(const Value * Addr, const DataLayout &DL);
 		bool mayInHeap(const Value * Addr);
-		void checkError(state_map_t *AbsState, Function &F, state_t *final_state);
+		void checkEndError(state_map_t *AbsState, Function &F);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
@@ -143,6 +143,8 @@ namespace {
 
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> BlockWorklist;
+
+		DenseMap<Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -614,7 +616,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 	}
 
 	// Rule 1: x.f = v => x.f becomes dirty
-	if (!isPMAddr(Addr))
+	if (!isPMAddr(Addr, DL))
 		return false;
 
 	DecomposedGEP DecompGEP;
@@ -710,7 +712,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		return false;
 	}
 
-	if (!isPMAddr(Addr))
+	if (!isPMAddr(Addr, DL))
 		return false;
 
 	DecomposedGEP DecompGEP;
@@ -956,8 +958,9 @@ bool PMRobustness::skipFunction(Function &F) {
 	return false;
 }
 
-bool PMRobustness::isPMAddr(const Value * Addr) {
-	for (auto &u : Addr->uses()) {
+bool PMRobustness::isPMAddr(const Value * Addr, const DataLayout &DL) {
+	const Value *Origin = GetUnderlyingObject(Addr, DL);
+	for (auto &u : Origin->uses()) {
 		if (isa<AllocaInst>(u)) {
 			//errs() << *Addr << " is non pmem\n";
 			return false;
@@ -1000,18 +1003,29 @@ bool PMRobustness::mayInHeap(const Value * Addr /*, Instruction *I*/) {
 	return true;
 }
 
-void PMRobustness::checkError(state_map_t *AbsState, Function &F, state_t *final_state) {
-	const DataLayout &DL = F.getParent()->getDataLayout();
+void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
+	DenseSet<const Value *> * ErrorSet = FunctionEndErrorSets[&F];
+	if (ErrorSet == NULL) {
+		ErrorSet = new DenseSet<const Value *>();
+		FunctionEndErrorSets[&F] = ErrorSet;
+	}
+
+	SmallPtrSet<Value *, 8> RetValSet;
+	for (Instruction *I : RetSet) {
+		Value *Ret = cast<ReturnInst>(I)->getReturnValue();
+		RetValSet.insert(Ret);
+	}
 
 	for (Instruction *I : RetSet) {
 		// Get the state at each return statements
 		state_t *s = AbsState->lookup(I);
 
-		unsigned i = 0;
 		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
 			// Anything other than then the parameters/return value that are dirty is an error.
 			if (FunctionArguments.find(it->first) != FunctionArguments.end())
+				continue;
+			else if (RetValSet.find(it->first) != RetValSet.end())
 				continue;
 
 			Value *Ret = cast<ReturnInst>(I)->getReturnValue();
@@ -1022,10 +1036,12 @@ void PMRobustness::checkError(state_map_t *AbsState, Function &F, state_t *final
 			IRBuilder<> IRB(I);
 
 			if (object_state->checkDirty()) {
-				errs() << *it->first << "\n";
-				errs() << "\n";
-				errs() << "Errrrrror!!!!!!! at ";
-				getPosition(I, IRB, true);
+				if (ErrorSet->find(it->first) == ErrorSet->end()) {
+					ErrorSet->insert(it->first);
+					errs() << *it->first << "\n";
+					errs() << "Error!!!!!!! at return statement: ";
+					getPosition(I, IRB, true);
+				}
 			}
 		}
 	}
@@ -1310,7 +1326,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 		Value *op = *it;
 
-		if (op->getType()->isPointerTy() && isPMAddr(op)) {
+		if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
 			DecomposedGEP DecompGEP;
 			decomposeAddress(DecompGEP, op, DL);
 			unsigned offset = DecompGEP.getOffsets();
@@ -1372,7 +1388,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 			Value *op = *it;
 
-			if (op->getType()->isPointerTy() && isPMAddr(op)) {
+			if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
 				DecomposedGEP DecompGEP;
 				decomposeAddress(DecompGEP, op, DL);
 				unsigned offset = DecompGEP.getOffsets();
@@ -1458,6 +1474,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
 				(*map)[DecompGEP.Base] = object_state;
+				updated |= true;
 			} /*else if (object_state->getSize() == 0) {
 				errs() << "operand: " << *op << "\n";
 				errs() << "call base: " << *CB << "\n";
@@ -1508,6 +1525,59 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		}
 
 		i++;
+	}
+
+	if (out_state->hasRetVal) {
+		ParamStateType return_state = out_state->retVal;
+		if (return_state == ParamStateType::NON_PMEM)
+			return updated;
+
+		DecomposedGEP DecompGEP;
+		decomposeAddress(DecompGEP, CB, DL);
+		unsigned offset = DecompGEP.getOffsets();
+
+		if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+			// TODO: We have information about arrays escaping or not.
+			// Dirty array slots are stored in UnflushedArrays
+		} else {
+			unsigned TypeSize = getFieldSize(CB, DL);
+			if (TypeSize == (unsigned)-1) {
+				assert(false);
+			}
+
+			ob_state_t *object_state = map->lookup(DecompGEP.Base);
+
+			if (object_state == NULL) {
+				object_state = new ob_state_t();
+				(*map)[DecompGEP.Base] = object_state;
+				updated |= true;
+			}
+
+			if (return_state == ParamStateType::DIRTY_CAPTURED) {
+				// Approximate dirty
+				updated |= object_state->setDirty(offset, TypeSize);
+			} else if (return_state == ParamStateType::DIRTY_ESCAPED) {
+				// TODO: How to approximate dirty?
+				//assert(false);
+				updated |= object_state->setEscape();
+				updated |= object_state->setDirty(offset, TypeSize);
+			} else if (return_state == ParamStateType::CLWB_CAPTURED) {
+				updated |= object_state->setClwb(offset, TypeSize);
+			} else if (return_state == ParamStateType::CLWB_ESCAPED) {
+				updated |= object_state->setClwb(offset, TypeSize);
+				updated |= object_state->setEscape();
+			} else if (return_state == ParamStateType::CLEAN_CAPTURED) {
+				updated |= object_state->setFlush(offset, TypeSize);
+			} else if (return_state == ParamStateType::CLEAN_ESCAPED) {
+				updated |= object_state->setFlush(offset, TypeSize);
+				updated |= object_state->setEscape();
+			} else if (return_state == ParamStateType::TOP) {
+				updated |= object_state->setFlush(offset, TypeSize);
+				updated |= object_state->setCaptured();
+			} else {
+				assert(false && "other cases");
+			}
+		}
 	}
 
 	return updated;
@@ -1634,7 +1704,6 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 					object_state->computeDirtyBtyes(info);
 				} // TODO: else if (CLWB_CAPTURED/CLWB_ESCAPED)
 			}
-
 		}
 
 		if (Output->getStateType(i) != absState) {
@@ -1678,6 +1747,8 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	for (state_t::iterator it = final_state.begin(); it != final_state.end(); it++) {
 		delete it->second;
 	}
+
+	checkEndError(AbsState, F);
 
 	return updated;
 }

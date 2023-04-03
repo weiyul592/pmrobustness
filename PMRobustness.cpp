@@ -85,7 +85,9 @@ namespace {
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 		bool processFlushWrapperFunction(state_t * map, Instruction * I);
+		bool processNTSWrapperFunction(state_t * map, Instruction * I);
 		bool processCalls(state_t *map, Instruction *I);
+		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
 		//bool processParamAnnotationFunction(Instruction * I);
 
@@ -103,6 +105,7 @@ namespace {
 		NVMOP analyzeFlushType(Function &F);
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
+		bool isNTSWrapperFunction(Instruction *I);
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
@@ -531,6 +534,8 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			updated = processMemIntrinsic(map, I);
 		} else if (isFlushWrapperFunction(I)) {
 			updated |= processFlushWrapperFunction(map, I);
+		} else if (isNTSWrapperFunction(I)) {
+			updated |= processNTSWrapperFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
 			if (op == NVM_FENCE) {
@@ -781,17 +786,8 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	assert(callee);
 
 	std::vector<StringRef> annotations;
-	StringRef AttrValue = callee->getFnAttribute("myflush").getValueAsString();
-	std::pair<StringRef, StringRef> Split = AttrValue.split("|");
-	annotations.push_back(Split.first);
+	getAnnotatedParamaters("myflush", annotations, callee);
 
-	while (!Split.second.empty()) {
-		Split = Split.second.split("|");
-		annotations.push_back(Split.first);
-	}
-
-	assert(callInst->arg_size() == annotations.size() &&
-		"annotations should match the number of paramaters");
 	Value *Addr = NULL;
 	Value *FlushSize = NULL;
 	for (unsigned i = 0; i < annotations.size(); i++) {
@@ -816,16 +812,15 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	}
 	assert(FlushOp == NVM_CLWB || FlushOp == NVM_CLFLUSH);
 
-	DecomposedGEP DecompGEP;
-	decomposeAddress(DecompGEP, Addr, DL);
-	unsigned offset = DecompGEP.getOffsets();
-
 /*
 	errs() << "flush wrapper " << *Addr << "\n  for " << *FlushSize << "\n  ";
 	IRBuilder<> IRB(I);
 	getPosition(I, IRB, true);
 	I->getFunction()->dump();
 */
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
 
 	if (DecompGEP.isArray) {
 		//TODO: compare GEP address
@@ -834,6 +829,7 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
+		bool updated = false;
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = map->lookup(DecompGEP.Base);
 		if (object_state == NULL) {
@@ -852,12 +848,76 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 
 			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
 			if (FlushOp == NVM_CLFLUSH)
-				object_state->setFlush(offset, size, true);
+				updated |= object_state->setFlush(offset, size, true);
 			else if (FlushOp == NVM_CLWB)
-				object_state->setClwb(offset, size, true);
+				updated |= object_state->setClwb(offset, size, true);
+
+			return updated;
 		}
 	}
 
+	// FIXME: set return value
+	return true;
+}
+
+bool PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
+	CallBase *callInst = cast<CallBase>(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	Function *callee = callInst->getCalledFunction();
+	assert(callee);
+
+	std::vector<StringRef> annotations;
+	getAnnotatedParamaters("nts", annotations, callee);
+
+	Value *Addr = NULL;
+	//Value *V = NULL;
+	for (unsigned i = 0; i < annotations.size(); i++) {
+		StringRef &token = annotations[i];
+		if (token == "addr") {
+			Addr = callInst->getArgOperand(i);
+		} else if (token == "value") {
+			// Ignore
+			//V = callInst->getArgOperand(i);
+		} else if (token == "ignore") {
+			// Ignore
+		} else {
+			assert(false && "bad annotation");
+		}
+	}
+
+/*
+	errs() << "Non-Temporal Store wrapper " << *Addr << "\n for " << *V << "\n  ";
+	IRBuilder<> IRB(I);
+	getPosition(I, IRB, true);
+	//I->getFunction()->dump();
+*/
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		// FIXME: N4.cpp:28
+		// assert(false);
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		// TODO: treat it the same way as array
+		assert(false);
+	} else {
+		bool updated = false;
+		// Size is likely to be either 32, 64, or 128 bits
+		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		ob_state_t *object_state = map->lookup(DecompGEP.Base);
+		if (object_state == NULL) {
+			object_state = new ob_state_t();
+			(*map)[DecompGEP.Base] = object_state;
+			updated |= true;
+		}
+
+		updated |= object_state->setClwb(offset, TypeSize);
+		return updated;
+	}
+
+	// FIXME: set return value
 	return true;
 }
 
@@ -900,6 +960,20 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	bool updated = lookupFunctionResult(map, CB, context);
 
 	return updated;
+}
+
+void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
+	StringRef AttrValue = callee->getFnAttribute(attr).getValueAsString();
+	std::pair<StringRef, StringRef> Split = AttrValue.split("|");
+	annotations.push_back(Split.first);
+
+	while (!Split.second.empty()) {
+		Split = Split.second.split("|");
+		annotations.push_back(Split.first);
+	}
+
+	assert(callee->arg_size() == annotations.size() &&
+		"annotations should match the number of paramaters");
 }
 
 /*
@@ -1136,6 +1210,18 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("myflush"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+// Non-temporal store
+bool PMRobustness::isNTSWrapperFunction(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if (callee->hasFnAttribute("nts"))
 				return true;
 		}
 	}
@@ -2137,7 +2223,7 @@ bool PMRobustness::DecomposeGEPExpression(const Value *V,
 }
 
 void PMRobustness::printMap(state_t * map) {
-	errs() << "## Printng Map\n";
+	errs() << "### Printing Map\n";
 	if (map == NULL) {
 		errs() << "NULL Map\n";
 		return;
@@ -2150,7 +2236,7 @@ void PMRobustness::printMap(state_t * map) {
 
 	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
 		ob_state_t *object_state = it->second;
-		errs() << "loc: " << *it->first << "\n";
+		errs() << "#loc: " << *it->first << "\n";
 		object_state->dump();
 	}
 

@@ -74,9 +74,10 @@ namespace {
 		void copyArrayState(addr_set_t *src, addr_set_t *dst);
 
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
-			state_t * dst);
+			state_t * dst, DenseMap<const BasicBlock *, bool> &visited_blocks);
 		void copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
-			SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst);
+			SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst,
+			DenseMap<const BasicBlock *, bool> &visited_blocks);
 
 		bool processInstruction(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
@@ -355,8 +356,8 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 						break;
 					}
 
-					copyMergedState(AbsState, pred_list, state);
-					copyMergedArrayState(ArraySets, pred_list, addr_set);
+					copyMergedState(AbsState, pred_list, state, visited_blocks);
+					copyMergedArrayState(ArraySets, pred_list, addr_set, visited_blocks);
 				}
 			} else {
 				// Copy the previous instruction's state
@@ -442,13 +443,14 @@ void PMRobustness::copyArrayState(addr_set_t *src, addr_set_t *dst) {
 }
 
 void PMRobustness::copyMergedState(state_map_t *AbsState,
-		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst) {
+		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst,
+		DenseMap<const BasicBlock *, bool> &visited_blocks) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
 		(*dst)[it->first]->setSize(0);
 
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = AbsState->lookup(pred->getTerminator());
-		if (s == NULL) {
+		if (!visited_blocks[pred]) {
 			continue;
 		}
 
@@ -475,13 +477,14 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 }
 
 void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
-		SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst) {
+		SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst,
+		DenseMap<const BasicBlock *, bool> &visited_blocks) {
 //	for (addr_set_t::iterator it = dst->begin(); it != dst->end(); it++)
 //		(*dst)[it->first]->setSize(0);
 
 	for (BasicBlock *pred : *src_list) {
 		addr_set_t *s = (*ArraySets)[pred];
-		if (s == NULL) {
+		if (!visited_blocks[pred]) {
 			continue;
 		}
 

@@ -86,6 +86,7 @@ namespace {
 		bool processStore(state_t * map, Instruction * I);
 		bool processFlushWrapperFunction(state_t * map, Instruction * I);
 		bool processNTSWrapperFunction(state_t * map, Instruction * I);
+		bool processDeleteFunction(state_t * map, Instruction * I);
 		bool processCalls(state_t *map, Instruction *I);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
@@ -106,6 +107,7 @@ namespace {
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
 		bool isNTSWrapperFunction(Instruction *I);
+		bool isDeleteFunction(Instruction *I);
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
@@ -506,7 +508,6 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 	}
 }
 
-
 bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
 
@@ -536,6 +537,8 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			updated |= processFlushWrapperFunction(map, I);
 		} else if (isNTSWrapperFunction(I)) {
 			updated |= processNTSWrapperFunction(map, I);
+		} else if (isDeleteFunction(I)) {
+			updated |= processDeleteFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
 			if (op == NVM_FENCE) {
@@ -861,8 +864,8 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 }
 
 bool PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
-	CallBase *callInst = cast<CallBase>(I);
 	const DataLayout &DL = I->getModule()->getDataLayout();
+	CallBase *callInst = cast<CallBase>(I);
 	Function *callee = callInst->getCalledFunction();
 	assert(callee);
 
@@ -915,6 +918,39 @@ bool PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 
 		updated |= object_state->setClwb(offset, TypeSize);
 		return updated;
+	}
+
+	// FIXME: set return value
+	return true;
+}
+
+bool PMRobustness::processDeleteFunction(state_t * map, Instruction * I) {
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	CallBase *callInst = cast<CallBase>(I);
+	Value *Addr = callInst->getArgOperand(0);
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		//TODO: compare GEP address
+		assert(false && "Deleting an array address");
+		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		// TODO: treat it the same way as array
+		assert(false && "Deleting an array address");
+	} else {
+		bool updated = false;
+		ob_state_t *object_state = map->lookup(DecompGEP.Base);
+		if (object_state != NULL) {
+			unsigned size = object_state->getSize();
+			updated |= object_state->setFlush(offset, size, true);
+			updated |= object_state->setCaptured();
+
+			return updated;
+		}
 	}
 
 	// FIXME: set return value
@@ -1222,6 +1258,18 @@ bool PMRobustness::isNTSWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("nts"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+// C++ delete operator
+bool PMRobustness::isDeleteFunction(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if (callee->getName() == "_ZdlPv")
 				return true;
 		}
 	}

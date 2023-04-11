@@ -73,7 +73,7 @@ namespace {
 	private:
 		void copyState(state_t * src, state_t * dst);
 		void copyArrayState(addr_set_t *src, addr_set_t *dst);
-		bool copyStateCheckDiff(state_t * src, state_t * dst, BasicBlock *block);
+		bool copyStateCheckDiff(state_t * src, state_t * dst);
 
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
 			state_t * dst, DenseMap<const BasicBlock *, bool> &visited_blocks);
@@ -99,6 +99,7 @@ namespace {
 		bool isPMAddr(const Value * Addr, const DataLayout &DL);
 		bool mayInHeap(const Value * Addr);
 		void checkEndError(state_map_t *AbsState, Function &F);
+		void checkEscapedObjError(state_t *state, Instruction *I);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
@@ -157,6 +158,8 @@ namespace {
 		std::list<BasicBlock *> BlockWorklist;
 
 		DenseMap<Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
+		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
+		DenseSet<const Instruction *> * StmtErrorSet;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -297,6 +300,12 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	}
 #endif
 
+	StmtErrorSet = FunctionStmtErrorSets[&F];
+	if (StmtErrorSet == NULL) {
+		StmtErrorSet = new DenseSet<const Instruction *>();
+		FunctionStmtErrorSets[&F] = StmtErrorSet;
+	}
+
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
@@ -395,7 +404,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 
 		// Copy block terminator's state and check if it has changed
 		state_t * terminator_state = AbsState->lookup(block->getTerminator());
-		bool block_state_changed = copyStateCheckDiff(terminator_state, block_end_state, block);
+		bool block_state_changed = copyStateCheckDiff(terminator_state, block_end_state);
 
 		// Push block successors to BlockWorklist if block state has changed
 		// or it is the first time we visit this block
@@ -467,7 +476,7 @@ void PMRobustness::copyArrayState(addr_set_t *src, addr_set_t *dst) {
 	}
 }
 
-bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst, BasicBlock *block) {
+bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst) {
 	bool updated = false;
 
 	// Mark each item in dst as `to delete`; they are unmarked if src contains them
@@ -561,13 +570,17 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 
 void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
+	bool check_error = false;
 
 	if (I->isAtomic()) {
 		updated |= processAtomic(map, I);
+		check_error = true;
 	} else if (isa<LoadInst>(I)) {
 		updated |= processLoad(map, I);
+		check_error = true;
 	} else if (isa<StoreInst>(I)) {
 		updated |= processStore(map, I);
+		check_error = true;
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		/* TODO: identify primitive functions that allocate memory
 		CallBase *CallSite = cast<CallBase>(I);
@@ -584,6 +597,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			return;
 		} else if (isa<MemIntrinsic>(I)) {
 			updated |= processMemIntrinsic(map, I);
+			check_error = true;
 		} else if (isFlushWrapperFunction(I)) {
 			processFlushWrapperFunction(map, I);
 		} else if (isNTSWrapperFunction(I)) {
@@ -600,9 +614,14 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			} else {
 #ifdef INTERPROCEDURAL
 				processCalls(map, I);
+				check_error = true;
 #endif
 			}
 		}
+	}
+
+	if (check_error) {
+		checkEscapedObjError(map, I);
 	}
 /*
 	if (updated) {
@@ -1187,6 +1206,32 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 					getPosition(I, IRB, true);
 				}
 			}
+		}
+	}
+}
+
+void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
+	bool has_escaped_dirty_objs = false;
+	IRBuilder<> IRB(I);
+
+	for (state_t::iterator it = state->begin(); it != state->end(); it++) {
+		ob_state_t *object_state = it->second;
+		if (object_state->isEscaped() && object_state->checkDirty()) {
+			// There is already one or more escaped dirty objects
+			if (has_escaped_dirty_objs) {
+				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
+					StmtErrorSet->insert(I);
+					errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
+					errs() << "Error: More than two objects and escaped and dirty at: ";
+					getPosition(I, IRB, true);
+				}
+
+				break;
+			}
+
+			has_escaped_dirty_objs = true;
+
+			// check if two fields in an object is dirty
 		}
 	}
 }

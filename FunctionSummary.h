@@ -198,6 +198,10 @@ struct OutputState {
 		return AbstractOutputState[i].get_state();
 	}
 
+	ParamState& getState(unsigned i) {
+		return AbstractOutputState[i];
+	}
+
 	void dump() {
 		errs() << "Abstract output state: ";
 		for (ParamState &I : AbstractOutputState) {

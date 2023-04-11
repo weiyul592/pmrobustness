@@ -45,6 +45,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/ADT/None.h"
 #include "PMRobustness.h"
 #include "FunctionSummary.h"
@@ -72,6 +73,7 @@ namespace {
 	private:
 		void copyState(state_t * src, state_t * dst);
 		void copyArrayState(addr_set_t *src, addr_set_t *dst);
+		bool copyStateCheckDiff(state_t * src, state_t * dst, BasicBlock *block);
 
 		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
 			state_t * dst, DenseMap<const BasicBlock *, bool> &visited_blocks);
@@ -79,15 +81,15 @@ namespace {
 			SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst,
 			DenseMap<const BasicBlock *, bool> &visited_blocks);
 
-		bool processInstruction(state_t * map, Instruction * I);
+		void processInstruction(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
-		bool processFlushWrapperFunction(state_t * map, Instruction * I);
-		bool processNTSWrapperFunction(state_t * map, Instruction * I);
-		bool processDeleteFunction(state_t * map, Instruction * I);
-		bool processCalls(state_t *map, Instruction *I);
+		void processFlushWrapperFunction(state_t * map, Instruction * I);
+		void processNTSWrapperFunction(state_t * map, Instruction * I);
+		void processDeleteFunction(state_t * map, Instruction * I);
+		void processCalls(state_t *map, Instruction *I);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
 		//bool processParamAnnotationFunction(Instruction * I);
@@ -113,7 +115,7 @@ namespace {
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
 		CallingContext * computeContext(state_t *map, Instruction *I);
-		bool lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context);
+		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context);
 		void computeInitialState(state_t *map, Function &F, CallingContext *Context);
 		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
 
@@ -130,12 +132,16 @@ namespace {
 		void printMap(state_t * map);
 		void test();
 
+		// object states at the end of each instruction for each function
 		DenseMap<Function *, state_map_t *> AbstractStates;
+		// object states at the end of each basic block for each function
+		DenseMap<Function *, b_state_map_t *> BlockEndAbstractStates;
 		DenseMap<Function *, DenseMap<BasicBlock *, addr_set_t *> *> UnflushedArrays;
 		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
 		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetInstMap;
 
 		CallingContext *CurrentContext;
+
 		// Arguments of the function being analyzed
 		DenseMap<Value *, unsigned> FunctionArguments;
 
@@ -218,12 +224,12 @@ bool PMRobustness::runOnModule(Module &M) {
 			FunctionWorklist.emplace_back(&F, Context);
 			UniqueFunctionSet.insert(std::make_pair(&F, Context));
 		} else {
-#ifdef PMROBUST_DEBUG
+ #ifdef PMROBUST_DEBUG
 			if (F.isDeclaration()) {
 				errs() << "{" << F.empty() << "," << !F.isMaterializable() << "}\n";
 				errs() << F.getName() << " isDeclaration ignored\n";
 			}
-#endif
+ #endif
 		}
 #else
 		if (!F.isDeclaration())
@@ -256,12 +262,18 @@ bool PMRobustness::runOnModule(Module &M) {
 
 void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	state_map_t *AbsState = AbstractStates[&F];
-	DenseMap<BasicBlock *, addr_set_t *> *ArraySets = UnflushedArrays[&F];
 	if (AbsState == NULL) {
 		AbsState = new state_map_t();
 		AbstractStates[&F] = AbsState;
 	}
 
+	b_state_map_t *BlockAbsState = BlockEndAbstractStates[&F];
+	if (BlockAbsState == NULL) {
+		BlockAbsState = new b_state_map_t();
+		BlockEndAbstractStates[&F] = BlockAbsState;
+	}
+
+	DenseMap<BasicBlock *, addr_set_t *> *ArraySets = UnflushedArrays[&F];
 	if (ArraySets == NULL) {
 		ArraySets = new DenseMap<BasicBlock *, addr_set_t *>();
 		UnflushedArrays[&F] = ArraySets;
@@ -296,16 +308,19 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		BasicBlock *block = BlockWorklist.front();
 		BlockWorklist.pop_front();
 
-		bool changed = false;
 		bool predsNotAnalyzed = false;
 		BasicBlock::iterator prev = block->begin();
+		state_t *block_end_state = BlockAbsState->lookup(block);
+		if (block_end_state == NULL) {
+			block_end_state = new state_t();
+			(*BlockAbsState)[block] = block_end_state;
+		}
+
 		for (BasicBlock::iterator it = block->begin(); it != block->end();) {
 			state_t * state = AbsState->lookup(&*it);
-
 			if (state == NULL) {
 				state = new state_t();
 				(*AbsState)[&*it] = state;
-				changed |= true;
 			}
 
 			// Build state from predecessors' states
@@ -369,17 +384,22 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				copyState((*AbsState)[&*prev], state);
 			}
 
-			if (processInstruction(state, &*it))
-				changed |= true;
+			processInstruction(state, &*it);
 
 			prev = it;
 			it++;
-		}
+		} // End of basic block instruction iteration
 
 		if (predsNotAnalyzed)
 			continue;
 
-		if (changed || !visited_blocks[block]) {
+		// Copy block terminator's state and check if it has changed
+		state_t * terminator_state = AbsState->lookup(block->getTerminator());
+		bool block_state_changed = copyStateCheckDiff(terminator_state, block_end_state, block);
+
+		// Push block successors to BlockWorklist if block state has changed
+		// or it is the first time we visit this block
+		if (block_state_changed || !visited_blocks[block]) {
 			visited_blocks[block] = true;
 
 			SmallPtrSet<BasicBlock *, 8> *succ_list = block_successors[block];
@@ -447,11 +467,42 @@ void PMRobustness::copyArrayState(addr_set_t *src, addr_set_t *dst) {
 	}
 }
 
+bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst, BasicBlock *block) {
+	bool updated = false;
+
+	// Mark each item in dst as `to delete`; they are unmarked if src contains them
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
+		it->second->markDelete();
+
+	for (state_t::iterator it = src->begin(); it != src->end(); it++) {
+		ob_state_t *object_state = dst->lookup(it->first);
+		if (object_state == NULL) {
+			// mark_delete is initialized to false;
+			object_state = new ob_state_t(it->second);
+			(*dst)[it->first] = object_state;
+			updated = true;
+		} else {
+			updated |= object_state->copyFromCheckDiff(it->second);
+			object_state->unmarkDelete();
+		}
+	}
+
+	// Remove items not contained in src
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++) {
+		if (it->second->shouldDelete()) {
+			//dst->erase(it);
+			updated = true;
+		}
+	}
+
+	return updated;
+}
+
 void PMRobustness::copyMergedState(state_map_t *AbsState,
 		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst,
 		DenseMap<const BasicBlock *, bool> &visited_blocks) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
-		(*dst)[it->first]->setSize(0);
+		it->second->setSize(0);
 
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = AbsState->lookup(pred->getTerminator());
@@ -508,15 +559,15 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 	}
 }
 
-bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
+void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
 
 	if (I->isAtomic()) {
-		updated = processAtomic(map, I);
+		updated |= processAtomic(map, I);
 	} else if (isa<LoadInst>(I)) {
-		updated = processLoad(map, I);
+		updated |= processLoad(map, I);
 	} else if (isa<StoreInst>(I)) {
-		updated = processStore(map, I);
+		updated |= processStore(map, I);
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		/* TODO: identify primitive functions that allocate memory
 		CallBase *CallSite = cast<CallBase>(I);
@@ -530,15 +581,15 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 
 		// Ignore Debug info Instrinsics
 		if (isa<DbgInfoIntrinsic>(I)) {
-			return updated;
+			return;
 		} else if (isa<MemIntrinsic>(I)) {
-			updated = processMemIntrinsic(map, I);
+			updated |= processMemIntrinsic(map, I);
 		} else if (isFlushWrapperFunction(I)) {
-			updated |= processFlushWrapperFunction(map, I);
+			processFlushWrapperFunction(map, I);
 		} else if (isNTSWrapperFunction(I)) {
-			updated |= processNTSWrapperFunction(map, I);
+			processNTSWrapperFunction(map, I);
 		} else if (isDeleteFunction(I)) {
-			updated |= processDeleteFunction(map, I);
+			processDeleteFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
 			if (op == NVM_FENCE) {
@@ -548,7 +599,7 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 				// updated |= processFlush(map, I, op);
 			} else {
 #ifdef INTERPROCEDURAL
-				updated |= processCalls(map, I);
+				processCalls(map, I);
 #endif
 			}
 		}
@@ -559,7 +610,6 @@ bool PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		printMap(map);
 	}
 */
-	return updated;
 }
 
 bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
@@ -782,7 +832,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	return updated;
 }
 
-bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
+void PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	CallBase *callInst = cast<CallBase>(I);
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	Function *callee = callInst->getCalledFunction();
@@ -832,7 +882,6 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
-		bool updated = false;
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = map->lookup(DecompGEP.Base);
 		if (object_state == NULL) {
@@ -851,19 +900,14 @@ bool PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 
 			//errs() << "flush " << *DecompGEP.Base << " from " << offset << " to " << size << "\n";
 			if (FlushOp == NVM_CLFLUSH)
-				updated |= object_state->setFlush(offset, size, true);
+				object_state->setFlush(offset, size, true);
 			else if (FlushOp == NVM_CLWB)
-				updated |= object_state->setClwb(offset, size, true);
-
-			return updated;
+				object_state->setClwb(offset, size, true);
 		}
 	}
-
-	// FIXME: set return value
-	return true;
 }
 
-bool PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
+void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	CallBase *callInst = cast<CallBase>(I);
 	Function *callee = callInst->getCalledFunction();
@@ -906,25 +950,19 @@ bool PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 		// TODO: treat it the same way as array
 		assert(false);
 	} else {
-		bool updated = false;
 		// Size is likely to be either 32, 64, or 128 bits
 		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = map->lookup(DecompGEP.Base);
 		if (object_state == NULL) {
 			object_state = new ob_state_t();
 			(*map)[DecompGEP.Base] = object_state;
-			updated |= true;
 		}
 
-		updated |= object_state->setClwb(offset, TypeSize);
-		return updated;
+		object_state->setClwb(offset, TypeSize);
 	}
-
-	// FIXME: set return value
-	return true;
 }
 
-bool PMRobustness::processDeleteFunction(state_t * map, Instruction * I) {
+void PMRobustness::processDeleteFunction(state_t * map, Instruction * I) {
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	CallBase *callInst = cast<CallBase>(I);
 	Value *Addr = callInst->getArgOperand(0);
@@ -942,46 +980,40 @@ bool PMRobustness::processDeleteFunction(state_t * map, Instruction * I) {
 		// TODO: treat it the same way as array
 		assert(false && "Deleting an array address");
 	} else {
-		bool updated = false;
 		ob_state_t *object_state = map->lookup(DecompGEP.Base);
 		if (object_state != NULL) {
 			unsigned size = object_state->getSize();
-			updated |= object_state->setFlush(offset, size, true);
-			updated |= object_state->setCaptured();
-
-			return updated;
+			object_state->setFlush(offset, size, true);
+			object_state->setCaptured();
 		}
 	}
-
-	// FIXME: set return value
-	return true;
 }
 
-bool PMRobustness::processCalls(state_t *map, Instruction *I) {
+void PMRobustness::processCalls(state_t *map, Instruction *I) {
 	CallBase *CB = cast<CallBase>(I);
 	if (CallInst *CI = dyn_cast<CallInst>(CB)) {
 		if (CI->isInlineAsm())
-			return false;
+			return;
 	}
 
 	Function *F = CB->getCalledFunction();
 	if (F == NULL) {
 		// TODO: why this happens?
 		//assert(false);
-		return false;
+		return;
 	}
 
 	if (F->isVarArg()) {
 #ifdef PMROBUST_DEBUG
 		errs() << "Cannot handle variable argument functions for " << F->getName() << "\n";
 #endif
-		return false;
+		return;
 	} else if (F->isDeclaration()) {
 		// TODO: think about how to approximate calls to functions with no body
 #ifdef PMROBUST_DEBUG
 		errs() << "Cannot handle functions with no function body: " << F->getName() << "\n";
 #endif
-		return false;
+		return;
 	}
 
 	// Update FunctionCallerMap
@@ -993,9 +1025,7 @@ bool PMRobustness::processCalls(state_t *map, Instruction *I) {
 	}
 
 	CallingContext *context = computeContext(map, I);
-	bool updated = lookupFunctionResult(map, CB, context);
-
-	return updated;
+	lookupFunctionResult(map, CB, context);
 }
 
 void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
@@ -1151,6 +1181,7 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 			if (object_state->checkDirty()) {
 				if (ErrorSet->find(it->first) == ErrorSet->end()) {
 					ErrorSet->insert(it->first);
+
 					errs() << *it->first << "\n";
 					errs() << "Error!!!!!!! at return statement: ";
 					getPosition(I, IRB, true);
@@ -1503,11 +1534,10 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	return context;
 }
 
-bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context) {
+void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context) {
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 	const DataLayout &DL = CB->getModule()->getDataLayout();
-	bool updated = false;
 
 	//errs() << "lookup results for function: " << F->getName() << "\n";
 	// Function has not been analyzed before
@@ -1545,18 +1575,18 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					//errs() << *op << "\n";
 
 					if (TypeSize == (unsigned)-1)
-						updated |= object_state->setFlush(offset, TypeSize, true);
+						object_state->setFlush(offset, TypeSize, true);
 					else
-						updated |= object_state->setFlush(offset, TypeSize);
+						object_state->setFlush(offset, TypeSize);
 
-					updated |= object_state->setCaptured();
+					object_state->setCaptured();
 				}
 			} // Else case: op is NON_PMEM, so don't do anything
 
 			i++;
 		}
 
-		return updated;
+		return;
 	}
 
 	OutputState *out_state = FS->getResult(Context);
@@ -1571,7 +1601,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			delete Context;
 		}
 
-		return updated;
+		return;
 	}
 
 	//errs() << "Function cache found\n";
@@ -1611,7 +1641,6 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
 				(*map)[DecompGEP.Base] = object_state;
-				updated |= true;
 			} /*else if (object_state->getSize() == 0) {
 				errs() << "operand: " << *op << "\n";
 				errs() << "call base: " << *CB << "\n";
@@ -1633,29 +1662,29 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
 					for (unsigned i = 0; i < lst->size(); i++) {
 						std::pair<int, int> &elem = (*lst)[i];
-						updated |= object_state->setDirty(offsets + elem.first, elem.second - elem.first);
+						object_state->setDirty(offsets + elem.first, elem.second - elem.first);
 					}
 				} else {
-					updated |= object_state->setDirty(offset, TypeSize);
+					object_state->setDirty(offset, TypeSize);
 				}
 			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
 				// TODO: How to approximate dirty?
 				//assert(false);
-				updated |= object_state->setEscape();
-				updated |= object_state->setDirty(offset, TypeSize);
+				object_state->setEscape();
+				object_state->setDirty(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
-				updated |= object_state->setClwb(offset, TypeSize);
+				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
-				updated |= object_state->setClwb(offset, TypeSize);
-				updated |= object_state->setEscape();
+				object_state->setClwb(offset, TypeSize);
+				object_state->setEscape();
 			} else if (param_state == ParamStateType::CLEAN_CAPTURED) {
-				updated |= object_state->setFlush(offset, TypeSize);
+				object_state->setFlush(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLEAN_ESCAPED) {
-				updated |= object_state->setFlush(offset, TypeSize);
-				updated |= object_state->setEscape();
+				object_state->setFlush(offset, TypeSize);
+				object_state->setEscape();
 			} else if (param_state == ParamStateType::TOP) {
-				updated |= object_state->setFlush(offset, TypeSize);
-				updated |= object_state->setCaptured();
+				object_state->setFlush(offset, TypeSize);
+				object_state->setCaptured();
 			} else {
 				assert(false && "other cases");
 			}
@@ -1667,7 +1696,7 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	if (out_state->hasRetVal) {
 		ParamStateType return_state = out_state->retVal;
 		if (return_state == ParamStateType::NON_PMEM)
-			return updated;
+			return;
 
 		DecomposedGEP DecompGEP;
 		decomposeAddress(DecompGEP, CB, DL);
@@ -1687,37 +1716,34 @@ bool PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			if (object_state == NULL) {
 				object_state = new ob_state_t();
 				(*map)[DecompGEP.Base] = object_state;
-				updated |= true;
 			}
 
 			if (return_state == ParamStateType::DIRTY_CAPTURED) {
 				// Approximate dirty
-				updated |= object_state->setDirty(offset, TypeSize);
+				object_state->setDirty(offset, TypeSize);
 			} else if (return_state == ParamStateType::DIRTY_ESCAPED) {
 				// TODO: How to approximate dirty?
 				//assert(false);
-				updated |= object_state->setEscape();
-				updated |= object_state->setDirty(offset, TypeSize);
+				object_state->setEscape();
+				object_state->setDirty(offset, TypeSize);
 			} else if (return_state == ParamStateType::CLWB_CAPTURED) {
-				updated |= object_state->setClwb(offset, TypeSize);
+				object_state->setClwb(offset, TypeSize);
 			} else if (return_state == ParamStateType::CLWB_ESCAPED) {
-				updated |= object_state->setClwb(offset, TypeSize);
-				updated |= object_state->setEscape();
+				object_state->setClwb(offset, TypeSize);
+				object_state->setEscape();
 			} else if (return_state == ParamStateType::CLEAN_CAPTURED) {
-				updated |= object_state->setFlush(offset, TypeSize);
+				object_state->setFlush(offset, TypeSize);
 			} else if (return_state == ParamStateType::CLEAN_ESCAPED) {
-				updated |= object_state->setFlush(offset, TypeSize);
-				updated |= object_state->setEscape();
+				object_state->setFlush(offset, TypeSize);
+				object_state->setEscape();
 			} else if (return_state == ParamStateType::TOP) {
-				updated |= object_state->setFlush(offset, TypeSize);
-				updated |= object_state->setCaptured();
+				object_state->setFlush(offset, TypeSize);
+				object_state->setCaptured();
 			} else {
 				assert(false && "other cases");
 			}
 		}
 	}
-
-	return updated;
 }
 
 // Get initial states of parameters from Context
@@ -2312,6 +2338,7 @@ static RegisterPass<PMRobustness> X("pmrobust", "Persistent Memory Robustness An
 // Automatically enable the pass.
 static void registerPMRobustness(const PassManagerBuilder &,
 							legacy::PassManagerBase &PM) {
+	PM.add(createCFGSimplificationPass());
 	PM.add(createPromoteMemoryToRegisterPass());
 	PM.add(createEarlyCSEPass(false));
 	PM.add(new PMRobustness());

@@ -14,6 +14,7 @@ struct ArrayInfo;
 
 typedef DenseMap<const Value *, ob_state_t *> state_t;
 typedef DenseMap<const Instruction *, state_t *> state_map_t;
+typedef DenseMap<const BasicBlock *, state_t *> b_state_map_t;
 typedef DenseMap<Value *, ArrayInfo *> addr_set_t;
 
 enum NVMOP {
@@ -136,6 +137,7 @@ private:
 	BitVector clwb_bytes;
 	bool escaped;
 	bool nonpmem;
+	bool mark_delete;
 
 	void resize(unsigned s) {
 		//if (s > (1 << 12))
@@ -155,7 +157,8 @@ public:
 		dirty_bytes(),
 		clwb_bytes(),
 		escaped(false),
-		nonpmem(false)
+		nonpmem(false),
+		mark_delete(false)
 	{}
 
 	ob_state_t(unsigned s) :
@@ -163,7 +166,8 @@ public:
 		dirty_bytes(s),
 		clwb_bytes(s),
 		escaped(false),
-		nonpmem(false)
+		nonpmem(false),
+		mark_delete(false)
 	{ /*assert(s <= (1 << 12));*/ }
 
 	ob_state_t(ob_state_t * other) :
@@ -171,7 +175,8 @@ public:
 		dirty_bytes(other->dirty_bytes),
 		clwb_bytes(other->clwb_bytes),
 		escaped(other->escaped),
-		nonpmem(other->nonpmem)
+		nonpmem(other->nonpmem),
+		mark_delete(false)
 	{ /*assert(size <= (1 << 12));*/ }
 
 	void mergeFrom(ob_state_t * other) {
@@ -208,8 +213,28 @@ public:
 //			assert(false);
 //		}
 
-		// Calling Contexts can be different, while only the initial state is reset each time analyzing functions
+		// nonpmem comes from Calling Contexts, which can be different
+		// Since only the initial state is reset each time analyzing functions,
+		// we propagate nonpmem by copying
 		nonpmem = src->nonpmem;
+	}
+
+	bool copyFromCheckDiff(ob_state_t * src) {
+		bool updated = false;
+		updated |= (size != src->size);
+		updated |= (dirty_bytes != src->dirty_bytes);
+		updated |= (clwb_bytes != src->clwb_bytes);
+		updated |= (escaped != src->escaped);
+
+		size = src->size;
+		dirty_bytes = src->dirty_bytes;
+		clwb_bytes = src->clwb_bytes;
+		escaped = src->escaped;
+
+		// nonpmem comes from Calling Contexts, and is not considered as a change in states
+		nonpmem = src->nonpmem;
+
+		return updated;
 	}
 
 	// return true: modified; return else: unchanged
@@ -243,14 +268,17 @@ public:
 		if (nonpmem)
 			return false;
 
-		if (start >= size && onlyFlushWrittenBytes) {
+		if (start > size && onlyFlushWrittenBytes) {
 			errs() << "FIXME: Flush unknown bytes\n";
 			return false;
 			//assert(false && "Flush unknown bytes");
 		}
 
 		unsigned end = start + len;
-		if (end > size && onlyFlushWrittenBytes) {
+		if (len == (unsigned)-1 && onlyFlushWrittenBytes) {
+			// start + len may overflow
+			end = size;
+		} else if (end > size && onlyFlushWrittenBytes) {
 			end = size;
 		} else if (end > size)
 			resize(end);
@@ -317,12 +345,28 @@ public:
 		return false;
 	}
 
+	bool isEscaped() {
+		return escaped;
+	}
+
 	void setNonPmem() {
 		nonpmem = true;
 	}
 
 	bool isNonPmem() {
 		return nonpmem;
+	}
+
+	void markDelete() {
+		mark_delete = true;
+	}
+
+	void unmarkDelete() {
+		mark_delete = false;
+	}
+
+	bool shouldDelete() {
+		return mark_delete;
 	}
 
 	unsigned getSize() {
@@ -417,12 +461,16 @@ public:
 
 	void dump() {
 		errs() << "bit vector size: " << size << "\n";
+		unsigned limit_size = size;
 		if (size != 0) {
-			for (unsigned i = 0; i < size; i++) {
+			if (size > 128)
+				limit_size = 128;
+
+			for (unsigned i = 0; i < limit_size; i++) {
 				errs() << dirty_bytes[i];
 			}
 			errs() << "\n";
-			for (unsigned i = 0; i < size; i++) {
+			for (unsigned i = 0; i < limit_size; i++) {
 				errs() << clwb_bytes[i];
 			}
 			errs() << "\n";

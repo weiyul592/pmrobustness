@@ -287,7 +287,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	FunctionArguments.clear();
 	unsigned i = 0;
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
-		FunctionArguments[&*it] = i;
+		FunctionArguments[&*it] = i++;
 	}
 
 	// Collect all return statements of Function F
@@ -599,10 +599,13 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			updated |= processMemIntrinsic(map, I);
 			check_error = true;
 		} else if (isFlushWrapperFunction(I)) {
+			updated |= true;
 			processFlushWrapperFunction(map, I);
 		} else if (isNTSWrapperFunction(I)) {
+			updated |= true;
 			processNTSWrapperFunction(map, I);
 		} else if (isDeleteFunction(I)) {
+			updated |= true;
 			processDeleteFunction(map, I);
 		} else {
 			NVMOP op = whichNVMoperation(I);
@@ -614,13 +617,14 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			} else {
 #ifdef INTERPROCEDURAL
 				processCalls(map, I);
+				updated |= true;
 				check_error = true;
 #endif
 			}
 		}
 	}
 
-	if (check_error) {
+	if (updated && check_error) {
 		checkEscapedObjError(map, I);
 	}
 /*
@@ -2383,9 +2387,9 @@ static RegisterPass<PMRobustness> X("pmrobust", "Persistent Memory Robustness An
 // Automatically enable the pass.
 static void registerPMRobustness(const PassManagerBuilder &,
 							legacy::PassManagerBase &PM) {
-	PM.add(createCFGSimplificationPass());
 	PM.add(createPromoteMemoryToRegisterPass());
 	PM.add(createEarlyCSEPass(false));
+	PM.add(createCFGSimplificationPass());
 	PM.add(new PMRobustness());
 }
 /* Enable the pass when opt level is greater than 0 */

@@ -164,6 +164,7 @@ namespace {
 		DenseMap<Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
 		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
 		DenseSet<const Instruction *> * StmtErrorSet;
+		bool writeToEscDirObj;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -497,7 +498,7 @@ bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst) {
 	// Remove items not contained in src
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++) {
 		if (it->second->shouldDelete()) {
-			//dst->erase(it);
+			dst->erase(it);
 			updated = true;
 		}
 	}
@@ -567,6 +568,7 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 }
 
 void PMRobustness::processInstruction(state_t * map, Instruction * I) {
+	writeToEscDirObj = false;
 	bool updated = false;
 	bool check_error = false;
 
@@ -735,6 +737,11 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
 		updated |= object_state->setDirty(offset, TypeSize);
 
+		// For reporting in-function error
+		if (object_state->isEscaped()) {
+			writeToEscDirObj = true;
+		}
+
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
 		// TODO: Val(i.e. p) should be PM Addr
 		if (Val && Val->getType()->isPointerTy() &&
@@ -758,7 +765,13 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				ob_state_t *object_state = getObjectState(map, ValDecompGEP.Base, updated);
 
 				// Note: if *x = &p->f, then *p is potentially reachabled; so mark it as escaped
-				updated |= object_state->setEscape();
+				bool changed_to_escaped = object_state->setEscape();
+				updated |= changed_to_escaped;
+
+				// For reporting in-function error
+				if (changed_to_escaped && object_state->isDirty()) {
+					writeToEscDirObj = true;
+				}
 			}
 		}
 	}
@@ -803,6 +816,11 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
 			updated |= object_state->setDirty(offset, TypeSize);
+
+			// For reporting in-function error
+			if (object_state->isEscaped()) {
+				writeToEscDirObj = true;
+			}
 		}
 
 		// Rule 2.2: p = *x (where x is a heap address) => p escapes
@@ -819,7 +837,13 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 
 			//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			ob_state_t *object_state = getObjectState(map, LIDecompGEP.Base, updated);
-			updated |= object_state->setEscape();
+			bool changed_to_escaped = object_state->setEscape();
+			updated |= changed_to_escaped;
+
+			// For reporting in-function error
+			if (changed_to_escaped && object_state->isDirty()) {
+				writeToEscDirObj = true;
+			}
 		}
 	}
 
@@ -1024,6 +1048,11 @@ void PMRobustness::processCalls(state_t *map, Instruction *I) {
 
 	CallingContext *context = computeContext(map, I);
 	lookupFunctionResult(map, CB, context);
+
+	// TODO: For reporting in-function error
+	//if (function writes to an escaped object) {
+	//	writeToEscDirObj = true;
+	//}
 }
 
 void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
@@ -1221,9 +1250,11 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 			if (has_escaped_dirty_objs) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 					StmtErrorSet->insert(I);
-					errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
-					errs() << "Error: More than two objects and escaped and dirty at: ";
-					getPosition(I, IRB, true);
+					if (writeToEscDirObj) {
+						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\t" << "Instruction " << *I << "\n";
+						errs() << "Error: More than two objects are escaped and dirty at: ";
+						getPosition(I, IRB, true);
+					}
 				}
 
 				break;
@@ -1699,6 +1730,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				//assert(false);
 				object_state->setEscape();
 				object_state->setDirty(offset, TypeSize);
+				writeToEscDirObj = true;
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
@@ -1748,6 +1780,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				//assert(false);
 				object_state->setEscape();
 				object_state->setDirty(offset, TypeSize);
+				writeToEscDirObj = true;
 			} else if (return_state == ParamStateType::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (return_state == ParamStateType::CLWB_ESCAPED) {

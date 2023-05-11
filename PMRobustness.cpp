@@ -164,6 +164,7 @@ namespace {
 		DenseMap<Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
 		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
 		DenseSet<const Instruction *> * StmtErrorSet;
+		bool hasTwoEscapedDirtyParams;
 		bool writeToEscDirObj;
 
 		unsigned MaxLookupSearchDepth = 100;
@@ -287,6 +288,21 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	unsigned i = 0;
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
 		FunctionArguments[&*it] = i++;
+	}
+
+	// Check if two or more parameters are escaped and dirty
+	hasTwoEscapedDirtyParams = false;
+	bool has_escaped_dirty_objs = false;
+	for (unsigned i = 0; i < F.arg_size(); i++) {
+		ParamState &PS = Context->getState(i);
+		if (PS.isEscaped() && PS.isDirty()) {
+			if (has_escaped_dirty_objs) {
+				hasTwoEscapedDirtyParams = true;
+				break;
+			}
+
+			has_escaped_dirty_objs = true;
+		}
 	}
 #endif
 
@@ -1254,6 +1270,9 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\t" << "Instruction " << *I << "\n";
 						errs() << "Error: More than two objects are escaped and dirty at: ";
 						getPosition(I, IRB, true);
+						if (hasTwoEscapedDirtyParams) {
+							errs() << "Two Parameters are already escaped dirty, this error has not be real\n";
+						}
 					}
 				}
 

@@ -98,6 +98,9 @@ namespace {
 		// TODO: Address check to be implemented
 		bool isPMAddr(const Value * Addr, const DataLayout &DL);
 		bool mayInHeap(const Value * Addr);
+		ob_state_t * getObjectState(state_t *map, const Value *Addr, bool &updated);
+		ob_state_t * getObjectState(state_t *map, const Value *Addr);
+
 		void checkEndError(state_map_t *AbsState, Function &F);
 		void checkEscapedObjError(state_t *state, Instruction *I);
 
@@ -111,6 +114,7 @@ namespace {
 		bool isFlushWrapperFunction(Instruction *I);
 		bool isNTSWrapperFunction(Instruction *I);
 		bool isDeleteFunction(Instruction *I);
+
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
@@ -198,14 +202,16 @@ bool PMRobustness::doInitialization (Module &M) {
 bool PMRobustness::runOnModule(Module &M) {
 	for (Function &F : M) {
 #ifdef INTERPROCEDURAL
-		if (!F.use_empty() && !F.isDeclaration()) {
-			// TODO: assume parameters have states TOP or do not push them to worklist?
-			if (F.arg_size() == 0) {
-				CallingContext *Context = new CallingContext();
-				FunctionWorklist.emplace_back(&F, Context);
-				UniqueFunctionSet.insert(std::make_pair(&F, Context));
-			}
-		} else if (F.use_empty() && !F.isDeclaration()) {
+		if (F.getName() == "main") {
+			// Function has parameters
+			CallingContext *Context = new CallingContext();
+			for (unsigned i = 0; i < F.arg_size(); i++)
+				Context->addAbsInput(ParamStateType::NON_PMEM);
+
+			FunctionWorklist.emplace_back(&F, Context);
+			UniqueFunctionSet.insert(std::make_pair(&F, Context));
+		} else if (!F.isDeclaration()) {
+			// Assume parameters have states TOP or do not push them to worklist?
 			CallingContext *Context = new CallingContext();
 			for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
 				Argument *Arg = &*it;
@@ -217,21 +223,13 @@ bool PMRobustness::runOnModule(Module &M) {
 
 			FunctionWorklist.emplace_back(&F, Context);
 			UniqueFunctionSet.insert(std::make_pair(&F, Context));
-		} else if (F.getName() == "main") {
-			CallingContext *Context = new CallingContext();
-			if (F.arg_size() != 0) {
-				Context->addAbsInput(ParamStateType::NON_PMEM);
-				Context->addAbsInput(ParamStateType::NON_PMEM);
-			}
-
-			FunctionWorklist.emplace_back(&F, Context);
-			UniqueFunctionSet.insert(std::make_pair(&F, Context));
 		} else {
+			// F.isDeclaration
+			errs() << F.getName() << " isDeclaration ignored in Module " << M.getName() << "\n";
+
  #ifdef PMROBUST_DEBUG
-			if (F.isDeclaration()) {
-				errs() << "{" << F.empty() << "," << !F.isMaterializable() << "}\n";
-				errs() << F.getName() << " isDeclaration ignored\n";
-			}
+			errs() << "{" << F.empty() << "," << !F.isMaterializable() << "}\n";
+			errs() << F.getName() << " isDeclaration ignored\n";
  #endif
 		}
 #else
@@ -289,6 +287,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
 		FunctionArguments[&*it] = i++;
 	}
+#endif
 
 	// Collect all return statements of Function F
 	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
@@ -298,7 +297,6 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 				RetSet.insert(BB.getTerminator());
 		}
 	}
-#endif
 
 	StmtErrorSet = FunctionStmtErrorSets[&F];
 	if (StmtErrorSet == NULL) {
@@ -601,13 +599,15 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		} else if (isFlushWrapperFunction(I)) {
 			updated |= true;
 			processFlushWrapperFunction(map, I);
-		} else if (isNTSWrapperFunction(I)) {
-			updated |= true;
-			processNTSWrapperFunction(map, I);
+		} /*else if (isNTSWrapperFunction(I)) {
+			//updated |= true;
+			//processNTSWrapperFunction(map, I);
 		} else if (isDeleteFunction(I)) {
-			updated |= true;
-			processDeleteFunction(map, I);
-		} else {
+			// Ignore delete operator
+			//updated |= true;
+			//processDeleteFunction(map, I);
+		}*/
+		else {
 			NVMOP op = whichNVMoperation(I);
 			if (op == NVM_FENCE) {
 				// TODO: fence operations
@@ -732,13 +732,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		*/
 	} else {
 		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-		ob_state_t *object_state = map->lookup(DecompGEP.Base);
-		if (object_state == NULL) {
-			object_state = new ob_state_t();
-			(*map)[DecompGEP.Base] = object_state;
-			updated |= true;
-		}
-
+		ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
 		updated |= object_state->setDirty(offset, TypeSize);
 
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
@@ -753,12 +747,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				// e.g. struct { int A; int arr[10]; };
 				// StructOffset is the beginning address of arr.
 				// TODO: can we compute the size of the arr field?
-				ob_state_t *object_state = map->lookup(ValDecompGEP.Base);
-				if (object_state == NULL) {
-					object_state = new ob_state_t();
-					(*map)[ValDecompGEP.Base] = object_state;
-					updated |= true;
-				}
+				ob_state_t *object_state = getObjectState(map, ValDecompGEP.Base, updated);
 
 				// Mark it as escaped
 				updated |= object_state->setEscape();
@@ -766,12 +755,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				// TODO: start working here
 				//assert(false && "Fix me");
 			} else {
-				ob_state_t *object_state = map->lookup(ValDecompGEP.Base);
-				if (object_state == NULL) {
-					object_state = new ob_state_t();
-					(*map)[ValDecompGEP.Base] = object_state;
-					updated |= true;
-				}
+				ob_state_t *object_state = getObjectState(map, ValDecompGEP.Base, updated);
 
 				// Note: if *x = &p->f, then *p is potentially reachabled; so mark it as escaped
 				updated |= object_state->setEscape();
@@ -817,14 +801,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			// Mark the address as dirty to detect interthread robustness violation
 			// For Atomic RMW, this is already done in processStore
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-
-			ob_state_t *object_state = map->lookup(DecompGEP.Base);
-			if (object_state == NULL) {
-				object_state = new ob_state_t();
-				(*map)[DecompGEP.Base] = object_state;
-				updated |= true;
-			}
-
+			ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
 			updated |= object_state->setDirty(offset, TypeSize);
 		}
 
@@ -841,13 +818,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			}
 
 			//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-			ob_state_t *object_state = map->lookup(LIDecompGEP.Base);
-			if (object_state == NULL) {
-				object_state = new ob_state_t();
-				(*map)[LIDecompGEP.Base] = object_state;
-				updated |= true;
-			}
-
+			ob_state_t *object_state = getObjectState(map, LIDecompGEP.Base, updated);
 			updated |= object_state->setEscape();
 		}
 	}
@@ -930,6 +901,7 @@ void PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	}
 }
 
+// Not using this function for now
 void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	CallBase *callInst = cast<CallBase>(I);
@@ -940,14 +912,14 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	getAnnotatedParamaters("nts", annotations, callee);
 
 	Value *Addr = NULL;
-	//Value *V = NULL;
+	Value *V = NULL;
 	for (unsigned i = 0; i < annotations.size(); i++) {
 		StringRef &token = annotations[i];
 		if (token == "addr") {
 			Addr = callInst->getArgOperand(i);
 		} else if (token == "value") {
 			// Ignore
-			//V = callInst->getArgOperand(i);
+			V = callInst->getArgOperand(i);
 		} else if (token == "ignore") {
 			// Ignore
 		} else {
@@ -982,9 +954,12 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 		}
 
 		object_state->setClwb(offset, TypeSize);
+		//(object_state of V)->setEscape(); //TODO & FIXME: if V is a reference, it will escape
 	}
 }
 
+// Not using this function; ignore delete operator
+// code should be robust w/ and w/o delete operator
 void PMRobustness::processDeleteFunction(state_t * map, Instruction * I) {
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	CallBase *callInst = cast<CallBase>(I);
@@ -1140,7 +1115,7 @@ bool PMRobustness::isPMAddr(const Value * Addr, const DataLayout &DL) {
 /** Simple may-analysis for checking if an address is in the heap
  *  TODO: may need more sophisticated checks
  **/
-bool PMRobustness::mayInHeap(const Value * Addr /*, Instruction *I*/) {
+bool PMRobustness::mayInHeap(const Value * Addr) {
 	if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>((Value *)Addr)) {
 		Value * BaseAddr = GEP->getPointerOperand();
 
@@ -1167,6 +1142,27 @@ bool PMRobustness::mayInHeap(const Value * Addr /*, Instruction *I*/) {
 
 	// Address may be in the heap. We don't know for sure.
 	return true;
+}
+
+ob_state_t * PMRobustness::getObjectState(state_t *map, const Value *Addr, bool &updated) {
+	ob_state_t *object_state = map->lookup(Addr);
+	if (object_state == NULL) {
+		object_state = new ob_state_t();
+		(*map)[Addr] = object_state;
+		updated |= true;
+	}
+
+	return object_state;
+}
+
+ob_state_t * PMRobustness::getObjectState(state_t *map, const Value *Addr) {
+	ob_state_t *object_state = map->lookup(Addr);
+	if (object_state == NULL) {
+		object_state = new ob_state_t();
+		(*map)[Addr] = object_state;
+	}
+
+	return object_state;
 }
 
 void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
@@ -1201,7 +1197,7 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 			ob_state_t *object_state = it->second;
 			IRBuilder<> IRB(I);
 
-			if (object_state->checkDirty()) {
+			if (object_state->isDirty() && object_state->isEscaped()) {
 				if (ErrorSet->find(it->first) == ErrorSet->end()) {
 					ErrorSet->insert(it->first);
 
@@ -1220,7 +1216,7 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 
 	for (state_t::iterator it = state->begin(); it != state->end(); it++) {
 		ob_state_t *object_state = it->second;
-		if (object_state->isEscaped() && object_state->checkDirty()) {
+		if (object_state->isEscaped() && object_state->isDirty()) {
 			// There is already one or more escaped dirty objects
 			if (has_escaped_dirty_objs) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
@@ -1297,13 +1293,14 @@ NVMOP PMRobustness::analyzeFlushType(Function &F) {
 	NVMOP op = NVM_UNKNOWN;
 	for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
 		op = whichNVMoperation(&*I);
-		if (op != NVM_UNKNOWN) {
-			if (op == NVM_CLWB) {
-				F.addFnAttr("flush_type", "clflushopt");
-			} else if (op == NVM_CLFLUSH) {
-				F.addFnAttr("flush_type", "clflush");
-			}
+		if (op == NVM_CLWB) {
+			F.addFnAttr("flush_type", "clflushopt");
 			break;
+		} else if (op == NVM_CLFLUSH) {
+			F.addFnAttr("flush_type", "clflush");
+			break;
+		} else if (op == NVM_FENCE) {
+			continue;
 		}
 	}
 
@@ -1612,13 +1609,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 					// TODO: What do we do here?
 				} else {
-					ob_state_t *object_state = map->lookup(DecompGEP.Base);
-
-					if (object_state == NULL) {
-						object_state = new ob_state_t();
-						(*map)[DecompGEP.Base] = object_state;
-					}
-
+					ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
 					unsigned TypeSize = getFieldSize(op, DL);
 					//errs() << "TypeSize: " << TypeSize << "\n";
 					//errs() << *op << "\n";
@@ -1685,33 +1676,20 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				continue;
 			}
 
-			ob_state_t *object_state = map->lookup(DecompGEP.Base);
-
-			if (object_state == NULL) {
-				object_state = new ob_state_t();
-				(*map)[DecompGEP.Base] = object_state;
-			} /*else if (object_state->getSize() == 0) {
-				errs() << "operand: " << *op << "\n";
-				errs() << "call base: " << *CB << "\n";
-				CB->getFunction()->dump();
-
-				assert(false);
-			}*/
-
+			ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
 			ParamStateType param_state = out_state->getStateType(i);
 			if (param_state == ParamStateType::DIRTY_CAPTURED) {
 				// Approximate dirty
 				if (Context->getState(i).isClean()) {
 					// Note: We don't recapture escaped objects
 					// If input state is clean, then use DirtyBytesInfo to get dirty bytes
-					DirtyBytesInfo *info = out_state->getDirtyBtyesInfo(i);
-					std::vector<std::pair<int, int>> *lst = info->getDirtyBtyes();
+					DirtyBytesInfo *info = out_state->getDirtyBytesInfo(i);
+					std::vector<std::pair<int, int>> *lst = info->getDirtyBytes();
 
-					unsigned offsets = DecompGEP.getOffsets();
 					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
 					for (unsigned i = 0; i < lst->size(); i++) {
 						std::pair<int, int> &elem = (*lst)[i];
-						object_state->setDirty(offsets + elem.first, elem.second - elem.first);
+						object_state->setDirty(offset + elem.first, elem.second - elem.first);
 					}
 				} else {
 					object_state->setDirty(offset, TypeSize);
@@ -1743,7 +1721,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	}
 
 	if (out_state->hasRetVal) {
-		ParamStateType return_state = out_state->retVal;
+		ParamStateType return_state = out_state->retVal.get_state();
 		if (return_state == ParamStateType::NON_PMEM)
 			return;
 
@@ -1760,12 +1738,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				assert(false);
 			}
 
-			ob_state_t *object_state = map->lookup(DecompGEP.Base);
-
-			if (object_state == NULL) {
-				object_state = new ob_state_t();
-				(*map)[DecompGEP.Base] = object_state;
-			}
+			ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
 
 			if (return_state == ParamStateType::DIRTY_CAPTURED) {
 				// Approximate dirty
@@ -1806,11 +1779,7 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		i++;
 
 		Argument *Arg = &*it;
-		ob_state_t *object_state = map->lookup(Arg);
-		if (object_state == NULL) {
-			object_state = new ob_state_t();
-			(*map)[Arg] = object_state;
-		}
+		ob_state_t *object_state = getObjectState(map, Arg);
 
 		if (PS == ParamStateType::NON_PMEM) {
 			object_state->setNonPmem();
@@ -1912,8 +1881,8 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			ParamState &input_state = Context->getState(i);
 			if (input_state.isClean()) {
 				if (absState == ParamStateType::DIRTY_CAPTURED || absState == ParamStateType::DIRTY_ESCAPED) {
-					DirtyBytesInfo *info = Output->getOrCreateDirtyBtyesInfo(i);
-					object_state->computeDirtyBtyes(info);
+					DirtyBytesInfo *info = Output->getOrCreateDirtyBytesInfo(i);
+					object_state->computeDirtyBytes(info);
 				} // TODO: else if (CLWB_CAPTURED/CLWB_ESCAPED)
 			}
 		}
@@ -1948,11 +1917,11 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			}
 		}
 
-		Output->retVal = PS.get_state();
+		Output->retVal.setState(PS.get_state());
 	} else {
 		//errs() << "RetVal non PMEM\n";
 		Output->hasRetVal = true;
-		Output->retVal = ParamStateType::NON_PMEM;
+		Output->retVal.setState(ParamStateType::NON_PMEM);
 	}
 
 	// Free memory in temporarily allocated final_state object

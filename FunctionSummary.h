@@ -33,6 +33,33 @@ public:
 		state = s;
 	}
 
+	std::string print() {
+		switch (state) {
+			case ParamStateType::EMPTY_KEY:
+				return "EMPTY_KEY";
+			case ParamStateType::TOMBSTONE_KEY:
+				return "TOMBSTONE_KEY";
+			case ParamStateType::BOTTOM:
+				return "BOTTOM";
+			case ParamStateType::NON_PMEM:
+				return "NON_PMEM";
+			case ParamStateType::DIRTY_CAPTURED:
+				return "DIRTY_CAPTURED";
+			case ParamStateType::DIRTY_ESCAPED:
+				return "DIRTY_ESCAPED";
+			case ParamStateType::CLWB_CAPTURED:
+				return "CLWB_CAPTURED";
+			case ParamStateType::CLWB_ESCAPED:
+				return "CLWB_ESCAPED";
+			case ParamStateType::CLEAN_CAPTURED:
+				return "CLEAN_CAPTURED";
+			case ParamStateType::CLEAN_ESCAPED:
+				return "CLEAN_ESCAPED";
+			case ParamStateType::TOP:
+				return "TOP";
+		}
+	}
+
 	bool isDirty() {
 		return state == ParamStateType::DIRTY_CAPTURED || state == ParamStateType::DIRTY_ESCAPED;
 	}
@@ -63,7 +90,8 @@ public:
 					return true;
 				break;
 			case ParamStateType::DIRTY_ESCAPED:
-				if (other_state != ParamStateType::BOTTOM && other_state != ParamStateType::DIRTY_ESCAPED)
+				if (other_state != ParamStateType::BOTTOM &&
+					other_state != ParamStateType::DIRTY_ESCAPED)
 					return true;
 				break;
 			case ParamStateType::DIRTY_CAPTURED:
@@ -129,7 +157,7 @@ struct DirtyBytesInfo {
 		tmp_lst = NULL;
 	}
 
-	std::vector<std::pair<int, int>> * getDirtyBtyes() {
+	std::vector<std::pair<int, int>> * getDirtyBytes() {
 		return lst;
 	}
 
@@ -172,9 +200,9 @@ struct OutputState {
 	std::vector<DirtyBytesInfo *> *DirtyBytesList;
 
 	bool hasRetVal;
-	ParamStateType retVal;
+	ParamState retVal;
 
-	DirtyBytesInfo * getOrCreateDirtyBtyesInfo(unsigned i) {
+	DirtyBytesInfo * getOrCreateDirtyBytesInfo(unsigned i) {
 		if (DirtyBytesList == NULL)
 			DirtyBytesList = new std::vector<DirtyBytesInfo *>();
 
@@ -190,7 +218,7 @@ struct OutputState {
 		return info;
 	}
 
-	DirtyBytesInfo * getDirtyBtyesInfo(unsigned i) {
+	DirtyBytesInfo * getDirtyBytesInfo(unsigned i) {
 		return (*DirtyBytesList)[i];
 	}
 
@@ -205,12 +233,12 @@ struct OutputState {
 	void dump() {
 		errs() << "Abstract output state: ";
 		for (ParamState &I : AbstractOutputState) {
-			errs() << (int)I.get_state() << "\t";
+			errs() << I.print() << "\t";
 		}
 		errs() << "\n";
 
 		if (hasRetVal)
-			errs() << "Abstract return state: " << (int)retVal << "\n";
+			errs() << "Abstract return state: " << retVal.print() << "\n";
 
 		errs() << "\n";
 	}
@@ -251,7 +279,7 @@ struct CallingContext {
 
 		errs() << "Abstract input state:  ";
 		for (ParamState&I : AbstractInputState) {
-			errs() << (int)I.get_state() << "\t";
+			errs() << I.print() << "\t";
 		}
 		errs() << "\n";
 	}
@@ -296,6 +324,9 @@ public:
 		OutputState *state = ResultMap.lookup(Context->AbstractInputState);
 		if (state == NULL) {
 			state = new OutputState();
+			state->DirtyBytesList == NULL;
+			state->hasRetVal = false;
+			state->retVal.setState(ParamStateType::BOTTOM);
 			ResultMap[Context->AbstractInputState] = state;
 		}
 

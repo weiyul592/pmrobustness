@@ -423,7 +423,7 @@ public:
 		}
 	}
 
-	bool checkDirty() {
+	bool isDirty() {
 		BitVector tmp(dirty_bytes);
 		tmp ^= clwb_bytes;
 
@@ -433,7 +433,7 @@ public:
 		return false;
 	}
 
-	void computeDirtyBtyes(DirtyBytesInfo *info) {
+	void computeDirtyBytes(DirtyBytesInfo *info) {
 		//dump();
 
 		BitVector only_dirty_bytes(dirty_bytes);
@@ -463,8 +463,8 @@ public:
 		errs() << "bit vector size: " << size << "\n";
 		unsigned limit_size = size;
 		if (size != 0) {
-			if (size > 128)
-				limit_size = 128;
+//			if (size > 128)
+//				limit_size = 128;
 
 			for (unsigned i = 0; i < limit_size; i++) {
 				errs() << dirty_bytes[i];

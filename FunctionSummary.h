@@ -57,6 +57,8 @@ public:
 				return "CLEAN_ESCAPED";
 			case ParamStateType::TOP:
 				return "TOP";
+			default:
+				return "UNKNOWN";
 		}
 	}
 
@@ -69,12 +71,13 @@ public:
 	}
 
 	bool isClean() {
-		return state == ParamStateType::CLEAN_CAPTURED || state == ParamStateType::CLEAN_ESCAPED;
+		return state == ParamStateType::TOP ||
+			state == ParamStateType::CLEAN_CAPTURED || state == ParamStateType::CLEAN_ESCAPED;
 	}
 
 	bool isCaptured() {
-		return state == ParamStateType::DIRTY_CAPTURED || state == ParamStateType::CLWB_CAPTURED ||
-			state == ParamStateType::CLEAN_CAPTURED;
+		return state == ParamStateType::TOP || state == ParamStateType::DIRTY_CAPTURED ||
+			state == ParamStateType::CLWB_CAPTURED || state == ParamStateType::CLEAN_CAPTURED;
 	}
 
 	bool isEscaped() {
@@ -82,8 +85,19 @@ public:
 			state == ParamStateType::CLEAN_ESCAPED;
 	}
 
-	inline bool operator <(const ParamState& other) const {
-		ParamStateType other_state = other.get_state();
+	inline bool isLowerThan(const ParamState& other) const {
+		return isLowerThan(other.get_state());
+	}
+
+	// Check if `this` is strictly lower than `other` in lattice
+	// Caution: returning false could also mean that two states are uncomparable
+	inline bool isLowerThan(const ParamStateType other_state) const {
+		if (state == ParamStateType::EMPTY_KEY || state == ParamStateType::TOMBSTONE_KEY ||
+			state == ParamStateType::NON_PMEM || other_state == ParamStateType::EMPTY_KEY ||
+			other_state == ParamStateType::TOMBSTONE_KEY || other_state == ParamStateType::NON_PMEM) {
+			return false;
+		}
+
 		switch (state) {
 			case ParamStateType::BOTTOM:
 				if (other_state != ParamStateType::BOTTOM)
@@ -118,8 +132,6 @@ public:
 					return true;
 				break;
 			case ParamStateType::TOP:
-				if (other_state != ParamStateType::TOP)
-					return true;
 				break;
 			default:
 				break;
@@ -130,6 +142,10 @@ public:
 
 	inline bool operator ==(const ParamState& other) const {
 		return state == other.get_state();
+	}
+
+	inline bool operator !=(const ParamState& other) const {
+		return state != other.get_state();
 	}
 
 	private:
@@ -324,7 +340,7 @@ public:
 		OutputState *state = ResultMap.lookup(Context->AbstractInputState);
 		if (state == NULL) {
 			state = new OutputState();
-			state->DirtyBytesList == NULL;
+			state->DirtyBytesList = NULL;
 			state->hasRetVal = false;
 			state->retVal.setState(ParamStateType::BOTTOM);
 			ResultMap[Context->AbstractInputState] = state;

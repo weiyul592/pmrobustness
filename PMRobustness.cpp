@@ -1246,9 +1246,9 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 				if (ErrorSet->find(it->first) == ErrorSet->end()) {
 					ErrorSet->insert(it->first);
 
-					errs() << *it->first << "\n";
 					errs() << "Error!!!!!!! at return statement: ";
 					getPosition(I, IRB, true);
+					errs() << "@@ Instruction " << *it->first << "\n";
 				}
 			}
 		}
@@ -1267,11 +1267,12 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 					StmtErrorSet->insert(I);
 					if (writeToEscDirObj) {
-						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\t" << "Instruction " << *I << "\n";
+						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
 						errs() << "Error: More than two objects are escaped and dirty at: ";
 						getPosition(I, IRB, true);
+						errs() << "@@ Instruction " << *I << "\n";
 						if (hasTwoEscapedDirtyParams) {
-							errs() << "Two Parameters are already escaped dirty, this error has not be real\n";
+							errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 						}
 					}
 				}
@@ -1745,10 +1746,23 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					object_state->setDirty(offset, TypeSize);
 				}
 			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
-				// TODO: How to approximate dirty?
-				//assert(false);
+				// Approximate dirty
+				if (Context->getState(i).isClean()) {
+					// Note: We don't recapture escaped objects
+					// If input state is clean, then use DirtyBytesInfo to get dirty bytes
+					DirtyBytesInfo *info = out_state->getDirtyBytesInfo(i);
+					std::vector<std::pair<int, int>> *lst = info->getDirtyBytes();
+
+					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
+					for (unsigned i = 0; i < lst->size(); i++) {
+						std::pair<int, int> &elem = (*lst)[i];
+						object_state->setDirty(offset + elem.first, elem.second - elem.first);
+					}
+				} else {
+					object_state->setDirty(offset, TypeSize);
+				}
+
 				object_state->setEscape();
-				object_state->setDirty(offset, TypeSize);
 				writeToEscDirObj = true;
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
@@ -1786,7 +1800,8 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		} else {
 			unsigned TypeSize = getFieldSize(CB, DL);
 			if (TypeSize == (unsigned)-1) {
-				assert(false);
+				//assert(false);
+				return;
 			}
 
 			ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
@@ -1962,7 +1977,7 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 			if (RetState != NULL) {
 				ParamStateType tmp = RetState->checkState();
-				if (PS < tmp) {
+				if (PS.isLowerThan(tmp)) {
 					//errs() << (int)PS.get_state() << " < " << (int)tmp << "\n";
 					PS.setState(tmp);
 				}

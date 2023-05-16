@@ -302,8 +302,10 @@ public:
 		if (nonpmem)
 			return false;
 
-		if (start >= size && onlyFlushWrittenBytes) {
-			assert(false && "Clwb unknown bytes");
+		if (start > size && onlyFlushWrittenBytes) {
+			errs() << "FIXME: Clwb unknown bytes\n";
+			return false;
+			//assert(false && "Clwb unknown bytes");
 		}
 
 		unsigned end = start + len;
@@ -392,8 +394,12 @@ public:
 				return ParamStateType::TOP;
 		}
 
-		if (startByte >= size)
-			assert(false);
+		if (startByte >= size) {
+			errs() << "Checking state out of range\n";
+			errs() << "range: " << startByte << " - " << startByte + len << "; size: " << size << "\n";
+			return ParamStateType::TOP;
+			//assert(false);
+		}
 
 		if (endByte > size)
 			endByte = size;

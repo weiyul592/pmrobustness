@@ -1692,7 +1692,42 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			delete Context;
 		}
 
-		return;
+		out_state = FS->getLeastUpperResult(Context);
+
+		// No least upper context exists
+		if (out_state == NULL) {
+			// Mark all parameters as TOP (clean and captured)
+			unsigned i = 0;
+			for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
+				Value *op = *it;
+
+				if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
+					DecomposedGEP DecompGEP;
+					decomposeAddress(DecompGEP, op, DL);
+					unsigned offset = DecompGEP.getOffsets();
+
+					if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+						// TODO: What do we do here?
+					} else {
+						ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+						unsigned TypeSize = getFieldSize(op, DL);
+						//errs() << "TypeSize: " << TypeSize << "\n";
+						//errs() << *op << "\n";
+
+						if (TypeSize == (unsigned)-1)
+							object_state->setFlush(offset, TypeSize, true);
+						else
+							object_state->setFlush(offset, TypeSize, true);
+
+						object_state->setCaptured();
+					}
+				} // Else case: op is NON_PMEM, so don't do anything
+
+				i++;
+			}
+
+			return;
+		}
 	}
 
 	//errs() << "Function cache found\n";

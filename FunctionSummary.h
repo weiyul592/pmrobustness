@@ -306,6 +306,21 @@ hash_code hash_value(const ParamState &value) {
 		static_cast<uint64_t>(value.get_state()));
 }
 
+// lhs >= rhs ?
+bool isStateVectorHigherOrEqual(SmallVector<ParamState, 8> &lhs, SmallVector<ParamState, 8> &rhs) {
+	assert(lhs.size() == rhs.size());
+
+	for (unsigned i = 0; i < lhs.size(); i++) {
+		if (rhs[i].isLowerThan(lhs[i]) != true &&
+			lhs[i] != rhs[i]) {
+
+			return false;
+		}
+	}
+
+	return true;
+}
+
 class FunctionSummary {
 public:
 	struct SummaryDenseMapInfo;
@@ -347,6 +362,33 @@ public:
 		}
 
 		return state;
+	}
+
+	OutputState * getLeastUpperResult(CallingContext *Context) {
+		SmallVector<ParamState, 8> *leastUpperContext = NULL;
+		for (result_map_t::iterator it = ResultMap.begin(); it != ResultMap.end(); it++) {
+			SmallVector<ParamState, 8> *cur = &it->first;
+			if (isStateVectorHigherOrEqual(*cur, Context->AbstractInputState)) {
+				if (leastUpperContext == NULL)
+					leastUpperContext = cur;
+				else if (isStateVectorHigherOrEqual(*leastUpperContext, *cur))
+					leastUpperContext = cur;
+				// TODO: Multiple higher contexts
+			}
+		}
+
+		if (leastUpperContext == NULL)
+			return NULL;
+
+/*
+		errs() << "Using least upper context: \n";
+		errs() << "Abstract input state: ";
+		for (ParamState& I : *leastUpperContext) {
+			errs() << I.print() << "\t";
+		}
+		errs() << "\n";
+*/
+		return ResultMap.lookup(*leastUpperContext);
 	}
 
 	result_map_t * getResultMap() {

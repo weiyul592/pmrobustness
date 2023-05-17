@@ -217,6 +217,7 @@ struct OutputState {
 
 	bool hasRetVal;
 	ParamState retVal;
+	bool marksEscDirObj;	// Whether this function ever marks anything as escaped and dirty
 
 	DirtyBytesInfo * getOrCreateDirtyBytesInfo(unsigned i) {
 		if (DirtyBytesList == NULL)
@@ -358,6 +359,7 @@ public:
 			state->DirtyBytesList = NULL;
 			state->hasRetVal = false;
 			state->retVal.setState(ParamStateType::BOTTOM);
+			state->marksEscDirObj = false;
 			ResultMap[Context->AbstractInputState] = state;
 		}
 

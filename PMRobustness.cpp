@@ -165,7 +165,8 @@ namespace {
 		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
 		DenseSet<const Instruction *> * StmtErrorSet;
 		bool hasTwoEscapedDirtyParams;
-		bool writeToEscDirObj;
+		bool InstructionMarksEscDirObj;
+		bool FunctionMarksEscDirObj;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -320,6 +321,8 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		StmtErrorSet = new DenseSet<const Instruction *>();
 		FunctionStmtErrorSets[&F] = StmtErrorSet;
 	}
+
+	FunctionMarksEscDirObj = false;
 
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
@@ -584,7 +587,7 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 }
 
 void PMRobustness::processInstruction(state_t * map, Instruction * I) {
-	writeToEscDirObj = false;
+	InstructionMarksEscDirObj = false;
 	bool updated = false;
 	bool check_error = false;
 
@@ -643,6 +646,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	}
 
 	if (updated && check_error) {
+		// TODO: report bugs when a function marks an object as escaped, dirty
 		checkEscapedObjError(map, I);
 	}
 /*
@@ -755,7 +759,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 		// For reporting in-function error
 		if (object_state->isEscaped()) {
-			writeToEscDirObj = true;
+			InstructionMarksEscDirObj = true;
+			FunctionMarksEscDirObj = true;
 		}
 
 		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
@@ -786,7 +791,8 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 				// For reporting in-function error
 				if (changed_to_escaped && object_state->isDirty()) {
-					writeToEscDirObj = true;
+					InstructionMarksEscDirObj = true;
+					FunctionMarksEscDirObj = true;
 				}
 			}
 		}
@@ -835,7 +841,8 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 
 			// For reporting in-function error
 			if (object_state->isEscaped()) {
-				writeToEscDirObj = true;
+				InstructionMarksEscDirObj = true;
+				FunctionMarksEscDirObj = true;
 			}
 		}
 
@@ -858,7 +865,8 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 
 			// For reporting in-function error
 			if (changed_to_escaped && object_state->isDirty()) {
-				writeToEscDirObj = true;
+				InstructionMarksEscDirObj = true;
+				FunctionMarksEscDirObj = true;
 			}
 		}
 	}
@@ -1064,11 +1072,6 @@ void PMRobustness::processCalls(state_t *map, Instruction *I) {
 
 	CallingContext *context = computeContext(map, I);
 	lookupFunctionResult(map, CB, context);
-
-	// TODO: For reporting in-function error
-	//if (function writes to an escaped object) {
-	//	writeToEscDirObj = true;
-	//}
 }
 
 void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
@@ -1266,7 +1269,7 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 			if (has_escaped_dirty_objs) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 					StmtErrorSet->insert(I);
-					if (writeToEscDirObj) {
+					if (InstructionMarksEscDirObj) {
 						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
 						errs() << "Error: More than two objects are escaped and dirty at: ";
 						getPosition(I, IRB, true);
@@ -1798,7 +1801,6 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				}
 
 				object_state->setEscape();
-				writeToEscDirObj = true;
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
@@ -1849,7 +1851,6 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				//assert(false);
 				object_state->setEscape();
 				object_state->setDirty(offset, TypeSize);
-				writeToEscDirObj = true;
 			} else if (return_state == ParamStateType::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (return_state == ParamStateType::CLWB_ESCAPED) {
@@ -1867,6 +1868,12 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				assert(false && "other cases");
 			}
 		}
+	}
+
+	// For reporting in-function error
+	if (out_state->marksEscDirObj) {
+		InstructionMarksEscDirObj = true;
+		FunctionMarksEscDirObj = true;
 	}
 }
 
@@ -2024,6 +2031,10 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 		//errs() << "RetVal non PMEM\n";
 		Output->hasRetVal = true;
 		Output->retVal.setState(ParamStateType::NON_PMEM);
+	}
+
+	if (FunctionMarksEscDirObj) {
+		Output->marksEscDirObj = true;
 	}
 
 	// Free memory in temporarily allocated final_state object

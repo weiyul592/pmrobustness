@@ -86,6 +86,7 @@ namespace {
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
+		bool processPHI(state_t * map, Instruction * I);
 		void processFlushWrapperFunction(state_t * map, Instruction * I);
 		void processNTSWrapperFunction(state_t * map, Instruction * I);
 		void processDeleteFunction(state_t * map, Instruction * I);
@@ -112,6 +113,7 @@ namespace {
 		NVMOP analyzeFlushType(Function &F);
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
+		bool ignoreFunction(Instruction *I);
 		bool isNTSWrapperFunction(Instruction *I);
 		bool isDeleteFunction(Instruction *I);
 
@@ -604,6 +606,8 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	} else if (isa<StoreInst>(I)) {
 		updated |= processStore(map, I);
 		check_error = true;
+	} else if (isa<PHINode>(I)) {
+		updated |= processPHI(map, I);
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		/* TODO: identify primitive functions that allocate memory
 		CallBase *CallSite = cast<CallBase>(I);
@@ -621,6 +625,8 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		} else if (isa<MemIntrinsic>(I)) {
 			updated |= processMemIntrinsic(map, I);
 			check_error = true;
+		} else if (ignoreFunction(I)) {
+			return;
 		} else if (isFlushWrapperFunction(I)) {
 			updated |= true;
 			processFlushWrapperFunction(map, I);
@@ -868,6 +874,46 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			if (changed_to_escaped && object_state->isDirty()) {
 				InstructionMarksEscDirObj = true;
 				FunctionMarksEscDirObj = true;
+			}
+		}
+	}
+
+	return updated;
+}
+
+bool PMRobustness::processPHI(state_t * map, Instruction * I) {
+	bool updated = false;
+	IRBuilder<> IRB(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+
+	if (!I->getType()->isPointerTy())
+		return false;
+
+	ob_state_t *phi_state = NULL;
+	bool first_state = true;
+	for (User::op_iterator it = I->op_begin(); it != I->op_end(); it++) {
+		Value *V = *it;
+
+		DecomposedGEP DecompGEP;
+		decomposeAddress(DecompGEP, V, DL);
+		unsigned offset = DecompGEP.getOffsets();
+
+		if (DecompGEP.isArray) {
+			continue;
+		} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+			continue;
+		} else {
+			ob_state_t *object_state = map->lookup(DecompGEP.Base);
+			if (object_state == NULL)
+				continue;
+
+			if (first_state) {
+				phi_state = getObjectState(map, I);
+				phi_state->copyFrom(object_state);
+				first_state = false;
+			} else {
+				// FIXME: only need to merge some field, not the entire object
+				phi_state->mergeFrom(object_state);
 			}
 		}
 	}
@@ -1388,6 +1434,17 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("myflush"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+bool PMRobustness::ignoreFunction(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if (callee->hasFnAttribute("ignore"))
 				return true;
 		}
 	}

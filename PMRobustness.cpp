@@ -165,8 +165,11 @@ namespace {
 		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
 		DenseSet<const Instruction *> * StmtErrorSet;
 		bool hasTwoEscapedDirtyParams;
-		bool InstructionMarksEscDirObj;	// Instruction: this instruction
+		bool InstructionMarksEscDirObj;	// Instruction: current instruction
 		bool FunctionMarksEscDirObj;	// Function: this function
+
+		// Call: this call instruction marks any object as dirty and escaped when non parameters are dirty and escaped;
+		bool CallMarksEscDirObj;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -590,6 +593,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	InstructionMarksEscDirObj = false;
 	bool updated = false;
 	bool check_error = false;
+	CallMarksEscDirObj = false;
 
 	if (I->isAtomic()) {
 		updated |= processAtomic(map, I);
@@ -1272,7 +1276,7 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 		ob_state_t *object_state = it->second;
 		if (object_state->isEscaped() && object_state->isDirty()) {
 			// There is already one or more escaped dirty objects
-			if (has_escaped_dirty_objs) {
+			if (has_escaped_dirty_objs || CallMarksEscDirObj) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 					if (InstructionMarksEscDirObj) {
 						StmtErrorSet->insert(I);
@@ -1646,6 +1650,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 	const DataLayout &DL = CB->getModule()->getDataLayout();
+	bool use_higher_results = false;
 
 	//errs() << "lookup results for function: " << F->getName() << "\n";
 	// Function has not been analyzed before
@@ -1707,6 +1712,8 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 		// No least upper context exists
 		if (out_state == NULL) {
+			use_higher_results = true;
+
 			// Mark all parameters as TOP (clean and captured)
 			unsigned i = 0;
 			for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
@@ -1885,6 +1892,10 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		InstructionMarksEscDirObj = true;
 		FunctionMarksEscDirObj = true;
 	}
+
+	if (!use_higher_results && out_state->marksEscDirObjConditional) {
+		CallMarksEscDirObj = true;
+	}
 }
 
 // Get initial states of parameters from Context
@@ -2046,6 +2057,20 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 	if (FunctionMarksEscDirObj) {
 		Output->marksEscDirObj = true;
+
+		// all parameters are not dirty escaped
+		bool non_dirty_escaped = true;
+		for (unsigned i = 0; i < Context->AbstractInputState.size(); i++) {
+			ParamState &state = Context->getState(i);
+			if (state.isDirtyEscaped()) {
+				non_dirty_escaped = false;
+				break;
+			}
+		}
+
+		if (non_dirty_escaped) {
+			Output->marksEscDirObjConditional = true;
+		}
 	}
 
 	// Free memory in temporarily allocated final_state object

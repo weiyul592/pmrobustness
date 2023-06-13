@@ -85,6 +85,14 @@ public:
 			state == ParamStateType::CLEAN_ESCAPED;
 	}
 
+	bool isDirtyEscaped() {
+		return state == ParamStateType::DIRTY_ESCAPED;
+	}
+
+	bool isNonPmem() {
+		return state == ParamStateType::NON_PMEM;
+	}
+
 	inline bool isLowerThan(const ParamState& other) const {
 		return isLowerThan(other.get_state());
 	}
@@ -217,7 +225,12 @@ struct OutputState {
 
 	bool hasRetVal;
 	ParamState retVal;
-	bool marksEscDirObj;	// Whether this function ever marks anything as escaped and dirty
+
+	// Whether this function ever marks anything as escaped and dirty
+	bool marksEscDirObj;
+
+	// Whether this function ever marks anything as escaped and dirty, when all parameters are captured, clean, or non_pmem
+	bool marksEscDirObjConditional;
 
 	DirtyBytesInfo * getOrCreateDirtyBytesInfo(unsigned i) {
 		if (DirtyBytesList == NULL)
@@ -360,6 +373,7 @@ public:
 			state->hasRetVal = false;
 			state->retVal.setState(ParamStateType::BOTTOM);
 			state->marksEscDirObj = false;
+			state->marksEscDirObjConditional = false;
 			ResultMap[Context->AbstractInputState] = state;
 		}
 

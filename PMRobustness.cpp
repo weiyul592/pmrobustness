@@ -721,10 +721,6 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		return false;
 	}
 
-	// Rule 1: x.f = v => x.f becomes dirty
-	if (!isPMAddr(Addr, DL))
-		return false;
-
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
@@ -753,20 +749,22 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		I->getParent()->dump();
 		*/
 	} else {
-		unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-		ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
-		updated |= object_state->setDirty(offset, TypeSize);
+		// Rule 1: x.f = v => x.f becomes dirty
+		if (isPMAddr(Addr, DL)) {
+			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+			ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
+			updated |= object_state->setDirty(offset, TypeSize);
 
-		// For reporting in-function error
-		if (object_state->isEscaped()) {
-			InstructionMarksEscDirObj = true;
-			FunctionMarksEscDirObj = true;
+			// For reporting in-function error
+			if (object_state->isEscaped()) {
+				InstructionMarksEscDirObj = true;
+				FunctionMarksEscDirObj = true;
+			}
 		}
 
-		// Rule 2.1: *x = p (where x is a heap address) => all fields of p escapes
+		// Rule 2.1: *x = p => all fields of p escapes
 		// TODO: Val(i.e. p) should be PM Addr
-		if (Val && Val->getType()->isPointerTy() &&
-			mayInHeap(DecompGEP.Base)) {
+		if (Val && Val->getType()->isPointerTy() && isPMAddr(Val, DL)) {
 			DecomposedGEP ValDecompGEP;
 			decomposeAddress(ValDecompGEP, Val, DL);
 			unsigned offset = ValDecompGEP.getOffsets();
@@ -815,9 +813,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		return false;
 	}
 
-	if (!isPMAddr(Addr, DL))
-		return false;
-
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
 	unsigned offset = DecompGEP.getOffsets();
@@ -832,22 +827,24 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
-		if (I->isAtomic() && isa<LoadInst>(I)) {
-			// Mark the address as dirty to detect interthread robustness violation
-			// For Atomic RMW, this is already done in processStore
-			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
-			ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
-			updated |= object_state->setDirty(offset, TypeSize);
+		if (isPMAddr(Addr, DL)) {
+			if (I->isAtomic() && isa<LoadInst>(I)) {
+				// Mark the address as dirty to detect interthread robustness violation
+				// For Atomic RMW, this is already done in processStore
+				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+				ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
+				updated |= object_state->setDirty(offset, TypeSize);
 
-			// For reporting in-function error
-			if (object_state->isEscaped()) {
-				InstructionMarksEscDirObj = true;
-				FunctionMarksEscDirObj = true;
+				// For reporting in-function error
+				if (object_state->isEscaped()) {
+					InstructionMarksEscDirObj = true;
+					FunctionMarksEscDirObj = true;
+				}
 			}
 		}
 
-		// Rule 2.2: p = *x (where x is a heap address) => p escapes
-		if (I->getType()->isPointerTy() && mayInHeap(DecompGEP.Base)) {
+		// Rule 2.2: p = *x => p escapes
+		if (I->getType()->isPointerTy() && isPMAddr(I, DL)) {
 			DecomposedGEP LIDecompGEP;
 			decomposeAddress(LIDecompGEP, I, DL);
 			unsigned offset = LIDecompGEP.getOffsets();
@@ -1163,6 +1160,7 @@ bool PMRobustness::isPMAddr(const Value * Addr, const DataLayout &DL) {
 /** Simple may-analysis for checking if an address is in the heap
  *  TODO: may need more sophisticated checks
  **/
+ /*
 bool PMRobustness::mayInHeap(const Value * Addr) {
 	if (GetElementPtrInst * GEP = dyn_cast<GetElementPtrInst>((Value *)Addr)) {
 		Value * BaseAddr = GEP->getPointerOperand();
@@ -1186,7 +1184,7 @@ bool PMRobustness::mayInHeap(const Value * Addr) {
 
 	// Address may be in the heap. We don't know for sure.
 	return true;
-}
+}*/
 
 ob_state_t * PMRobustness::getObjectState(state_t *map, const Value *Addr, bool &updated) {
 	ob_state_t *object_state = map->lookup(Addr);

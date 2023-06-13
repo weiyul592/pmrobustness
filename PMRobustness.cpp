@@ -1852,7 +1852,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 						std::pair<int, int> &elem = (*lst)[i];
 						object_state->setDirty(offset + elem.first, elem.second - elem.first);
 					}
-				} else {
+				} else if (!out_state->isUntouched(i)) {
 					object_state->setDirty(offset, TypeSize);
 				}
 			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
@@ -1868,7 +1868,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 						std::pair<int, int> &elem = (*lst)[i];
 						object_state->setDirty(offset + elem.first, elem.second - elem.first);
 					}
-				} else {
+				} else if (!out_state->isUntouched(i)) {
 					object_state->setDirty(offset, TypeSize);
 				}
 
@@ -2127,6 +2127,17 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 		if (non_dirty_escaped) {
 			Output->marksEscDirObjConditional = true;
+		}
+	}
+
+	if (!Output->checkUntouched) {
+		unsigned i = 0;
+		for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
+			Argument *Arg = &*it;
+			if (Arg->getNumUses() == 0)
+				Output->setUntouched(i);
+
+			i++;
 		}
 	}
 

@@ -223,6 +223,9 @@ struct OutputState {
 	// Because when the input state is dirty, all bytes are approximated as dirty.
 	std::vector<DirtyBytesInfo *> *DirtyBytesList;
 
+	// true if a parameter has no uses
+	std::vector<bool> UntouchedParamList;
+
 	bool hasRetVal;
 	ParamState retVal;
 
@@ -231,6 +234,7 @@ struct OutputState {
 
 	// Whether this function ever marks anything as escaped and dirty, when all parameters are captured, clean, or non_pmem
 	bool marksEscDirObjConditional;
+	bool checkUntouched;
 
 	DirtyBytesInfo * getOrCreateDirtyBytesInfo(unsigned i) {
 		if (DirtyBytesList == NULL)
@@ -258,6 +262,19 @@ struct OutputState {
 
 	ParamState& getState(unsigned i) {
 		return AbstractOutputState[i];
+	}
+
+	bool isUntouched(unsigned i) {
+		if (UntouchedParamList.size() <= i)
+			return false;
+
+		return UntouchedParamList[i];
+	}
+
+	void setUntouched(unsigned i) {
+		if (UntouchedParamList.size() <= i)
+			UntouchedParamList.resize(i+1);
+		UntouchedParamList[i] = true;
 	}
 
 	void dump() {
@@ -374,6 +391,7 @@ public:
 			state->retVal.setState(ParamStateType::BOTTOM);
 			state->marksEscDirObj = false;
 			state->marksEscDirObjConditional = false;
+			state->checkUntouched = false;
 			ResultMap[Context->AbstractInputState] = state;
 		}
 

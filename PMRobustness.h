@@ -470,16 +470,18 @@ public:
 		unsigned limit_size = size;
 		if (size != 0) {
 //			if (size > 128)
-//				limit_size = 128;
+//				limit_size = 128;	// Maybe only print a few bytes when the object is large
 
-			for (unsigned i = 0; i < limit_size; i++) {
-				errs() << dirty_bytes[i];
+			if (dirty_bytes.any()) {
+				for (unsigned i = 0; i < limit_size; i++) {
+					errs() << dirty_bytes[i];
+				}
+				errs() << "\n";
+				for (unsigned i = 0; i < limit_size; i++) {
+					errs() << clwb_bytes[i];
+				}
+				errs() << "\n";
 			}
-			errs() << "\n";
-			for (unsigned i = 0; i < limit_size; i++) {
-				errs() << clwb_bytes[i];
-			}
-			errs() << "\n";
 		}
 
 		if (escaped)
@@ -509,7 +511,7 @@ void printDecomposedGEP(DecomposedGEP &Decom) {
 	}*/
 }
 
-static inline Value *getPosition(Instruction * I, IRBuilder <> IRB, bool print = false)
+static inline Value *getPosition(const Instruction * I, IRBuilder <> IRB, bool print = false)
 {
 	const DebugLoc & debug_location = I->getDebugLoc ();
 	std::string position_string;
@@ -517,6 +519,12 @@ static inline Value *getPosition(Instruction * I, IRBuilder <> IRB, bool print =
 		llvm::raw_string_ostream position_stream (position_string);
 		debug_location . print (position_stream);
 	}
+
+	// Phi instructions do not have positions
+	if (position_string == "")
+		return NULL;
+
+	// TODO: some instructions have position:0
 
 	if (print) {
 		errs() << position_string << "\n";

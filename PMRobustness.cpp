@@ -165,8 +165,8 @@ namespace {
 		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
 		DenseSet<const Instruction *> * StmtErrorSet;
 		bool hasTwoEscapedDirtyParams;
-		bool InstructionMarksEscDirObj;
-		bool FunctionMarksEscDirObj;
+		bool InstructionMarksEscDirObj;	// Instruction: this instruction
+		bool FunctionMarksEscDirObj;	// Function: this function
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -228,7 +228,7 @@ bool PMRobustness::runOnModule(Module &M) {
 			UniqueFunctionSet.insert(std::make_pair(&F, Context));
 		} else {
 			// F.isDeclaration
-			errs() << F.getName() << " isDeclaration ignored in Module " << M.getName() << "\n";
+			//errs() << F.getName() << " isDeclaration ignored in Module " << M.getName() << "\n";
 
  #ifdef PMROBUST_DEBUG
 			errs() << "{" << F.empty() << "," << !F.isMaterializable() << "}\n";
@@ -1182,11 +1182,7 @@ bool PMRobustness::mayInHeap(const Value * Addr) {
 
 	// TODO: if pointer comes from function parameters; check the caller
 	// Attach metadata to each uses of function parameters
-	/*
-	if (I->getMetadata(FUNC_PARAM_USE)) {
-		
-	}
-	*/
+	//if (I->getMetadata(FUNC_PARAM_USE)) {}
 
 	// Address may be in the heap. We don't know for sure.
 	return true;
@@ -1250,8 +1246,20 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 					ErrorSet->insert(it->first);
 
 					errs() << "Error!!!!!!! at return statement: ";
-					getPosition(I, IRB, true);
+					Value *pos = NULL;
+					if (isa<Instruction>(it->first) && !isa<PHINode>(it->first)) {
+						const Instruction *inst = cast<Instruction>(it->first);
+						pos = getPosition(inst, IRB, true);
+
+						if (pos == NULL)
+							getPosition(I, IRB, true);
+					} else {
+						getPosition(I, IRB, true);
+					}
+
 					errs() << "@@ Instruction " << *it->first << "\n";
+					F.dump();
+					CurrentContext->dump();
 				}
 			}
 		}
@@ -1268,8 +1276,8 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 			// There is already one or more escaped dirty objects
 			if (has_escaped_dirty_objs) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
-					StmtErrorSet->insert(I);
 					if (InstructionMarksEscDirObj) {
+						StmtErrorSet->insert(I);
 						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
 						errs() << "Error: More than two objects are escaped and dirty at: ";
 						getPosition(I, IRB, true);
@@ -1277,6 +1285,8 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 						if (hasTwoEscapedDirtyParams) {
 							errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 						}
+						I->getFunction()->dump();
+						CurrentContext->dump();
 					}
 				}
 
@@ -1284,8 +1294,7 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 			}
 
 			has_escaped_dirty_objs = true;
-
-			// check if two fields in an object is dirty
+			// TODO: check if two fields in an object is dirty
 		}
 	}
 }
@@ -1384,6 +1393,7 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	return false;
 }
 
+/*
 // Non-temporal store
 bool PMRobustness::isNTSWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
@@ -1406,7 +1416,7 @@ bool PMRobustness::isDeleteFunction(Instruction *I) {
 	}
 
 	return false;
-}
+}*/
 
 addr_set_t * PMRobustness::getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B) {
 	DenseMap<BasicBlock *, addr_set_t *> * ArraySets = UnflushedArrays[F];
@@ -1837,6 +1847,8 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		} else {
 			unsigned TypeSize = getFieldSize(CB, DL);
 			if (TypeSize == (unsigned)-1) {
+				errs() << "CB " << *CB << " has field size -1; so it is a function type\n";
+				//errs() << *CB->getFunction() << "\n";
 				//assert(false);
 				return;
 			}
@@ -2018,10 +2030,11 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			ob_state_t *RetState = s->lookup(Ret);
 
 			if (RetState != NULL) {
-				ParamStateType tmp = RetState->checkState();
-				if (PS.isLowerThan(tmp)) {
-					//errs() << (int)PS.get_state() << " < " << (int)tmp << "\n";
-					PS.setState(tmp);
+				ParamStateType tmp_state = RetState->checkState();
+				ParamState tmp = ParamState(tmp_state);
+				if (tmp.isLowerThan(PS)) {
+					//errs() << tmp.print() << " < " << PS.print() << "\n";
+					PS.setState(tmp_state);
 				}
 			}
 		}

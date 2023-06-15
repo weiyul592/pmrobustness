@@ -88,6 +88,7 @@ namespace {
 		bool processStore(state_t * map, Instruction * I);
 		bool processPHI(state_t * map, Instruction * I);
 		void processFlushWrapperFunction(state_t * map, Instruction * I);
+		void processFlushParameterFunction(state_t * map, Instruction * I);
 		void processNTSWrapperFunction(state_t * map, Instruction * I);
 		void processDeleteFunction(state_t * map, Instruction * I);
 		void processCalls(state_t *map, Instruction *I);
@@ -113,6 +114,7 @@ namespace {
 		NVMOP analyzeFlushType(Function &F);
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
+		bool isFlushParameterFunction(Instruction *I);
 		bool ignoreFunction(Instruction *I);
 		bool isNTSWrapperFunction(Instruction *I);
 		bool isDeleteFunction(Instruction *I);
@@ -630,6 +632,9 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		} else if (isFlushWrapperFunction(I)) {
 			updated |= true;
 			processFlushWrapperFunction(map, I);
+		} else if (isFlushParameterFunction(I)) {
+			updated |= true;
+			processFlushParameterFunction(map, I);
 		} /*else if (isNTSWrapperFunction(I)) {
 			//updated |= true;
 			//processNTSWrapperFunction(map, I);
@@ -995,6 +1000,69 @@ void PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		}
 	}
 }
+
+void PMRobustness::processFlushParameterFunction(state_t * map, Instruction * I) {
+	CallBase *callInst = cast<CallBase>(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	Function *callee = callInst->getCalledFunction();
+	assert(callee);
+
+	std::vector<StringRef> annotations;
+	getAnnotatedParamaters("flush_parameter", annotations, callee);
+
+	Value *Addr = NULL;
+	for (unsigned i = 0; i < annotations.size(); i++) {
+		StringRef &token = annotations[i];
+		if (token == "addr") {
+			Addr = callInst->getArgOperand(i);
+		} else if (token == "ignore") {
+			// Ignore
+		} else {
+			assert(false && "bad annotation");
+		}
+	}
+
+	NVMOP FlushOp = NVM_UNKNOWN;
+	if (callee->hasFnAttribute("flush_type")) {
+		StringRef flushtype = callee->getFnAttribute("flush_type").getValueAsString();
+		FlushOp = whichNVMoperation(flushtype);
+	} else {
+		FlushOp = analyzeFlushType(*callee);
+	}
+	assert(FlushOp == NVM_CLWB || FlushOp == NVM_CLFLUSH);
+
+/*
+	errs() << "flush wrapper " << *Addr << "\n";
+	IRBuilder<> IRB(I);
+	getPosition(I, IRB, true);
+	I->getFunction()->dump();
+*/
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		assert(false);
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		// TODO: treat it the same way as array
+	} else {
+		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		ob_state_t *object_state = map->lookup(DecompGEP.Base);
+		if (object_state == NULL) {
+			// TODO: to be solve in interprocedural analysis
+			// public method calls can modify the state of objects e.g. masstress.cpp:320
+			errs() << "Flush an unknown address\n";
+			//assert(false && "Flush an unknown address");
+		} else {
+			unsigned size = object_state->getSize();
+			if (FlushOp == NVM_CLFLUSH)
+				object_state->setFlush(offset, size, true);
+			else if (FlushOp == NVM_CLWB)
+				object_state->setClwb(offset, size, true);
+		}
+	}
+}
+
 
 // Not using this function for now
 void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
@@ -1403,7 +1471,14 @@ NVMOP PMRobustness::whichNVMoperation(StringRef flushtype) {
 NVMOP PMRobustness::analyzeFlushType(Function &F) {
 	NVMOP op = NVM_UNKNOWN;
 	for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
-		op = whichNVMoperation(&*I);
+		if (isFlushWrapperFunction(&*I)) {
+			CallBase *callInst = cast<CallBase>(&*I);
+			Function *callee = callInst->getCalledFunction();
+			op = analyzeFlushType(*callee);
+		} else {
+			op = whichNVMoperation(&*I);
+		}
+
 		if (op == NVM_CLWB) {
 			F.addFnAttr("flush_type", "clflushopt");
 			break;
@@ -1434,6 +1509,17 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("myflush"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+bool PMRobustness::isFlushParameterFunction(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if (callee->hasFnAttribute("flush_parameter"))
 				return true;
 		}
 	}

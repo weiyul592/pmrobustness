@@ -128,6 +128,8 @@ namespace {
 		void computeInitialState(state_t *map, Function &F, CallingContext *Context);
 		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
 
+		void modifyReturnState(state_t *map, CallBase *CB, OutputState *out_state);
+
 		const Value * GetLinearExpression(
 			const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
 			unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
@@ -660,7 +662,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		}
 	}
 
-	if (updated && check_error) {
+	if (check_error) {
 		// TODO: report bugs when a function marks an object as escaped, dirty
 		checkEscapedObjError(map, I);
 	}
@@ -1255,8 +1257,12 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 bool PMRobustness::skipFunction(Function &F) {
-	if (F.hasFnAttribute("myflush") || F.hasFnAttribute("ignore")) {
-		return true;
+	std::vector<StringRef> nameList = { "myflush", "flush_parameter", "ignore", "suppress" };
+	for (StringRef &s : nameList) {
+		if (F.hasFnAttribute(s)) {
+			errs() << "Function " << F.getName() << " is ignored\n";
+			return true;
+		}
 	}
 
 	return false;
@@ -1530,7 +1536,7 @@ bool PMRobustness::isFlushParameterFunction(Instruction *I) {
 bool PMRobustness::ignoreFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
-			if (callee->hasFnAttribute("ignore"))
+			if (callee->hasFnAttribute("ignore") || callee->hasFnAttribute("suppress"))
 				return true;
 		}
 	}
@@ -1841,7 +1847,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 	OutputState *out_state = FS->getResult(Context);
 	// Function has not been analyzed with the context
-	// TODO: If there is a context higher than the current context, use the alternative results
+	// TODO: If there are multiple contexts higher than the current context, use merged results
 	if (out_state == NULL) {
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
@@ -1980,56 +1986,6 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		i++;
 	}
 
-	if (out_state->hasRetVal) {
-		ParamStateType return_state = out_state->retVal.get_state();
-		if (return_state == ParamStateType::NON_PMEM)
-			return;
-
-		DecomposedGEP DecompGEP;
-		decomposeAddress(DecompGEP, CB, DL);
-		unsigned offset = DecompGEP.getOffsets();
-
-		if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
-			// TODO: We have information about arrays escaping or not.
-			// Dirty array slots are stored in UnflushedArrays
-		} else {
-			unsigned TypeSize = getFieldSize(CB, DL);
-			if (TypeSize == (unsigned)-1) {
-				errs() << "CB " << *CB << " has field size -1; so it is a function type\n";
-				//errs() << *CB->getFunction() << "\n";
-				//assert(false);
-				return;
-			}
-
-			ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
-
-			if (return_state == ParamStateType::DIRTY_CAPTURED) {
-				// Approximate dirty
-				object_state->setDirty(offset, TypeSize);
-			} else if (return_state == ParamStateType::DIRTY_ESCAPED) {
-				// TODO: How to approximate dirty?
-				//assert(false);
-				object_state->setEscape();
-				object_state->setDirty(offset, TypeSize);
-			} else if (return_state == ParamStateType::CLWB_CAPTURED) {
-				object_state->setClwb(offset, TypeSize);
-			} else if (return_state == ParamStateType::CLWB_ESCAPED) {
-				object_state->setClwb(offset, TypeSize);
-				object_state->setEscape();
-			} else if (return_state == ParamStateType::CLEAN_CAPTURED) {
-				object_state->setFlush(offset, TypeSize);
-			} else if (return_state == ParamStateType::CLEAN_ESCAPED) {
-				object_state->setFlush(offset, TypeSize);
-				object_state->setEscape();
-			} else if (return_state == ParamStateType::TOP) {
-				object_state->setFlush(offset, TypeSize);
-				object_state->setCaptured();
-			} else {
-				assert(false && "other cases");
-			}
-		}
-	}
-
 	// For reporting in-function error
 	if (out_state->marksEscDirObj) {
 		InstructionMarksEscDirObj = true;
@@ -2038,6 +1994,10 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 	if (!use_higher_results && out_state->marksEscDirObjConditional) {
 		CallMarksEscDirObj = true;
+	}
+
+	if (out_state->hasRetVal) {
+		modifyReturnState(map, CB, out_state);
 	}
 }
 
@@ -2235,6 +2195,57 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	checkEndError(AbsState, F);
 
 	return updated;
+}
+
+void PMRobustness::modifyReturnState(state_t *map, CallBase *CB, OutputState *out_state) {
+	const DataLayout &DL = CB->getModule()->getDataLayout();
+	ParamStateType return_state = out_state->retVal.get_state();
+	if (return_state == ParamStateType::NON_PMEM)
+		return;
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, CB, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		// TODO: We have information about arrays escaping or not.
+		// Dirty array slots are stored in UnflushedArrays
+	} else {
+		unsigned TypeSize = getFieldSize(CB, DL);
+		if (TypeSize == (unsigned)-1) {
+			errs() << "CB " << *CB << " has field size -1; so it is a function type\n";
+			//errs() << *CB->getFunction() << "\n";
+			//assert(false);
+			return;
+		}
+
+		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+
+		if (return_state == ParamStateType::DIRTY_CAPTURED) {
+			// Approximate dirty
+			object_state->setDirty(offset, TypeSize);
+		} else if (return_state == ParamStateType::DIRTY_ESCAPED) {
+			// TODO: How to approximate dirty?
+			//assert(false);
+			object_state->setEscape();
+			object_state->setDirty(offset, TypeSize);
+		} else if (return_state == ParamStateType::CLWB_CAPTURED) {
+			object_state->setClwb(offset, TypeSize);
+		} else if (return_state == ParamStateType::CLWB_ESCAPED) {
+			object_state->setClwb(offset, TypeSize);
+			object_state->setEscape();
+		} else if (return_state == ParamStateType::CLEAN_CAPTURED) {
+			object_state->setFlush(offset, TypeSize);
+		} else if (return_state == ParamStateType::CLEAN_ESCAPED) {
+			object_state->setFlush(offset, TypeSize);
+			object_state->setEscape();
+		} else if (return_state == ParamStateType::TOP) {
+			object_state->setFlush(offset, TypeSize);
+			object_state->setCaptured();
+		} else {
+			assert(false && "other cases");
+		}
+	}
 }
 
 //===----------------------------------------------------------------------===//

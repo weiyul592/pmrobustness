@@ -90,7 +90,6 @@ namespace {
 		void processFlushWrapperFunction(state_t * map, Instruction * I);
 		void processFlushParameterFunction(state_t * map, Instruction * I);
 		void processNTSWrapperFunction(state_t * map, Instruction * I);
-		void processDeleteFunction(state_t * map, Instruction * I);
 		void processCalls(state_t *map, Instruction *I);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
@@ -117,7 +116,6 @@ namespace {
 		bool isFlushParameterFunction(Instruction *I);
 		bool ignoreFunction(Instruction *I);
 		bool isNTSWrapperFunction(Instruction *I);
-		bool isDeleteFunction(Instruction *I);
 
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
@@ -176,6 +174,7 @@ namespace {
 
 		// Call: this call instruction marks any object as dirty and escaped when non parameters are dirty and escaped;
 		bool CallMarksEscDirObj;
+		bool hasError;
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
@@ -332,6 +331,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	}
 
 	FunctionMarksEscDirObj = false;
+	hasError = false;
 
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
@@ -361,10 +361,10 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 
 			// Build state from predecessors' states
 			if (it == block->begin()) {
-				addr_set_t * addr_set = (*ArraySets)[block];
-				if (addr_set == NULL) {
-					addr_set = new addr_set_t();
-					(*ArraySets)[block] = addr_set;
+				addr_set_t * array_addr_set = (*ArraySets)[block];
+				if (array_addr_set == NULL) {
+					array_addr_set = new addr_set_t();
+					(*ArraySets)[block] = array_addr_set;
 				}
 
 				// First instruction; take the union of predecessors' states
@@ -385,8 +385,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 						break;
 					} else {
 						copyState(prev_s, state);
-						assert(addr_set);
-						copyArrayState((*ArraySets)[pred], addr_set);
+						copyArrayState((*ArraySets)[pred], array_addr_set);
 					}
 				} else {
 					// Multiple predecessors
@@ -413,7 +412,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 					}
 
 					copyMergedState(AbsState, pred_list, state, visited_blocks);
-					copyMergedArrayState(ArraySets, pred_list, addr_set, visited_blocks);
+					copyMergedArrayState(ArraySets, pred_list, array_addr_set, visited_blocks);
 				}
 			} else {
 				// Copy the previous instruction's state
@@ -640,10 +639,6 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		} /*else if (isNTSWrapperFunction(I)) {
 			//updated |= true;
 			//processNTSWrapperFunction(map, I);
-		} else if (isDeleteFunction(I)) {
-			// Ignore delete operator
-			//updated |= true;
-			//processDeleteFunction(map, I);
 		}*/
 		else {
 			NVMOP op = whichNVMoperation(I);
@@ -748,9 +743,11 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		ArrayInfo * tmp = new ArrayInfo();
 		tmp->copyGEP(&DecompGEP);
 		(*unflushed_addr)[Addr] = tmp;
+
+		// Use to record escaped/captured for base pointers of arrays
+		getObjectState(map, DecompGEP.Base);
 /*
 		errs() << "Addr inserted: " << *Addr << "\n";
-		//errs() << "Array encountered\t";
 		errs() << *I << "\n  ";
 		//I->getFunction()->dump();
 		getPosition(I, IRB, true);
@@ -1123,35 +1120,6 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	}
 }
 
-// Not using this function; ignore delete operator
-// code should be robust w/ and w/o delete operator
-void PMRobustness::processDeleteFunction(state_t * map, Instruction * I) {
-	const DataLayout &DL = I->getModule()->getDataLayout();
-	CallBase *callInst = cast<CallBase>(I);
-	Value *Addr = callInst->getArgOperand(0);
-
-	DecomposedGEP DecompGEP;
-	decomposeAddress(DecompGEP, Addr, DL);
-	unsigned offset = DecompGEP.getOffsets();
-
-	if (DecompGEP.isArray) {
-		//TODO: compare GEP address
-		assert(false && "Deleting an array address");
-		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
-		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
-	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
-		// TODO: treat it the same way as array
-		assert(false && "Deleting an array address");
-	} else {
-		ob_state_t *object_state = map->lookup(DecompGEP.Base);
-		if (object_state != NULL) {
-			unsigned size = object_state->getSize();
-			object_state->setFlush(offset, size, true);
-			object_state->setCaptured();
-		}
-	}
-}
-
 void PMRobustness::processCalls(state_t *map, Instruction *I) {
 	CallBase *CB = cast<CallBase>(I);
 	if (CallInst *CI = dyn_cast<CallInst>(CB)) {
@@ -1333,6 +1301,7 @@ ob_state_t * PMRobustness::getObjectState(state_t *map, const Value *Addr) {
 
 void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
+	DenseMap<BasicBlock *, addr_set_t *> *ArraySets = UnflushedArrays[&F];
 	DenseSet<const Value *> * ErrorSet = FunctionEndErrorSets[&F];
 	if (ErrorSet == NULL) {
 		ErrorSet = new DenseSet<const Value *>();
@@ -1346,11 +1315,10 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 	}
 
 	for (Instruction *I : RetSet) {
-		// Get the state at each return statements
-		state_t *s = AbsState->lookup(I);
-
-		for (state_t::iterator it = s->begin(); it != s->end(); it++) {
-			// Anything other than then the parameters/return value that are dirty is an error.
+		// 1) Check objects other than parameters/return values that are dirty and escaped
+		// Get the state at each return statement
+		state_t *state = AbsState->lookup(I);
+		for (state_t::iterator it = state->begin(); it != state->end(); it++) {
 			if (FunctionArguments.find(it->first) != FunctionArguments.end())
 				continue;
 			else if (RetValSet.find(it->first) != RetValSet.end())
@@ -1361,13 +1329,13 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 				continue;
 
 			ob_state_t *object_state = it->second;
-			IRBuilder<> IRB(I);
-
 			if (object_state->isDirty() && object_state->isEscaped()) {
 				if (ErrorSet->find(it->first) == ErrorSet->end()) {
+					hasError = true;
 					ErrorSet->insert(it->first);
 
 					errs() << "Error!!!!!!! at return statement: ";
+					IRBuilder<> IRB(I);
 					Value *pos = NULL;
 					if (isa<Instruction>(it->first) && !isa<PHINode>(it->first)) {
 						const Instruction *inst = cast<Instruction>(it->first);
@@ -1380,8 +1348,31 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 					}
 
 					errs() << "@@ Instruction " << *it->first << "\n";
-					F.dump();
-					CurrentContext->dump();
+				}
+			}
+		}
+
+		// 2) Check unflushed arrays at the exit blocks
+		BasicBlock *exit_block = I->getParent();
+		addr_set_t *array_addr_set = (*ArraySets)[exit_block];
+		for (addr_set_t::iterator it = array_addr_set->begin(); it != array_addr_set->end(); it++) {
+			ob_state_t *object_state = state->lookup(it->second->Base);
+			assert(object_state);
+
+			if (object_state->isEscaped()) {
+				if (ErrorSet->find(it->first) == ErrorSet->end()) {
+					hasError = true;
+					ErrorSet->insert(it->first);
+
+					errs() << "Error: Unflushed array address: ";
+					IRBuilder<> IRB(I);
+					if (isa<Instruction>(it->first)) {
+						const Instruction *inst = cast<Instruction>(it->first);
+						getPosition(inst, IRB, true);
+					} else
+						getPosition(I, IRB, true);
+
+					errs() << "@@ Instruction " << *it->first << "\n";
 				}
 			}
 		}
@@ -1399,6 +1390,7 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 			if (has_escaped_dirty_objs || CallMarksEscDirObj) {
 				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 					if (InstructionMarksEscDirObj) {
+						hasError = true;
 						StmtErrorSet->insert(I);
 						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
 						errs() << "Error: More than two objects are escaped and dirty at: ";
@@ -1407,8 +1399,6 @@ void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
 						if (hasTwoEscapedDirtyParams) {
 							errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 						}
-						I->getFunction()->dump();
-						CurrentContext->dump();
 					}
 				}
 
@@ -1556,18 +1546,7 @@ bool PMRobustness::isNTSWrapperFunction(Instruction *I) {
 
 	return false;
 }
-
-// C++ delete operator
-bool PMRobustness::isDeleteFunction(Instruction *I) {
-	if (CallBase *CB = dyn_cast<CallBase>(I)) {
-		if (Function *callee = CB->getCalledFunction()) {
-			if (callee->getName() == "_ZdlPv")
-				return true;
-		}
-	}
-
-	return false;
-}*/
+*/
 
 addr_set_t * PMRobustness::getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B) {
 	DenseMap<BasicBlock *, addr_set_t *> * ArraySets = UnflushedArrays[F];
@@ -1849,6 +1828,8 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	// Function has not been analyzed with the context
 	// TODO: If there are multiple contexts higher than the current context, use merged results
 	if (out_state == NULL) {
+		out_state = FS->getLeastUpperResult(Context);
+
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
 			UniqueFunctionSet.insert(std::make_pair(F, Context));
@@ -1857,12 +1838,8 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			delete Context;
 		}
 
-		out_state = FS->getLeastUpperResult(Context);
-
 		// No least upper context exists
 		if (out_state == NULL) {
-			use_higher_results = true;
-
 			// Mark all parameters as TOP (clean and captured)
 			unsigned i = 0;
 			for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
@@ -1894,7 +1871,8 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			}
 
 			return;
-		}
+		} else
+			use_higher_results = true;
 	}
 
 	//errs() << "Function cache found\n";
@@ -1922,6 +1900,46 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 			// TODO: We have information about arrays escaping or not.
 			// Dirty array slots are stored in UnflushedArrays
+			ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+			ParamStateType param_state = out_state->getStateType(i);
+
+			addr_set_t *unflushed_addr = getOrCreateUnflushedAddrSet(CB->getFunction(), CB->getParent());
+			ArrayInfo *info = unflushed_addr->lookup(op);
+			ArrayInfo *tmp = new ArrayInfo();
+			tmp->copyGEP(&DecompGEP);
+
+			if (param_state == ParamStateType::DIRTY_CAPTURED) {
+				if (info == NULL)
+					(*unflushed_addr)[op] = tmp;
+			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
+				if (info == NULL)
+					(*unflushed_addr)[op] = tmp;
+				object_state->setEscape();
+			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
+				// FIXME
+				if (info == NULL)
+					(*unflushed_addr)[op] = tmp;
+			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
+				// FIXME
+				if (info == NULL)
+					(*unflushed_addr)[op] = tmp;
+				object_state->setEscape();
+			} else if (param_state == ParamStateType::CLEAN_CAPTURED) {
+				if (info != NULL)
+					checkUnflushedAddress(CB->getFunction(), unflushed_addr, op, DecompGEP);
+				delete tmp;
+			} else if (param_state == ParamStateType::CLEAN_ESCAPED) {
+				if (info != NULL)
+					checkUnflushedAddress(CB->getFunction(), unflushed_addr, op, DecompGEP);
+				object_state->setEscape();
+				delete tmp;
+			} else if (param_state == ParamStateType::TOP) {
+				checkUnflushedAddress(CB->getFunction(), unflushed_addr, op, DecompGEP);
+				object_state->setCaptured();
+				delete tmp;
+			} else {
+				assert(false && "other cases");
+			}
 		} else {
 			unsigned TypeSize = getFieldSize(op, DL);
 			if (TypeSize == (unsigned)-1) {
@@ -2194,6 +2212,11 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 
 	checkEndError(AbsState, F);
 
+	if (hasError) {
+		F.dump();
+		CurrentContext->dump();
+	}
+
 	return updated;
 }
 
@@ -2208,8 +2231,7 @@ void PMRobustness::modifyReturnState(state_t *map, CallBase *CB, OutputState *ou
 	unsigned offset = DecompGEP.getOffsets();
 
 	if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
-		// TODO: We have information about arrays escaping or not.
-		// Dirty array slots are stored in UnflushedArrays
+		assert(false);
 	} else {
 		unsigned TypeSize = getFieldSize(CB, DL);
 		if (TypeSize == (unsigned)-1) {

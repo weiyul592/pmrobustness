@@ -90,7 +90,7 @@ namespace {
 		void processFlushWrapperFunction(state_t * map, Instruction * I);
 		void processFlushParameterFunction(state_t * map, Instruction * I);
 		void processNTSWrapperFunction(state_t * map, Instruction * I);
-		void processCalls(state_t *map, Instruction *I);
+		void processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
 		//bool processParamAnnotationFunction(Instruction * I);
@@ -103,7 +103,7 @@ namespace {
 		ob_state_t * getObjectState(state_t *map, const Value *Addr);
 
 		void checkEndError(state_map_t *AbsState, Function &F);
-		void checkEscapedObjError(state_t *state, Instruction *I);
+		void checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
@@ -122,7 +122,7 @@ namespace {
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
 		CallingContext * computeContext(state_t *map, Instruction *I);
-		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context);
+		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context, bool &non_dirty_escaped_before);
 		void computeInitialState(state_t *map, Function &F, CallingContext *Context);
 		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
 
@@ -596,9 +596,10 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 
 void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	InstructionMarksEscDirObj = false;
+	CallMarksEscDirObj = false;
 	bool updated = false;
 	bool check_error = false;
-	CallMarksEscDirObj = false;
+	bool non_dirty_escaped_before_call = true;
 
 	if (I->isAtomic()) {
 		updated |= processAtomic(map, I);
@@ -649,7 +650,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 				// updated |= processFlush(map, I, op);
 			} else {
 #ifdef INTERPROCEDURAL
-				processCalls(map, I);
+				processCalls(map, I, non_dirty_escaped_before_call);
 				updated |= true;
 				check_error = true;
 #endif
@@ -659,7 +660,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 
 	if (check_error) {
 		// TODO: report bugs when a function marks an object as escaped, dirty
-		checkEscapedObjError(map, I);
+		checkEscapedObjError(map, I, non_dirty_escaped_before_call);
 	}
 /*
 	if (updated) {
@@ -678,11 +679,8 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 	} else if (isa<LoadInst>(I)) {
 		updated |= processLoad(map, I);
 	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
-		// Treat atomic_exchange as load + store
-		// Treat other RMWs as store
-		if (RMWI->getOperation() == AtomicRMWInst::Xchg)
-			updated |= processLoad(map, I);
-
+		// Treat atomic RMWs as load + store
+		updated |= processLoad(map, I);
 		updated |= processStore(map, I);
 		//errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
@@ -1120,7 +1118,7 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	}
 }
 
-void PMRobustness::processCalls(state_t *map, Instruction *I) {
+void PMRobustness::processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before) {
 	CallBase *CB = cast<CallBase>(I);
 	if (CallInst *CI = dyn_cast<CallInst>(CB)) {
 		if (CI->isInlineAsm())
@@ -1156,7 +1154,7 @@ void PMRobustness::processCalls(state_t *map, Instruction *I) {
 	}
 
 	CallingContext *context = computeContext(map, I);
-	lookupFunctionResult(map, CB, context);
+	lookupFunctionResult(map, CB, context, non_dirty_escaped_before);
 }
 
 void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
@@ -1379,34 +1377,46 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 	}
 }
 
-void PMRobustness::checkEscapedObjError(state_t *state, Instruction *I) {
-	bool has_escaped_dirty_objs = false;
+void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before) {
+	unsigned escaped_dirty_objs_count = 0;
+	bool check_and_report = false;
 	IRBuilder<> IRB(I);
 
-	for (state_t::iterator it = state->begin(); it != state->end(); it++) {
+	if (!InstructionMarksEscDirObj)
+		return;
+
+	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
 		ob_state_t *object_state = it->second;
 		if (object_state->isEscaped() && object_state->isDirty()) {
-			// There is already one or more escaped dirty objects
-			if (has_escaped_dirty_objs || CallMarksEscDirObj) {
-				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
-					if (InstructionMarksEscDirObj) {
-						hasError = true;
-						StmtErrorSet->insert(I);
-						errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
-						errs() << "Error: More than two objects are escaped and dirty at: ";
-						getPosition(I, IRB, true);
-						errs() << "@@ Instruction " << *I << "\n";
-						if (hasTwoEscapedDirtyParams) {
-							errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
-						}
-					}
-				}
+			escaped_dirty_objs_count++;
 
+			// There is already one or more escaped dirty objects
+			if (escaped_dirty_objs_count == 2) {
+				check_and_report = true;
 				break;
 			}
 
-			has_escaped_dirty_objs = true;
 			// TODO: check if two fields in an object is dirty
+		}
+	}
+
+	if (escaped_dirty_objs_count == 1 && CallMarksEscDirObj) {
+		// If escaped_dirty_objs_count was 0 before processCall updated states,
+		// then it is not a bug
+		// Some of the cases where two fields of an object are dirty are covered here
+		if (!non_dirty_escaped_before)
+			check_and_report = true;
+	}
+
+	if (check_and_report && StmtErrorSet->find(I) == StmtErrorSet->end()) {
+		hasError = true;
+		StmtErrorSet->insert(I);
+		errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
+		errs() << "Error: More than two objects are escaped and dirty at: ";
+		getPosition(I, IRB, true);
+		errs() << "@@ Instruction " << *I << "\n";
+		if (hasTwoEscapedDirtyParams) {
+			errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 		}
 	}
 }
@@ -1774,7 +1784,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	return context;
 }
 
-void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context) {
+void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context, bool &non_dirty_escaped_before) {
 	Function *F = CB->getCalledFunction();
 	FunctionSummary *FS = FunctionSummaries[F];
 	const DataLayout &DL = CB->getModule()->getDataLayout();
@@ -1861,7 +1871,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 						if (TypeSize == (unsigned)-1)
 							object_state->setFlush(offset, TypeSize, true);
 						else
-							object_state->setFlush(offset, TypeSize, true);
+							object_state->setFlush(offset, TypeSize);
 
 						object_state->setCaptured();
 					}
@@ -1876,6 +1886,27 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	}
 
 	//errs() << "Function cache found\n";
+
+	// For reporting in-function error
+	if (out_state->marksEscDirObj) {
+		InstructionMarksEscDirObj = true;
+		FunctionMarksEscDirObj = true;
+	}
+
+	if (!use_higher_results && out_state->marksEscDirObjConditional) {
+		CallMarksEscDirObj = true;
+	}
+
+	if (CallMarksEscDirObj) {
+		for (state_t::iterator it = map->begin(); it != map->end(); it++) {
+			ob_state_t *object_state = it->second;
+			if (object_state->isEscaped() && object_state->isDirty()) {
+				non_dirty_escaped_before = false;
+				break;
+			}
+		}
+
+	}
 
 	// Use cached result to modify parameter states
 	unsigned i = 0;
@@ -2002,16 +2033,6 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		}
 
 		i++;
-	}
-
-	// For reporting in-function error
-	if (out_state->marksEscDirObj) {
-		InstructionMarksEscDirObj = true;
-		FunctionMarksEscDirObj = true;
-	}
-
-	if (!use_higher_results && out_state->marksEscDirObjConditional) {
-		CallMarksEscDirObj = true;
 	}
 
 	if (out_state->hasRetVal) {

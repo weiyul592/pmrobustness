@@ -126,6 +126,7 @@ namespace {
 		void computeInitialState(state_t *map, Function &F, CallingContext *Context);
 		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
 
+		void makeParametersTOP(state_t *map, CallBase *CB);
 		void modifyReturnState(state_t *map, CallBase *CB, OutputState *out_state);
 
 		const Value * GetLinearExpression(
@@ -1802,35 +1803,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		}
 
 		// Mark all parameters as TOP (clean and captured)
-		unsigned i = 0;
-		for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
-			Value *op = *it;
-
-			if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
-				DecomposedGEP DecompGEP;
-				decomposeAddress(DecompGEP, op, DL);
-				unsigned offset = DecompGEP.getOffsets();
-
-				if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
-					// TODO: What do we do here?
-				} else {
-					ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
-					unsigned TypeSize = getFieldSize(op, DL);
-					//errs() << "TypeSize: " << TypeSize << "\n";
-					//errs() << *op << "\n";
-
-					if (TypeSize == (unsigned)-1)
-						object_state->setFlush(offset, TypeSize, true);
-					else
-						object_state->setFlush(offset, TypeSize);
-
-					object_state->setCaptured();
-				}
-			} // Else case: op is NON_PMEM, so don't do anything
-
-			i++;
-		}
-
+		makeParametersTOP(map, CB);
 		return;
 	}
 
@@ -1838,8 +1811,6 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	// Function has not been analyzed with the context
 	// TODO: If there are multiple contexts higher than the current context, use merged results
 	if (out_state == NULL) {
-		out_state = FS->getLeastUpperResult(Context);
-
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
 			UniqueFunctionSet.insert(std::make_pair(F, Context));
@@ -1848,38 +1819,11 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			delete Context;
 		}
 
-		// No least upper context exists
+		out_state = FS->getLeastUpperResult(Context);
 		if (out_state == NULL) {
+			// No least upper context exists
 			// Mark all parameters as TOP (clean and captured)
-			unsigned i = 0;
-			for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
-				Value *op = *it;
-
-				if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
-					DecomposedGEP DecompGEP;
-					decomposeAddress(DecompGEP, op, DL);
-					unsigned offset = DecompGEP.getOffsets();
-
-					if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
-						// TODO: What do we do here?
-					} else {
-						ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
-						unsigned TypeSize = getFieldSize(op, DL);
-						//errs() << "TypeSize: " << TypeSize << "\n";
-						//errs() << *op << "\n";
-
-						if (TypeSize == (unsigned)-1)
-							object_state->setFlush(offset, TypeSize, true);
-						else
-							object_state->setFlush(offset, TypeSize);
-
-						object_state->setCaptured();
-					}
-				} // Else case: op is NON_PMEM, so don't do anything
-
-				i++;
-			}
-
+			makeParametersTOP(map, CB);
 			return;
 		} else
 			use_higher_results = true;
@@ -2239,6 +2183,36 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	}
 
 	return updated;
+}
+
+// Mark all parameters as TOP (clean and captured)
+void PMRobustness::makeParametersTOP(state_t *map, CallBase *CB) {
+	const DataLayout &DL = CB->getModule()->getDataLayout();
+	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
+		Value *op = *it;
+
+		if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
+			DecomposedGEP DecompGEP;
+			decomposeAddress(DecompGEP, op, DL);
+			unsigned offset = DecompGEP.getOffsets();
+
+			if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+				// TODO: What do we do here?
+			} else {
+				ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+				unsigned TypeSize = getFieldSize(op, DL);
+				//errs() << "TypeSize: " << TypeSize << "\n";
+				//errs() << *op << "\n";
+
+				if (TypeSize == (unsigned)-1)
+					object_state->setFlush(offset, TypeSize, true);
+				else
+					object_state->setFlush(offset, TypeSize);
+
+				object_state->setCaptured();
+			}
+		} // Else case: op is NON_PMEM, so don't do anything
+	}
 }
 
 void PMRobustness::modifyReturnState(state_t *map, CallBase *CB, OutputState *out_state) {

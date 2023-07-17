@@ -1204,11 +1204,9 @@ unsigned PMRobustness::getFieldSize(Value *Addr, const DataLayout &DL) {
 	Type *OrigPtrTy = Addr->getType();
 	Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
 	if (!OrigTy->isSized()) {
-		if (OrigTy->isFunctionTy())
-			return -1;
-		else
-			assert("false && OrigTy is not sized");
+		return -1;
 	}
+
 	unsigned TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
 
 	return TypeSize / 8;

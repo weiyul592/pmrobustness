@@ -47,6 +47,8 @@
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/ADT/None.h"
+#include "llvm/ADT/SetVector.h"
+
 #include "PMRobustness.h"
 #include "FunctionSummary.h"
 //#include "andersen/include/AndersenAA.h"
@@ -75,10 +77,10 @@ namespace {
 		void copyArrayState(addr_set_t *src, addr_set_t *dst);
 		bool copyStateCheckDiff(state_t * src, state_t * dst);
 
-		void copyMergedState(state_map_t *AbsState, SmallPtrSetImpl<BasicBlock *> * src_list,
+		void copyMergedState(state_map_t *AbsState, SmallSetVector<BasicBlock *, 8> * src_list,
 			state_t * dst, DenseMap<const BasicBlock *, bool> &visited_blocks);
 		void copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
-			SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst,
+			SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst,
 			DenseMap<const BasicBlock *, bool> &visited_blocks);
 
 		void processInstruction(state_t * map, Instruction * I);
@@ -89,7 +91,7 @@ namespace {
 		bool processPHI(state_t * map, Instruction * I);
 		void processFlushWrapperFunction(state_t * map, Instruction * I);
 		void processFlushParameterFunction(state_t * map, Instruction * I);
-		void processNTSWrapperFunction(state_t * map, Instruction * I);
+		//void processNTSWrapperFunction(state_t * map, Instruction * I);
 		void processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
@@ -115,7 +117,7 @@ namespace {
 		bool isFlushWrapperFunction(Instruction *I);
 		bool isFlushParameterFunction(Instruction *I);
 		bool ignoreFunction(Instruction *I);
-		bool isNTSWrapperFunction(Instruction *I);
+		//bool isNTSWrapperFunction(Instruction *I);
 
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
@@ -143,20 +145,20 @@ namespace {
 		void test();
 
 		// object states at the end of each instruction for each function
-		DenseMap<Function *, state_map_t *> AbstractStates;
+		DenseMap<const Function *, state_map_t *> AbstractStates;
 		// object states at the end of each basic block for each function
-		DenseMap<Function *, b_state_map_t *> BlockEndAbstractStates;
-		DenseMap<Function *, DenseMap<BasicBlock *, addr_set_t *> *> UnflushedArrays;
-		DenseMap<Function *, FunctionSummary *> FunctionSummaries;
-		DenseMap<Function *, SmallPtrSet<Instruction *, 8> > FunctionRetInstMap;
+		DenseMap<const Function *, b_state_map_t *> BlockEndAbstractStates;
+		DenseMap<const Function *, DenseMap<BasicBlock *, addr_set_t *> *> UnflushedArrays;
+		DenseMap<const Function *, FunctionSummary *> FunctionSummaries;
+		DenseMap<const Function *, SmallPtrSet<Instruction *, 8> > FunctionRetInstMap;
 
 		CallingContext *CurrentContext;
 
 		// Arguments of the function being analyzed
-		DenseMap<Value *, unsigned> FunctionArguments;
+		DenseMap<const Value *, unsigned> FunctionArguments;
 
 		// Map a Function to its call sites
-		DenseMap<Function *, SmallDenseSet<std::pair<Function *, CallingContext *>> > FunctionCallerMap;
+		DenseMap<Function *, SetVector<std::pair<Function *, CallingContext *>> > FunctionCallerMap;
 
 		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
@@ -166,8 +168,8 @@ namespace {
 		std::vector<BasicBlock *> unprocessed_blocks;
 		std::list<BasicBlock *> BlockWorklist;
 
-		DenseMap<Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
-		DenseMap<Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
+		DenseMap<const Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
+		DenseMap<const Function *, DenseSet<const Instruction *> *> FunctionStmtErrorSets;
 		DenseSet<const Instruction *> * StmtErrorSet;
 		bool hasTwoEscapedDirtyParams;
 		bool InstructionMarksEscDirObj;	// Instruction: current instruction
@@ -335,8 +337,8 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	hasError = false;
 
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
-	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_predecessors;
-	DenseMap<const BasicBlock *, SmallPtrSet<BasicBlock *, 8> *> block_successors;
+	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_predecessors;
+	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_successors;
 	DenseMap<const BasicBlock *, bool> visited_blocks;
 
 	// Analyze F
@@ -390,9 +392,9 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 					}
 				} else {
 					// Multiple predecessors
-					SmallPtrSet<BasicBlock *, 8> *pred_list = block_predecessors[block];
+					SmallSetVector<BasicBlock *, 8> *pred_list = block_predecessors[block];
 					if (pred_list == NULL) {
-						pred_list = new SmallPtrSet<BasicBlock *, 8>();
+						pred_list = new SmallSetVector<BasicBlock *, 8>();
 						block_predecessors[block] = pred_list;
 						for (BasicBlock *pred : predecessors(block)) {
 							pred_list->insert(pred);
@@ -438,9 +440,9 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		if (block_state_changed || !visited_blocks[block]) {
 			visited_blocks[block] = true;
 
-			SmallPtrSet<BasicBlock *, 8> *succ_list = block_successors[block];
+			SmallSetVector<BasicBlock *, 8> *succ_list = block_successors[block];
 			if (succ_list == NULL) {
-				succ_list = new SmallPtrSet<BasicBlock *, 8>();
+				succ_list = new SmallSetVector<BasicBlock *, 8>();
 				block_successors[block] = succ_list;
 				for (BasicBlock *succ : successors(block)) {
 					succ_list->insert(succ);
@@ -458,12 +460,12 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	bool state_changed = computeFinalState(AbsState, F, Context);
 	if (state_changed) {
 		// push callers with their contexts
-		SmallDenseSet<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[&F];
+		SetVector<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[&F];
 		for (const std::pair<Function *, CallingContext *> &C : Callers) {
-			if (UniqueFunctionSet.find(C) == UniqueFunctionSet.end()) {
+			if (UniqueFunctionSet.find(*it) == UniqueFunctionSet.end()) {
 				// Not found in FunctionWorklist
-				Function *Function = C.first;
-				CallingContext *CallerContext = new CallingContext(C.second);
+				Function *Function = it->first;
+				CallingContext *CallerContext = new CallingContext(it->second);
 				FunctionWorklist.emplace_back(Function, CallerContext);
 				UniqueFunctionSet.insert(std::make_pair(Function, CallerContext));
 
@@ -535,7 +537,7 @@ bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst) {
 }
 
 void PMRobustness::copyMergedState(state_map_t *AbsState,
-		SmallPtrSetImpl<BasicBlock *> * src_list, state_t * dst,
+		SmallSetVector<BasicBlock *, 8> * src_list, state_t * dst,
 		DenseMap<const BasicBlock *, bool> &visited_blocks) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
 		it->second->setSize(0);
@@ -569,7 +571,7 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 }
 
 void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
-		SmallPtrSetImpl<BasicBlock *> *src_list, addr_set_t *dst,
+		SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst,
 		DenseMap<const BasicBlock *, bool> &visited_blocks) {
 //	for (addr_set_t::iterator it = dst->begin(); it != dst->end(); it++)
 //		(*dst)[it->first]->setSize(0);
@@ -1061,8 +1063,8 @@ void PMRobustness::processFlushParameterFunction(state_t * map, Instruction * I)
 	}
 }
 
-
 // Not using this function for now
+/*
 void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	const DataLayout &DL = I->getModule()->getDataLayout();
 	CallBase *callInst = cast<CallBase>(I);
@@ -1088,12 +1090,10 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 		}
 	}
 
-/*
 	errs() << "Non-Temporal Store wrapper " << *Addr << "\n for " << *V << "\n  ";
 	IRBuilder<> IRB(I);
 	getPosition(I, IRB, true);
 	//I->getFunction()->dump();
-*/
 
 	DecomposedGEP DecompGEP;
 	decomposeAddress(DecompGEP, Addr, DL);
@@ -1117,7 +1117,7 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 		object_state->setClwb(offset, TypeSize);
 		//(object_state of V)->setEscape(); //TODO & FIXME: if V is a reference, it will escape
 	}
-}
+}*/
 
 void PMRobustness::processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before) {
 	CallBase *CB = cast<CallBase>(I);
@@ -1147,8 +1147,8 @@ void PMRobustness::processCalls(state_t *map, Instruction *I, bool &non_dirty_es
 	}
 
 	// Update FunctionCallerMap
-	SmallDenseSet<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[F];
-	if (Callers.find(std::make_pair(CB->getCaller(), CurrentContext)) == Callers.end()) {
+	SetVector<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[F];
+	if (Callers.count(std::make_pair(CB->getCaller(), CurrentContext)) == 0) {
 		// If Caller w/ Context is not found
 		CallingContext *ContextCopy = new CallingContext(CurrentContext);
 		Callers.insert(std::make_pair(CB->getCaller(), ContextCopy));

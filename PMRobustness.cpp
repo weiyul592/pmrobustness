@@ -92,6 +92,7 @@ namespace {
 		void processFlushWrapperFunction(state_t * map, Instruction * I);
 		void processFlushParameterFunction(state_t * map, Instruction * I);
 		//void processNTSWrapperFunction(state_t * map, Instruction * I);
+		void processReturnAnnotation(state_t *map, Instruction *I);
 		void processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
@@ -116,6 +117,7 @@ namespace {
 		//bool isParamAnnotationFunction(Instruction *I);
 		bool isFlushWrapperFunction(Instruction *I);
 		bool isFlushParameterFunction(Instruction *I);
+		bool isReturnAnnotated(Instruction *I);
 		bool ignoreFunction(Instruction *I);
 		//bool isNTSWrapperFunction(Instruction *I);
 
@@ -640,6 +642,9 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		} else if (isFlushParameterFunction(I)) {
 			updated |= true;
 			processFlushParameterFunction(map, I);
+		} else if (isReturnAnnotated(I)) {
+			updated |= true;
+			processReturnAnnotation(map, I);
 		} /*else if (isNTSWrapperFunction(I)) {
 			//updated |= true;
 			//processNTSWrapperFunction(map, I);
@@ -1059,6 +1064,36 @@ void PMRobustness::processFlushParameterFunction(state_t * map, Instruction * I)
 				object_state->setFlush(offset, size, true);
 			else if (FlushOp == NVM_CLWB)
 				object_state->setClwb(offset, size, true);
+		}
+	}
+}
+
+void PMRobustness::processReturnAnnotation(state_t * map, Instruction * I) {
+	CallBase *callInst = cast<CallBase>(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	Function *callee = callInst->getCalledFunction();
+	assert(callee);
+
+	std::vector<StringRef> annotations;
+	getAnnotatedParamaters("return", annotations, callee);
+
+	StringRef &annotation = annotations[0];
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, I, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		assert(false);
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		// TODO: treat it the same way as array
+		assert(false);
+	} else {
+		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+		if (annotation == "escaped") {
+			object_state->setEscape();
+		} else {
+			assert(false);
 		}
 	}
 }
@@ -1525,6 +1560,17 @@ bool PMRobustness::isFlushParameterFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("flush_parameter"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+bool PMRobustness::isReturnAnnotated(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if (callee->hasFnAttribute("return"))
 				return true;
 		}
 	}

@@ -48,6 +48,7 @@
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/ADT/None.h"
 #include "llvm/ADT/SetVector.h"
+#include "../../Analysis/CFLTaintAnalysis/CFLAndersTaintAnalysis.h"
 
 #include "PMRobustness.h"
 #include "FunctionSummary.h"
@@ -69,6 +70,7 @@ namespace {
 		void analyzeFunction(Function &F, CallingContext *Context);
 
 		static char ID;
+		CFLAndersTaintResult *CFL;
 		//AliasAnalysis *AA;
 		//AndersenAAResult *AA;
 
@@ -100,7 +102,7 @@ namespace {
 
 		bool skipFunction(Function &F);
 		// TODO: Address check to be implemented
-		bool isPMAddr(const Value * Addr, const DataLayout &DL);
+		bool isPMAddr(const Function *F, const Value * Addr, const DataLayout &DL);
 		bool mayInHeap(const Value * Addr);
 		ob_state_t * getObjectState(state_t *map, const Value *Addr, bool &updated);
 		ob_state_t * getObjectState(state_t *map, const Value *Addr);
@@ -162,6 +164,8 @@ namespace {
 		// Map a Function to its call sites
 		DenseMap<Function *, SetVector<std::pair<Function *, CallingContext *>> > FunctionCallerMap;
 
+		DenseMap<const Function*, DenseSet<const Value *>> PMAddrSets;
+
 		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
 		// The set of items in FunctionWorklist; used to avoid insert duplicate items to FunctionWorklist
@@ -216,6 +220,8 @@ bool PMRobustness::doInitialization (Module &M) {
 }
 
 bool PMRobustness::runOnModule(Module &M) {
+	CFL = &getAnalysis<CFLAndersTaintWrapperPass>().getResult();
+
 	for (Function &F : M) {
 #ifdef INTERPROCEDURAL
 		if (F.getName() == "main") {
@@ -226,6 +232,7 @@ bool PMRobustness::runOnModule(Module &M) {
 
 			FunctionWorklist.emplace_back(&F, Context);
 			UniqueFunctionSet.insert(std::make_pair(&F, Context));
+			PMAddrSets = CFL->taintedValsInReachableFuncs(F);
 		} else if (!F.isDeclaration()) {
 			// Assume parameters have states TOP or do not push them to worklist?
 			CallingContext *Context = new CallingContext();
@@ -337,7 +344,15 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 
 	FunctionMarksEscDirObj = false;
 	hasError = false;
-
+/*
+	// Collect PM Addresses in functions unreachable from main
+	if (PMAddrSets.find(&F) == PMAddrSets.end()) {
+		Optional<DenseSet<const Value *>> taintedVals = CFL->taintedVals(F);
+		if (taintedVals) {
+			PMAddrSets[&F] = *taintedVals;
+		}
+	}
+*/
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_successors;
@@ -464,14 +479,14 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 		// push callers with their contexts
 		SetVector<std::pair<Function *, CallingContext *>> &Callers = FunctionCallerMap[&F];
 		for (const std::pair<Function *, CallingContext *> &C : Callers) {
-			if (UniqueFunctionSet.find(*it) == UniqueFunctionSet.end()) {
+			if (UniqueFunctionSet.find(C) == UniqueFunctionSet.end()) {
 				// Not found in FunctionWorklist
-				Function *Function = it->first;
-				CallingContext *CallerContext = new CallingContext(it->second);
+				Function *Function = C.first;
+				CallingContext *CallerContext = new CallingContext(C.second);
 				FunctionWorklist.emplace_back(Function, CallerContext);
 				UniqueFunctionSet.insert(std::make_pair(Function, CallerContext));
 
-				//errs() << "Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
+				//errs() << "(LOG4) Function " << Function->getName() << " added to worklist in " << F.getName() << "\n";
 			}
 		}
 	}
@@ -770,7 +785,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		*/
 	} else {
 		// Rule 1: x.f = v => x.f becomes dirty
-		if (isPMAddr(Addr, DL)) {
+		if (isPMAddr(I->getFunction(), Addr, DL)) {
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
 			updated |= object_state->setDirty(offset, TypeSize);
@@ -784,7 +799,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 		// Rule 2.1: *x = p => all fields of p escapes
 		// TODO: Val(i.e. p) should be PM Addr
-		if (Val && Val->getType()->isPointerTy() && isPMAddr(Val, DL)) {
+		if (Val && Val->getType()->isPointerTy() && isPMAddr(I->getFunction(), Val, DL)) {
 			DecomposedGEP ValDecompGEP;
 			decomposeAddress(ValDecompGEP, Val, DL);
 			unsigned offset = ValDecompGEP.getOffsets();
@@ -847,7 +862,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
-		if (isPMAddr(Addr, DL)) {
+		if (isPMAddr(I->getFunction(), Addr, DL)) {
 			if (I->isAtomic() && isa<LoadInst>(I)) {
 				// Mark the address as dirty to detect interthread robustness violation
 				// For Atomic RMW, this is already done in processStore
@@ -864,7 +879,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		}
 
 		// Rule 2.2: p = *x => p escapes
-		if (I->getType()->isPointerTy() && isPMAddr(I, DL)) {
+		if (I->getType()->isPointerTy() && isPMAddr(I->getFunction(), I, DL)) {
 			DecomposedGEP LIDecompGEP;
 			decomposeAddress(LIDecompGEP, I, DL);
 			unsigned offset = LIDecompGEP.getOffsets();
@@ -1251,6 +1266,7 @@ unsigned PMRobustness::getFieldSize(Value *Addr, const DataLayout &DL) {
 void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 	AU.addRequiredTransitive<AAResultsWrapperPass>();
 	AU.addRequiredTransitive<MemoryDependenceWrapperPass>();
+	AU.addRequired<CFLAndersTaintWrapperPass>();
 	//AU.addRequired<AAResultsWrapperPass>();
 	//AU.addRequired<AndersenAAWrapperPass>();
 	AU.setPreservesAll();
@@ -1268,10 +1284,22 @@ bool PMRobustness::skipFunction(Function &F) {
 	return false;
 }
 
-bool PMRobustness::isPMAddr(const Value * Addr, const DataLayout &DL) {
+bool PMRobustness::isPMAddr(const Function *F, const Value * Addr, const DataLayout &DL) {
+	DenseSet<const Value *> * PMAddrs = NULL;
+	if (PMAddrSets.find(F) != PMAddrSets.end()) {
+		PMAddrs = &PMAddrSets[F];
+	}
+
 	const Value *Origin = GetUnderlyingObject(Addr, DL);
 	for (auto &u : Origin->uses()) {
 		if (isa<AllocaInst>(u)) {
+			//errs() << *Addr << " is non pmem\n";
+			return false;
+		}
+	}
+
+	if (PMAddrs) {
+		if (PMAddrs->find(Addr) == PMAddrs->end()) {
 			//errs() << *Addr << " is non pmem\n";
 			return false;
 		}
@@ -1789,7 +1817,7 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 		Value *op = *it;
 
-		if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
+		if (op->getType()->isPointerTy() && isPMAddr(I->getFunction(), op, DL)) {
 			DecomposedGEP DecompGEP;
 			decomposeAddress(DecompGEP, op, DL);
 			unsigned offset = DecompGEP.getOffsets();
@@ -1841,7 +1869,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
 			UniqueFunctionSet.insert(std::make_pair(F, Context));
-			//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName();
+			//errs() << "(LOG5) Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
 		} else {
 			delete Context;
 		}
@@ -1858,7 +1886,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
 			FunctionWorklist.emplace_back(F, Context);
 			UniqueFunctionSet.insert(std::make_pair(F, Context));
-			//errs() << "Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
+			//errs() << "(LOG6) Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
 		} else {
 			delete Context;
 		}
@@ -2235,7 +2263,7 @@ void PMRobustness::makeParametersTOP(state_t *map, CallBase *CB) {
 	for (User::op_iterator it = CB->arg_begin(); it != CB->arg_end(); it++) {
 		Value *op = *it;
 
-		if (op->getType()->isPointerTy() && isPMAddr(op, DL)) {
+		if (op->getType()->isPointerTy() && isPMAddr(CB->getFunction(), op, DL)) {
 			DecomposedGEP DecompGEP;
 			decomposeAddress(DecompGEP, op, DL);
 			unsigned offset = DecompGEP.getOffsets();

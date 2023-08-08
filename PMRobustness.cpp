@@ -91,10 +91,13 @@ namespace {
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 		bool processPHI(state_t * map, Instruction * I);
-		void processFlushWrapperFunction(state_t * map, Instruction * I);
-		void processFlushParameterFunction(state_t * map, Instruction * I);
-		//void processNTSWrapperFunction(state_t * map, Instruction * I);
+
+		bool processAnnotatedFunction(state_t *map, Instruction *I, bool &check_error);
+		void processFlushWrapperFunction(state_t *map, Instruction * I);
+		void processFlushParameterFunction(state_t *map, Instruction * I);
+		//void processNTSWrapperFunction(state_t *map, Instruction * I);
 		void processReturnAnnotation(state_t *map, Instruction *I);
+		void processPMMemcpy(state_t *map, Instruction *I);
 		void processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
@@ -117,9 +120,9 @@ namespace {
 		NVMOP whichNVMoperation(StringRef flushtype);
 		NVMOP analyzeFlushType(Function &F);
 		//bool isParamAnnotationFunction(Instruction *I);
+		bool isAnnotated(Instruction *I);
+		bool isAnnotated(Function &F);
 		bool isFlushWrapperFunction(Instruction *I);
-		bool isFlushParameterFunction(Instruction *I);
-		bool isReturnAnnotated(Instruction *I);
 		bool ignoreFunction(Instruction *I);
 		//bool isNTSWrapperFunction(Instruction *I);
 
@@ -164,7 +167,7 @@ namespace {
 		// Map a Function to its call sites
 		DenseMap<Function *, SetVector<std::pair<Function *, CallingContext *>> > FunctionCallerMap;
 
-		DenseMap<const Function*, DenseSet<const Value *>> PMAddrSets;
+		DenseMap<const Function*, DenseSet<Value *>> PMAddrSets;
 
 		std::list<std::pair<Function *, CallingContext *>> FunctionWorklist;
 
@@ -187,6 +190,7 @@ namespace {
 
 		unsigned MaxLookupSearchDepth = 100;
 		std::set<std::string> MemAllocatingFunctions;
+		std::vector<StringRef> AnnotationList;
 
 		// May consider having several DenseMaps for function with different parameter sizes: 4, 8, 12, 16, etc.
 	};
@@ -201,6 +205,11 @@ bool PMRobustness::doInitialization (Module &M) {
 	MemAllocatingFunctions = {
 		"operator new(unsigned long)", "operator new[](unsigned long)", "malloc",
 		"calloc", "realloc"
+	};
+
+	AnnotationList = {
+		"myflush", "flush_parameter", "ignore", "suppress", "return",
+		"persist_memcpy"
 	};
 
 	GlobalVariable *global_annos = M.getNamedGlobal("llvm.global.annotations");
@@ -232,7 +241,6 @@ bool PMRobustness::runOnModule(Module &M) {
 
 			FunctionWorklist.emplace_back(&F, Context);
 			UniqueFunctionSet.insert(std::make_pair(&F, Context));
-			PMAddrSets = CFL->taintedValsInReachableFuncs(F);
 		} else if (!F.isDeclaration()) {
 			// Assume parameters have states TOP or do not push them to worklist?
 			CallingContext *Context = new CallingContext();
@@ -344,15 +352,15 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 
 	FunctionMarksEscDirObj = false;
 	hasError = false;
-/*
-	// Collect PM Addresses in functions unreachable from main
+
+	// Collect PM Addresses in functions
 	if (PMAddrSets.find(&F) == PMAddrSets.end()) {
-		Optional<DenseSet<const Value *>> taintedVals = CFL->taintedVals(F);
+		Optional<DenseSet<Value *>> taintedVals = CFL->taintedVals(F);
 		if (taintedVals) {
 			PMAddrSets[&F] = *taintedVals;
 		}
 	}
-*/
+
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_successors;
@@ -651,15 +659,8 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 			check_error = true;
 		} else if (ignoreFunction(I)) {
 			return;
-		} else if (isFlushWrapperFunction(I)) {
-			updated |= true;
-			processFlushWrapperFunction(map, I);
-		} else if (isFlushParameterFunction(I)) {
-			updated |= true;
-			processFlushParameterFunction(map, I);
-		} else if (isReturnAnnotated(I)) {
-			updated |= true;
-			processReturnAnnotation(map, I);
+		} else if (isAnnotated(I)) {
+			updated |= processAnnotatedFunction(map, I, check_error);
 		} /*else if (isNTSWrapperFunction(I)) {
 			//updated |= true;
 			//processNTSWrapperFunction(map, I);
@@ -946,6 +947,31 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 	return updated;
 }
 
+bool PMRobustness::processAnnotatedFunction(state_t *map, Instruction *I, bool &check_error) {
+	CallBase *CB = cast<CallBase>(I);
+	Function *callee = CB->getCalledFunction();
+	bool updated = false;
+
+	if (callee->hasFnAttribute("myflush")) {
+		updated = true;
+		processFlushWrapperFunction(map, I);
+	} else if (callee->hasFnAttribute("flush_parameter")) {
+		updated = true;
+		processFlushParameterFunction(map, I);
+	} else if (callee->hasFnAttribute("return")) {
+		updated = true;
+		processReturnAnnotation(map, I);
+	} else if (callee->hasFnAttribute("persist_memcpy")) {
+		updated = true;
+		check_error = true;
+		processPMMemcpy(map, I);
+	} else {
+		assert(false && "Unknown annotated function");
+	}
+
+	return updated;
+}
+
 void PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 	CallBase *callInst = cast<CallBase>(I);
 	const DataLayout &DL = I->getModule()->getDataLayout();
@@ -995,6 +1021,7 @@ void PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
+		assert(false);
 	} else {
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = map->lookup(DecompGEP.Base);
@@ -1064,6 +1091,7 @@ void PMRobustness::processFlushParameterFunction(state_t * map, Instruction * I)
 	if (DecompGEP.isArray) {
 		assert(false);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		assert(false);
 		// TODO: treat it the same way as array
 	} else {
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
@@ -1109,6 +1137,70 @@ void PMRobustness::processReturnAnnotation(state_t * map, Instruction * I) {
 			object_state->setEscape();
 		} else {
 			assert(false);
+		}
+	}
+}
+
+void PMRobustness::processPMMemcpy(state_t * map, Instruction * I) {
+	CallBase *callInst = cast<CallBase>(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+	Function *callee = callInst->getCalledFunction();
+	assert(callee);
+
+	std::vector<StringRef> annotations;
+	getAnnotatedParamaters("persist_memcpy", annotations, callee);
+
+	Value *Addr = NULL;
+	Value *Size = NULL;
+	for (unsigned i = 0; i < annotations.size(); i++) {
+		StringRef &token = annotations[i];
+		if (token == "addr") {
+			Addr = callInst->getArgOperand(i);
+		} else if (token == "size") {
+			Size = callInst->getArgOperand(i);
+		} else if (token == "ignore") {
+			// Ignore
+		} else {
+			assert(false && "bad annotation");
+		}
+	}
+
+	DecomposedGEP DecompGEP;
+	decomposeAddress(DecompGEP, Addr, DL);
+	unsigned offset = DecompGEP.getOffsets();
+
+	if (DecompGEP.isArray) {
+		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+		ArrayInfo * tmp = new ArrayInfo();
+		tmp->copyGEP(&DecompGEP);
+		(*unflushed_addr)[Addr] = tmp;
+
+		// Use to record escaped/captured for base pointers of arrays
+		getObjectState(map, DecompGEP.Base);
+	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+		ArrayInfo * tmp = new ArrayInfo();
+		tmp->copyGEP(&DecompGEP);
+		(*unflushed_addr)[Addr] = tmp;
+
+		// Use to record escaped/captured for base pointers of arrays
+		getObjectState(map, DecompGEP.Base);
+	} else {
+		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
+		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+		unsigned size;
+		if (isa<ConstantInt>(Size))
+			size = cast<ConstantInt>(Size)->getZExtValue();
+		else {
+			// size could be a variable; see ulog.c:329
+			// TODO: How to overapproximate size?
+			size = object_state->getSize();
+		}
+
+		object_state->setDirty(offset, size);
+		if (object_state->isEscaped()) {
+			InstructionMarksEscDirObj = true;
+			FunctionMarksEscDirObj = true;
 		}
 	}
 }
@@ -1273,19 +1365,11 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 bool PMRobustness::skipFunction(Function &F) {
-	std::vector<StringRef> nameList = { "myflush", "flush_parameter", "ignore", "suppress" };
-	for (StringRef &s : nameList) {
-		if (F.hasFnAttribute(s)) {
-			errs() << "Function " << F.getName() << " is ignored\n";
-			return true;
-		}
-	}
-
-	return false;
+	return isAnnotated(F);
 }
 
 bool PMRobustness::isPMAddr(const Function *F, const Value * Addr, const DataLayout &DL) {
-	DenseSet<const Value *> * PMAddrs = NULL;
+	DenseSet<Value *> * PMAddrs = NULL;
 	if (PMAddrSets.find(F) != PMAddrSets.end()) {
 		PMAddrs = &PMAddrSets[F];
 	}
@@ -1293,19 +1377,18 @@ bool PMRobustness::isPMAddr(const Function *F, const Value * Addr, const DataLay
 	const Value *Origin = GetUnderlyingObject(Addr, DL);
 	for (auto &u : Origin->uses()) {
 		if (isa<AllocaInst>(u)) {
-			//errs() << *Addr << " is non pmem\n";
 			return false;
 		}
 	}
 
 	if (PMAddrs) {
 		if (PMAddrs->find(Addr) == PMAddrs->end()) {
-			//errs() << *Addr << " is non pmem\n";
+			//errs() << "(LOG) " << *Addr << " is non pmem\n";
 			return false;
 		}
 	}
 
-	//errs() << "*** " << *Addr << " is PMEM\n";
+	//errs() << "(LOG) " << *Addr << " is PMEM\n";
 	return true;
 }
 
@@ -1573,32 +1656,32 @@ bool PMRobustness::isParamAnnotationFunction(Instruction *I) {
 	return false;
 }*/
 
+bool PMRobustness::isAnnotated(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			for (StringRef &s : AnnotationList) {
+				if (callee->hasFnAttribute(s))
+					return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+bool PMRobustness::isAnnotated(Function &F) {
+	for (StringRef &s : AnnotationList) {
+		if (F.hasFnAttribute(s))
+			return true;
+	}
+
+	return false;
+}
+
 bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("myflush"))
-				return true;
-		}
-	}
-
-	return false;
-}
-
-bool PMRobustness::isFlushParameterFunction(Instruction *I) {
-	if (CallBase *CB = dyn_cast<CallBase>(I)) {
-		if (Function *callee = CB->getCalledFunction()) {
-			if (callee->hasFnAttribute("flush_parameter"))
-				return true;
-		}
-	}
-
-	return false;
-}
-
-bool PMRobustness::isReturnAnnotated(Instruction *I) {
-	if (CallBase *CB = dyn_cast<CallBase>(I)) {
-		if (Function *callee = CB->getCalledFunction()) {
-			if (callee->hasFnAttribute("return"))
 				return true;
 		}
 	}

@@ -503,6 +503,10 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 
 // DenseMap<Value *, ob_state_t *> state_t;
 void PMRobustness::copyState(state_t * src, state_t * dst) {
+	// Mark each item in dst as `to delete`; they are unmarked if src contains them
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
+		it->second->markDelete();
+
 	for (state_t::iterator it = src->begin(); it != src->end(); it++) {
 		ob_state_t *object_state = dst->lookup(it->first);
 		if (object_state == NULL) {
@@ -514,6 +518,14 @@ void PMRobustness::copyState(state_t * src, state_t * dst) {
 //				errs() << "src size: " << it->second->size << "\n";
 //			}
 			object_state->copyFrom(it->second);
+			object_state->unmarkDelete();
+		}
+	}
+
+	// Remove items not contained in src
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++) {
+		if (it->second->shouldDelete()) {
+			dst->erase(it);
 		}
 	}
 }
@@ -1382,14 +1394,13 @@ bool PMRobustness::isPMAddr(const Function *F, const Value * Addr, const DataLay
 	}
 
 	if (PMAddrs) {
-		if (PMAddrs->find(Addr) == PMAddrs->end()) {
-			//errs() << "(LOG) " << *Addr << " is non pmem\n";
-			return false;
+		if (PMAddrs->find(Addr) != PMAddrs->end()) {
+			return true;
 		}
-	}
+	} else
+		assert(false);
 
-	//errs() << "(LOG) " << *Addr << " is PMEM\n";
-	return true;
+	return false;
 }
 
 /** Simple may-analysis for checking if an address is in the heap

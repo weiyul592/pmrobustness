@@ -79,11 +79,9 @@ namespace {
 		void copyArrayState(addr_set_t *src, addr_set_t *dst);
 		bool copyStateCheckDiff(state_t * src, state_t * dst);
 
-		void copyMergedState(state_map_t *AbsState, SmallSetVector<BasicBlock *, 8> * src_list,
-			state_t * dst, DenseMap<const BasicBlock *, bool> &visited_blocks);
+		void copyMergedState(state_map_t *AbsState, SmallSetVector<BasicBlock *, 8> * src_list, state_t * dst);
 		void copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
-			SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst,
-			DenseMap<const BasicBlock *, bool> &visited_blocks);
+			SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst);
 
 		void processInstruction(state_t * map, Instruction * I);
 		bool processAtomic(state_t * map, Instruction * I);
@@ -91,6 +89,7 @@ namespace {
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
 		bool processPHI(state_t * map, Instruction * I);
+		bool processSelect(state_t * map, Instruction * I);
 
 		bool processAnnotatedFunction(state_t *map, Instruction *I, bool &check_error);
 		void processFlushWrapperFunction(state_t *map, Instruction * I);
@@ -175,6 +174,7 @@ namespace {
 		DenseSet<std::pair<Function *, CallingContext *>> UniqueFunctionSet;
 
 		std::vector<BasicBlock *> unprocessed_blocks;
+		DenseMap<const BasicBlock *, bool> visited_blocks;
 		std::list<BasicBlock *> BlockWorklist;
 
 		DenseMap<const Function *, DenseSet<const Value *> *> FunctionEndErrorSets;
@@ -364,7 +364,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 	// LLVM allows duplicate predecessors: https://stackoverflow.com/questions/65157239/llvmpredecessors-could-return-duplicate-basic-block-pointers
 	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_predecessors;
 	DenseMap<const BasicBlock *, SmallSetVector<BasicBlock *, 8> *> block_successors;
-	DenseMap<const BasicBlock *, bool> visited_blocks;
+	visited_blocks.clear();
 
 	// Analyze F
 	BlockWorklist.push_back(&F.getEntryBlock());
@@ -439,8 +439,8 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 						break;
 					}
 
-					copyMergedState(AbsState, pred_list, state, visited_blocks);
-					copyMergedArrayState(ArraySets, pred_list, array_addr_set, visited_blocks);
+					copyMergedState(AbsState, pred_list, state);
+					copyMergedArrayState(ArraySets, pred_list, array_addr_set);
 				}
 			} else {
 				// Copy the previous instruction's state
@@ -574,8 +574,7 @@ bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst) {
 }
 
 void PMRobustness::copyMergedState(state_map_t *AbsState,
-		SmallSetVector<BasicBlock *, 8> * src_list, state_t * dst,
-		DenseMap<const BasicBlock *, bool> &visited_blocks) {
+		SmallSetVector<BasicBlock *, 8> * src_list, state_t * dst) {
 	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
 		it->second->setSize(0);
 
@@ -608,8 +607,7 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 }
 
 void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *ArraySets,
-		SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst,
-		DenseMap<const BasicBlock *, bool> &visited_blocks) {
+		SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst) {
 //	for (addr_set_t::iterator it = dst->begin(); it != dst->end(); it++)
 //		(*dst)[it->first]->setSize(0);
 
@@ -652,6 +650,8 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		check_error = true;
 	} else if (isa<PHINode>(I)) {
 		updated |= processPHI(map, I);
+	} else if (isa<SelectInst>(I)) {
+		updated |= processSelect(map, I);
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		/* TODO: identify primitive functions that allocate memory
 		CallBase *CallSite = cast<CallBase>(I);
@@ -773,13 +773,17 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 	//printDecomposedGEP(DecompGEP);
 	if (DecompGEP.isArray) {
-		addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
-		ArrayInfo * tmp = new ArrayInfo();
-		tmp->copyGEP(&DecompGEP);
-		(*unflushed_addr)[Addr] = tmp;
+		if (isPMAddr(I->getFunction(), DecompGEP.Base, DL) ||
+			isPMAddr(I->getFunction(), Addr, DL)) {
+			addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+			ArrayInfo * tmp = new ArrayInfo();
+			tmp->copyGEP(&DecompGEP);
+			(*unflushed_addr)[Addr] = tmp;
 
-		// Use to record escaped/captured for base pointers of arrays
-		getObjectState(map, DecompGEP.Base);
+			// Use to record escaped/captured for base pointers of arrays
+			getObjectState(map, DecompGEP.Base);
+		}
+
 /*
 		errs() << "Addr inserted: " << *Addr << "\n";
 		errs() << *I << "\n  ";
@@ -929,8 +933,14 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 
 	ob_state_t *phi_state = NULL;
 	bool first_state = true;
-	for (User::op_iterator it = I->op_begin(); it != I->op_end(); it++) {
-		Value *V = *it;
+
+	PHINode *PHI = cast<PHINode>(I);
+	for (unsigned i = 0; i != PHI->getNumIncomingValues(); i++) {
+		Value *V = PHI->getIncomingValue(i);
+
+		if (!visited_blocks[PHI->getIncomingBlock(i)]) {
+			continue;
+		}
 
 		DecomposedGEP DecompGEP;
 		decomposeAddress(DecompGEP, V, DL);
@@ -952,6 +962,52 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 			} else {
 				// FIXME: only need to merge some field, not the entire object
 				phi_state->mergeFrom(object_state);
+			}
+		}
+	}
+
+	return updated;
+}
+
+bool PMRobustness::processSelect(state_t * map, Instruction * I) {
+	bool updated = false;
+	IRBuilder<> IRB(I);
+	const DataLayout &DL = I->getModule()->getDataLayout();
+
+	if (!I->getType()->isPointerTy())
+		return false;
+
+	ob_state_t *state = NULL;
+	bool first_state = true;
+
+	unsigned i = 0;
+	for (User::op_iterator it = I->op_begin(); it != I->op_end(); it++, i++) {
+		// There are three operands in total. Skip the first operand
+		if (i == 0)
+			continue;
+
+		Value *V = *it;
+
+		DecomposedGEP DecompGEP;
+		decomposeAddress(DecompGEP, V, DL);
+		unsigned offset = DecompGEP.getOffsets();
+
+		if (DecompGEP.isArray) {
+			continue;
+		} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
+			continue;
+		} else {
+			ob_state_t *object_state = map->lookup(DecompGEP.Base);
+			if (object_state == NULL)
+				continue;
+
+			if (first_state) {
+				state = getObjectState(map, I);
+				state ->copyFrom(object_state);
+				first_state = false;
+			} else {
+				// FIXME: only need to merge some field, not the entire object
+				state->mergeFrom(object_state);
 			}
 		}
 	}
@@ -1397,8 +1453,10 @@ bool PMRobustness::isPMAddr(const Function *F, const Value * Addr, const DataLay
 		if (PMAddrs->find(Addr) != PMAddrs->end()) {
 			return true;
 		}
-	} else
-		assert(false);
+	} else {
+		errs() << "PMAddrs not ready yet";
+		//assert(false);
+	}
 
 	return false;
 }

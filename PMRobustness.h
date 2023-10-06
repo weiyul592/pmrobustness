@@ -453,13 +453,14 @@ public:
 			int j = only_dirty_bytes.find_next_unset(i);
 
 			if (j == -1) {
-				j = size;
+				j = only_dirty_bytes.size();
 				info->push(i, j);
 				break;
 			}
 
 			info->push(i, j);
-			i = dirty_bytes.find_next(j);
+			assert(j >= 1);
+			i = only_dirty_bytes.find_next(j - 1);
 		}
 
 		info->finalize();

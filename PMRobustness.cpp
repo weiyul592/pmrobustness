@@ -38,6 +38,7 @@
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
@@ -54,6 +55,8 @@
 #include "FunctionSummary.h"
 //#include "andersen/include/AndersenAA.h"
 //#include "llvm/Analysis/AliasAnalysis.h"
+
+#define IGNORE "ignore"
 
 //#define PMROBUST_DEBUG
 #define INTERPROCEDURAL
@@ -91,6 +94,7 @@ namespace {
 		bool processPHI(state_t * map, Instruction * I);
 		bool processSelect(state_t * map, Instruction * I);
 
+		void processInFunctionAnnotation(state_t *map, Instruction *I);
 		bool processAnnotatedFunction(state_t *map, Instruction *I, bool &check_error);
 		void processFlushWrapperFunction(state_t *map, Instruction * I);
 		void processFlushParameterFunction(state_t *map, Instruction * I);
@@ -102,6 +106,7 @@ namespace {
 
 		//bool processParamAnnotationFunction(Instruction * I);
 
+		bool skipAnnotatedInstruction(Instruction *I);
 		bool skipFunction(Function &F);
 		// TODO: Address check to be implemented
 		bool isPMAddr(const Function *F, const Value * Addr, const DataLayout &DL);
@@ -119,10 +124,10 @@ namespace {
 		NVMOP whichNVMoperation(StringRef flushtype);
 		NVMOP analyzeFlushType(Function &F);
 		//bool isParamAnnotationFunction(Instruction *I);
-		bool isAnnotated(Instruction *I);
-		bool isAnnotated(Function &F);
+		bool isInFunctionAnnotation(Instruction *I);
+		bool isFunctionAnnotated(Instruction *I);
+		bool isFunctionAnnotated(Function &F);
 		bool isFlushWrapperFunction(Instruction *I);
-		bool ignoreFunction(Instruction *I);
 		//bool isNTSWrapperFunction(Instruction *I);
 
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
@@ -184,7 +189,7 @@ namespace {
 		bool InstructionMarksEscDirObj;	// Instruction: current instruction
 		bool FunctionMarksEscDirObj;	// Function: this function
 
-		// Call: this call instruction marks any object as dirty and escaped when non parameters are dirty and escaped;
+		// Call: this call instruction marks any object as dirty and escaped when no parameters are dirty and escaped;
 		bool CallMarksEscDirObj;
 		bool hasError;
 
@@ -380,7 +385,7 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 			(*BlockAbsState)[block] = block_end_state;
 		}
 
-		for (BasicBlock::iterator it = block->begin(); it != block->end();) {
+		for (BasicBlock::iterator it = block->begin(); it != block->end(); it++) {
 			state_t * state = AbsState->lookup(&*it);
 			if (state == NULL) {
 				state = new state_t();
@@ -450,7 +455,6 @@ void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
 			processInstruction(state, &*it);
 
 			prev = it;
-			it++;
 		} // End of basic block instruction iteration
 
 		if (predsNotAnalyzed)
@@ -639,6 +643,10 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool check_error = false;
 	bool non_dirty_escaped_before_call = true;
 
+	if (skipAnnotatedInstruction(I)) {
+		return;
+	}
+
 	if (I->isAtomic()) {
 		updated |= processAtomic(map, I);
 		check_error = true;
@@ -669,9 +677,9 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		} else if (isa<MemIntrinsic>(I)) {
 			updated |= processMemIntrinsic(map, I);
 			check_error = true;
-		} else if (ignoreFunction(I)) {
-			return;
-		} else if (isAnnotated(I)) {
+		} else if (isInFunctionAnnotation(I)) {
+			processInFunctionAnnotation(map, I);
+		} else if (isFunctionAnnotated(I)) {
 			updated |= processAnnotatedFunction(map, I, check_error);
 		} /*else if (isNTSWrapperFunction(I)) {
 			//updated |= true;
@@ -1015,12 +1023,59 @@ bool PMRobustness::processSelect(state_t * map, Instruction * I) {
 	return updated;
 }
 
+void PMRobustness::processInFunctionAnnotation(state_t *map, Instruction *I) {
+	CallBase *CB = cast<CallBase>(I);
+	Function *callee = CB->getCalledFunction();
+
+	// Ignore code blocked enclosed by pm_ignore_block_begin() and pm_ignore_block_end()
+	if (callee->getName() == "pm_ignore_block_begin") {
+		bool annotate = false;
+		std::list<BasicBlock *> worklist;
+		worklist.push_back(I->getParent());
+		MDNode *N = MDNode::get(I->getContext(), None);
+
+		while (!worklist.empty()) {
+			BasicBlock *cur = worklist.front();
+			worklist.pop_front();
+			bool break_in_the_middle = false;
+
+			for (BasicBlock::iterator it = cur->begin(); it != cur->end(); it++) {
+				if (annotate) {
+					(&*it)->setMetadata(IGNORE, N);
+				}
+
+				if (&*it == I) {
+					// Start annotating after "pm_ignore_block_begin"
+					annotate = true;
+				} else if (CallBase *CB = dyn_cast<CallBase>(&*it)) {
+					if (Function *callee = CB->getCalledFunction()) {
+						if (callee->getName() == "pm_ignore_block_end") {
+							// Stop annotating instructions in this block
+							break_in_the_middle = true;
+							break;
+						}
+					}
+				}
+			}
+
+			// Add successors unless seeing "pm_ignore_block_end"
+			if (!break_in_the_middle) {
+				for (BasicBlock *succ : successors(cur)) {
+					worklist.push_back(succ);
+				}
+			}
+		}
+	}
+}
+
 bool PMRobustness::processAnnotatedFunction(state_t *map, Instruction *I, bool &check_error) {
 	CallBase *CB = cast<CallBase>(I);
 	Function *callee = CB->getCalledFunction();
 	bool updated = false;
 
-	if (callee->hasFnAttribute("myflush")) {
+	if (callee->hasFnAttribute("ignore") || callee->hasFnAttribute("suppress")) {
+		// do nothing
+	} else if (callee->hasFnAttribute("myflush")) {
 		updated = true;
 		processFlushWrapperFunction(map, I);
 	} else if (callee->hasFnAttribute("flush_parameter")) {
@@ -1432,8 +1487,12 @@ void PMRobustness::getAnalysisUsage(AnalysisUsage &AU) const {
 	AU.setPreservesAll();
 }
 
+bool PMRobustness::skipAnnotatedInstruction(Instruction *I) {
+	return I->getMetadata(IGNORE) != NULL;
+}
+
 bool PMRobustness::skipFunction(Function &F) {
-	return isAnnotated(F);
+	return isFunctionAnnotated(F);
 }
 
 bool PMRobustness::isPMAddr(const Function *F, const Value * Addr, const DataLayout &DL) {
@@ -1725,7 +1784,20 @@ bool PMRobustness::isParamAnnotationFunction(Instruction *I) {
 	return false;
 }*/
 
-bool PMRobustness::isAnnotated(Instruction *I) {
+bool PMRobustness::isInFunctionAnnotation(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if ((callee->getName() == "pm_ignore_block_begin") ||
+				(callee->getName() == "pm_ignore_block_end")) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+bool PMRobustness::isFunctionAnnotated(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			for (StringRef &s : AnnotationList) {
@@ -1738,7 +1810,7 @@ bool PMRobustness::isAnnotated(Instruction *I) {
 	return false;
 }
 
-bool PMRobustness::isAnnotated(Function &F) {
+bool PMRobustness::isFunctionAnnotated(Function &F) {
 	for (StringRef &s : AnnotationList) {
 		if (F.hasFnAttribute(s))
 			return true;
@@ -1751,17 +1823,6 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 	if (CallBase *CB = dyn_cast<CallBase>(I)) {
 		if (Function *callee = CB->getCalledFunction()) {
 			if (callee->hasFnAttribute("myflush"))
-				return true;
-		}
-	}
-
-	return false;
-}
-
-bool PMRobustness::ignoreFunction(Instruction *I) {
-	if (CallBase *CB = dyn_cast<CallBase>(I)) {
-		if (Function *callee = CB->getCalledFunction()) {
-			if (callee->hasFnAttribute("ignore") || callee->hasFnAttribute("suppress"))
 				return true;
 		}
 	}

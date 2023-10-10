@@ -132,6 +132,7 @@ namespace {
 
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
+		bool checkPointerArithmetics(Value *Addr, const DataLayout &DL);
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
 		CallingContext * computeContext(state_t *map, Instruction *I);
@@ -809,6 +810,20 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		I->getParent()->dump();
 		*/
 	} else {
+		if (checkPointerArithmetics(Addr, DL)) {
+			if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
+				StmtErrorSet->insert(I);
+				hasError = true;
+
+				errs() << "Warning: Store to addresses computed by pointer arithmetics: ";
+				IRBuilder<> IRB(I);
+				getPosition(I, IRB, true);
+				errs() << "@@ Instruction " << *I << "\n";
+			}
+
+			return false;
+		}
+
 		// Rule 1: x.f = v => x.f becomes dirty
 		if (isPMAddr(I->getFunction(), Addr, DL)) {
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
@@ -887,6 +902,23 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
+		if (checkPointerArithmetics(Addr, DL)) {
+			// Only need to check for atomic loads
+			if (I->isAtomic() && isa<LoadInst>(I)) {
+				if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
+					StmtErrorSet->insert(I);
+					hasError = true;
+
+					errs() << "Warning: Load from addresses computed by pointer arithmetics: ";
+					IRBuilder<> IRB(I);
+					getPosition(I, IRB, true);
+					errs() << "@@ Instruction " << *I << "\n";
+				}
+			}
+
+			return false;
+		}
+
 		if (isPMAddr(I->getFunction(), Addr, DL)) {
 			if (I->isAtomic() && isa<LoadInst>(I)) {
 				// Mark the address as dirty to detect interthread robustness violation
@@ -1309,6 +1341,20 @@ void PMRobustness::processPMMemcpy(state_t * map, Instruction * I) {
 		// Use to record escaped/captured for base pointers of arrays
 		getObjectState(map, DecompGEP.Base);
 	} else {
+		if (checkPointerArithmetics(Addr, DL)) {
+			if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
+				StmtErrorSet->insert(I);
+				hasError = true;
+
+				errs() << "Warning: Memcpy to addresses computed by pointer arithmetics: ";
+				IRBuilder<> IRB(I);
+				getPosition(I, IRB, true);
+				errs() << "@@ Instruction " << *I << "\n";
+			}
+
+			return;
+		}
+
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
 		unsigned size;
@@ -1994,6 +2040,15 @@ bool PMRobustness::checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Valu
 
 	errs() << "flush an array address not seen before\n";
 	//assert(false && "flush an array address not seen before");
+	return false;
+}
+
+bool PMRobustness::checkPointerArithmetics(Value *Addr, const DataLayout &DL) {
+	const Value *Origin = GetUnderlyingObject(Addr, DL);
+	if (isa<IntToPtrInst>(Origin)) {
+		return true;
+	}
+
 	return false;
 }
 

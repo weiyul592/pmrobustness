@@ -191,6 +191,7 @@ namespace {
 		bool FunctionMarksEscDirObj;	// Function: this function
 
 		// Call: this call instruction marks any object as dirty and escaped when no parameters are dirty and escaped;
+
 		bool CallMarksEscDirObj;
 		bool hasError;
 
@@ -1698,6 +1699,7 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 
 void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before) {
 	unsigned escaped_dirty_objs_count = 0;
+        SmallVector<const Value *, 4> escaped_dirty_objs;
 	bool check_and_report = false;
 	IRBuilder<> IRB(I);
 
@@ -1708,6 +1710,7 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 		ob_state_t *object_state = it->second;
 		if (object_state->isEscaped() && object_state->isDirty()) {
 			escaped_dirty_objs_count++;
+			escaped_dirty_objs.push_back(it->first);
 
 			// There is already one or more escaped dirty objects
 			if (escaped_dirty_objs_count == 2) {
@@ -1734,6 +1737,9 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 		errs() << "Error: More than two objects are escaped and dirty at: ";
 		getPosition(I, IRB, true);
 		errs() << "@@ Instruction " << *I << "\n";
+		errs() << "Dirty and escaped objects \n";
+		for(auto const *Val: escaped_dirty_objs)
+			errs() << "--" << *Val << "\n"; 
 		if (hasTwoEscapedDirtyParams) {
 			errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 		}

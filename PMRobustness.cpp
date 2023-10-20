@@ -1177,7 +1177,8 @@ void PMRobustness::processFlushWrapperFunction(state_t * map, Instruction * I) {
 		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
-		assert(false);
+		addr_set_t *AddrSet = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+		checkUnflushedAddress(I->getFunction(), AddrSet, Addr, DecompGEP);
 	} else {
 		//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 		ob_state_t *object_state = map->lookup(DecompGEP.Base);

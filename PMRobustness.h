@@ -411,21 +411,24 @@ public:
 			if (dirty_bytes.find_first_in(startByte, endByte) == -1) {
 				// dirty_bytes are all 0
 				return ParamStateType::CLEAN_ESCAPED;
-			} else if (tmp.find_first_unset_in(startByte, endByte) == -1) {
-				// dirty_bytes and clwb_bytes are all set;
+			} else if (dirty_bytes == tmp) {
+				// all set dirty_bytes are clwbed;
 				return ParamStateType::CLWB_ESCAPED;
-			} else
+			} else {
+				// Some set dirty_bytes are not clwbed
 				return ParamStateType::DIRTY_ESCAPED;
+			}
 		} else {
-
 			if (dirty_bytes.find_first_in(startByte, endByte) == -1) {
 				// dirty_bytes are all 0
 				return ParamStateType::CLEAN_CAPTURED;
-			} else if (tmp.find_first_unset_in(startByte, endByte) == -1) {
-				// dirty_bytes and clwb_bytes are all set;
+			} else if (dirty_bytes == tmp) {
+				// all set dirty_bytes are clwbed;
 				return ParamStateType::CLWB_CAPTURED;
-			} else
+			} else {
+				// Some set dirty_bytes are not clwbed
 				return ParamStateType::DIRTY_CAPTURED;
+			}
 		}
 	}
 

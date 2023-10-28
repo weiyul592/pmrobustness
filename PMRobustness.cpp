@@ -57,6 +57,7 @@
 //#include "llvm/Analysis/AliasAnalysis.h"
 
 #define IGNORE "ignore"
+//#define DUMP_CACHED_RESULT
 
 //#define PMROBUST_DEBUG
 #define INTERPROCEDURAL
@@ -2138,7 +2139,11 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	const DataLayout &DL = CB->getModule()->getDataLayout();
 	bool use_higher_results = false;
 
-	//errs() << "lookup results for function: " << F->getName() << "\n";
+#ifdef DUMP_CACHED_RESULT
+	errs() << "lookup results for function: " << F->getName() << " with Context:\n";
+	Context->dump();
+#endif
+
 	// Function has not been analyzed before
 	if (FS == NULL) {
 		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
@@ -2151,6 +2156,9 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 
 		// Mark all parameters as TOP (clean and captured)
 		makeParametersTOP(map, CB);
+#ifdef DUMP_CACHED_RESULT
+		errs() << "Function cached result not found. Make all parameters TOP\n\n";
+#endif
 		return;
 	}
 
@@ -2171,12 +2179,20 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			// No least upper context exists
 			// Mark all parameters as TOP (clean and captured)
 			makeParametersTOP(map, CB);
+#ifdef DUMP_CACHED_RESULT
+			errs() << "Function cached result not found. Make all parameters TOP\n\n";
+#endif
 			return;
 		} else
 			use_higher_results = true;
 	}
 
-	//errs() << "Function cache found\n";
+#ifdef DUMP_CACHED_RESULT
+	errs() << "Function cached result found\n";
+	if (use_higher_results)
+		errs() << "Higher contexts are used\n";
+	out_state->dump();
+#endif
 
 	// For reporting in-function error
 	if (out_state->marksEscDirObj) {

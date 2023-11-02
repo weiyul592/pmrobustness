@@ -39,6 +39,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
@@ -144,6 +145,10 @@ namespace {
 		void makeParametersTOP(state_t *map, CallBase *CB);
 		void modifyReturnState(state_t *map, CallBase *CB, OutputState *out_state);
 
+		alias_set_t * getFunctionAliasSet(Function *F);
+		value_set_t * getValueAliasSet(Function *F, Value *V);
+		void computeAliasSet(PHINode *PHI);
+
 		const Value * GetLinearExpression(
 			const Value *V, APInt &Scale, APInt &Offset, unsigned &ZExtBits,
 			unsigned &SExtBits, const DataLayout &DL, unsigned Depth,
@@ -200,6 +205,7 @@ namespace {
 		std::set<std::string> MemAllocatingFunctions;
 		std::vector<StringRef> AnnotationList;
 
+		DenseMap<const Function *, alias_set_t *> FunctionAliasSet;
 		// May consider having several DenseMaps for function with different parameter sizes: 4, 8, 12, 16, etc.
 	};
 }
@@ -977,8 +983,11 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 	bool first_state = true;
 
 	PHINode *PHI = cast<PHINode>(I);
+	computeAliasSet(PHI);
+
 	for (unsigned i = 0; i != PHI->getNumIncomingValues(); i++) {
 		Value *V = PHI->getIncomingValue(i);
+		value_set_t *set = getValueAliasSet(I->getFunction(), V);
 
 		if (!visited_blocks[PHI->getIncomingBlock(i)]) {
 			continue;
@@ -2625,6 +2634,72 @@ void PMRobustness::modifyReturnState(state_t *map, CallBase *CB, OutputState *ou
 		} else {
 			assert(false && "other cases");
 		}
+	}
+}
+
+alias_set_t * PMRobustness::getFunctionAliasSet(Function *F) {
+	alias_set_t *AliasSet = FunctionAliasSet.lookup(F);
+	if (AliasSet == NULL) {
+		AliasSet = new alias_set_t();
+		FunctionAliasSet[F] = AliasSet;
+	}
+
+	return AliasSet;
+}
+
+value_set_t * PMRobustness::getValueAliasSet(Function *F, Value *V) {
+	alias_set_t *AliasSet = FunctionAliasSet.lookup(F);
+	if (AliasSet == NULL)
+		return NULL;
+
+	value_set_t *set = AliasSet->lookup(V);
+	return set;
+}
+
+void PMRobustness::computeAliasSet(PHINode *PHI) {
+	alias_set_t *AliasSet = getFunctionAliasSet(PHI->getFunction());
+	Value *V1 = PHI;
+	// TODO: use GetUnderlyingObject
+	for (unsigned i = 0; i != PHI->getNumIncomingValues(); i++) {
+		Value *V2 = PHI->getIncomingValue(i);
+		if (isa<ConstantPointerNull>(V1)) {
+			V1 = V2;
+			continue;
+		} else if (isa<ConstantPointerNull>(V2)) {
+			continue;
+		}
+
+		value_set_t *set1 = AliasSet->lookup(V1);
+		value_set_t *set2 = AliasSet->lookup(V2);
+		if (set1 == NULL && set1 == NULL) {
+			// create value_set_t and add both values
+			set1 = new value_set_t();
+			set1->insert(V1);
+			set1->insert(V2);
+			(*AliasSet)[V1] = set1;
+			(*AliasSet)[V2] = set1;
+		} else if (set1 == NULL) {
+			// set2 is not NULL; add V1 to the set of set2
+			set2->insert(V1);
+			(*AliasSet)[V1] = set2;
+		} else if (set2 == NULL){
+			// set1 is not NULL; add V1 to the set of V2
+			set1->insert(V2);
+			(*AliasSet)[V2] = set1;
+		} else if (set1 == set2) {
+			// Do nothing
+		} else {
+			// merge set1 and set2; remove set1
+			set1->insert(set2->begin(), set2->end());
+			// Update the reference for each member in set2
+			for (Value *u : *set2) {
+				(*AliasSet)[u] = set1;
+			}
+
+			delete set2;
+		}
+
+		V1 = V2;
 	}
 }
 

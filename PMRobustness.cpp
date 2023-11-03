@@ -758,9 +758,9 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
 		updated |= processStore(map, I);
 		//errs() << "Atomic RMW processed\n";
 	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
-#ifdef PMROBUST_DEBUG
-		errs() << "CASI not implemented yet\n";
-#endif
+		// FIXME: Treat CAS as RMW for now
+		updated |= processLoad(map, I);
+		updated |= processStore(map, I);
 	} else if (isa<FenceInst>(I)) {
 		// Ignore for now
 		//errs() << "FenseInst not implemented yet\n";
@@ -801,6 +801,9 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		// Rule 2.1 only makes sense for atomic_exchange
 		if (RMWI->getOperation() == AtomicRMWInst::Xchg)
 			Val = RMWI->getValOperand();
+	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
+		Addr = CASI->getPointerOperand();
+		Val = CASI->getNewValOperand();
 	} else {
 		return false;
 	}
@@ -913,6 +916,8 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 		Addr = LI->getPointerOperand();
 	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
 		Addr = RMWI->getPointerOperand();
+	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
+		Addr = CASI->getPointerOperand();
 	} else {
 		return false;
 	}

@@ -197,7 +197,6 @@ namespace {
 		bool FunctionMarksEscDirObj;	// Function: this function
 
 		// Call: this call instruction marks any object as dirty and escaped when no parameters are dirty and escaped;
-
 		bool CallMarksEscDirObj;
 		bool hasError;
 
@@ -206,7 +205,6 @@ namespace {
 		std::vector<StringRef> AnnotationList;
 
 		DenseMap<const Function *, alias_set_t *> FunctionAliasSet;
-		// May consider having several DenseMaps for function with different parameter sizes: 4, 8, 12, 16, etc.
 	};
 }
 
@@ -588,8 +586,10 @@ bool PMRobustness::copyStateCheckDiff(state_t * src, state_t * dst) {
 
 void PMRobustness::copyMergedState(state_map_t *AbsState,
 		SmallSetVector<BasicBlock *, 8> * src_list, state_t * dst) {
-	for (state_t::iterator it = dst->begin(); it != dst->end(); it++)
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++) {
 		it->second->setSize(0);
+		it->second->markDelete();
+	}
 
 	for (BasicBlock *pred : *src_list) {
 		state_t *s = AbsState->lookup(pred->getTerminator());
@@ -611,10 +611,19 @@ void PMRobustness::copyMergedState(state_map_t *AbsState,
 				} else {
 					A->mergeFrom(B);
 				}
+
+				A->unmarkDelete();
 			} else {
 				(*dst)[it->first] = new ob_state_t(it->second);
 				//map[it->first] = it->second;
 			}
+		}
+	}
+
+	// Remove items not contained in src
+	for (state_t::iterator it = dst->begin(); it != dst->end(); it++) {
+		if (it->second->shouldDelete()) {
+			dst->erase(it);
 		}
 	}
 }
@@ -1710,7 +1719,7 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 
 void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before) {
 	unsigned escaped_dirty_objs_count = 0;
-        SmallVector<const Value *, 4> escaped_dirty_objs;
+	SmallVector<const Value *, 4> escaped_dirty_objs;
 	bool check_and_report = false;
 	IRBuilder<> IRB(I);
 
@@ -1750,7 +1759,7 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "Dirty and escaped objects \n";
 		for(auto const *Val: escaped_dirty_objs)
-			errs() << "--" << *Val << "\n"; 
+			errs() << "--" << *Val << "\n";
 		if (hasTwoEscapedDirtyParams) {
 			errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 		}

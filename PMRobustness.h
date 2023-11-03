@@ -17,6 +17,9 @@ typedef DenseMap<const Instruction *, state_t *> state_map_t;
 typedef DenseMap<const BasicBlock *, state_t *> b_state_map_t;
 typedef DenseMap<Value *, ArrayInfo *> addr_set_t;
 
+typedef DenseSet<Value *> value_set_t;
+typedef DenseMap<const Value *, value_set_t *> alias_set_t;
+
 enum NVMOP {
 	NVM_CLWB,
 	NVM_CLFLUSH,

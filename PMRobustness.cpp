@@ -58,7 +58,10 @@
 //#include "llvm/Analysis/AliasAnalysis.h"
 
 #define IGNORE "ignore"
+#define FUNCTIONNAME ""
+
 //#define DUMP_CACHED_RESULT
+//#define DUMP_INST_STATE
 
 //#define PMROBUST_DEBUG
 #define INTERPROCEDURAL
@@ -305,6 +308,14 @@ bool PMRobustness::runOnModule(Module &M) {
 }
 
 void PMRobustness::analyzeFunction(Function &F, CallingContext *Context) {
+#ifdef DUMP_INST_STATE
+	if (F.getName() == FUNCTIONNAME) {
+		F.dump();
+		errs() << "Analyzing Function " << F.getName() << " with Context: \n";
+		Context->dump();
+	}
+#endif
+
 	state_map_t *AbsState = AbstractStates[&F];
 	if (AbsState == NULL) {
 		AbsState = new state_map_t();
@@ -724,12 +735,13 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		// TODO: report bugs when a function marks an object as escaped, dirty
 		checkEscapedObjError(map, I, non_dirty_escaped_before_call);
 	}
-/*
-	if (updated) {
-		errs() << "After " << *I << "\n";
+
+#ifdef DUMP_INST_STATE
+	if (I->getFunction()->getName() == FUNCTIONNAME) {
+		errs() << "After " << *I << "\n\n";
 		printMap(map);
 	}
-*/
+#endif
 }
 
 bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
@@ -996,8 +1008,6 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 
 	for (unsigned i = 0; i != PHI->getNumIncomingValues(); i++) {
 		Value *V = PHI->getIncomingValue(i);
-		value_set_t *set = getValueAliasSet(I->getFunction(), V);
-
 		if (!visited_blocks[PHI->getIncomingBlock(i)]) {
 			continue;
 		}

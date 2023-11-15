@@ -1009,8 +1009,10 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 	bool first_state = true;
 
 	PHINode *PHI = cast<PHINode>(I);
-	computeAliasSet(PHI);
+	//computeAliasSet(PHI);
 
+	SmallVector<ob_state_t *, 8> object_list;
+	bool anyescaped = false;
 	for (unsigned i = 0; i != PHI->getNumIncomingValues(); i++) {
 		Value *V = PHI->getIncomingValue(i);
 		if (!visited_blocks[PHI->getIncomingBlock(i)]) {
@@ -1038,6 +1040,18 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 				// FIXME: only need to merge some field, not the entire object
 				phi_state->mergeFrom(object_state);
 			}
+
+			// If one incoming value has escaped, mark all of them as escaped
+			if (object_state->isEscaped())
+				anyescaped = true;
+
+			object_list.push_back(object_state);
+		}
+	}
+
+	if (anyescaped) {
+		for (ob_state_t *ob : object_list) {
+			ob->setEscape();
 		}
 	}
 

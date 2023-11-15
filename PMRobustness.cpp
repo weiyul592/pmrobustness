@@ -1685,6 +1685,9 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 		// 1) Check objects other than parameters/return values that are dirty and escaped
 		// Get the state at each return statement
 		state_t *state = AbsState->lookup(I);
+		if (state == NULL)
+			continue;
+
 		for (state_t::iterator it = state->begin(); it != state->end(); it++) {
 			if (FunctionArguments.find(it->first) != FunctionArguments.end())
 				continue;
@@ -2460,6 +2463,8 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	for (Instruction *I : RetSet) {
 		// Get the state at each return statements
 		state_t *s = AbsState->lookup(I);
+		if (s == NULL)
+			continue;
 
 		// Merge the state of each function paremeter. This is a conservative approximation.
 		for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {

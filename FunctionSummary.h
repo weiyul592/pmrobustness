@@ -359,6 +359,12 @@ public:
 	//using iterator = DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo>::iterator;
 	typedef DenseMap<SmallVector<ParamState, 8>, OutputState *, SummaryDenseMapInfo> result_map_t;
 
+	FunctionSummary() {
+		ArgSize = 0;
+		has_release_ops = false;
+		just_set_release = false;
+	}
+
 	struct SummaryDenseMapInfo {
 		static SmallVector<ParamState, 8> getEmptyKey() {
 			return {ParamState(ParamStateType::EMPTY_KEY)};
@@ -429,9 +435,28 @@ public:
 		return &ResultMap;
 	}
 
+	bool hasRelease() {
+		return has_release_ops;
+	}
+
+	void setRelease() {
+		if (has_release_ops == false)
+			just_set_release = true;
+		else
+			just_set_release = false;
+
+		has_release_ops = true;
+	}
+
+	bool justSetRelease() {
+		return just_set_release;
+	}
+
 private:
 	result_map_t ResultMap;
 	unsigned ArgSize = 0;
+	bool has_release_ops = false;
+	bool just_set_release = false;
 };
 
 namespace llvm {

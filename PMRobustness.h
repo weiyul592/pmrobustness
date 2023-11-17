@@ -265,6 +265,53 @@ public:
 		return true;
 	}
 
+	// Check if there are other dirty bytes other than the ones in [start, end)
+	bool hasDirtyBytesNotIn(unsigned start, unsigned len) {
+		if (nonpmem)
+			return false;
+
+		unsigned end = start + len;
+		if (end > size) {
+			resize(end);
+		}
+
+		int setBitBeforeStart = dirty_bytes.find_first_in(0, start);
+		int setBitAfterEnd = dirty_bytes.find_first_in(end, dirty_bytes.size());
+
+		if (setBitBeforeStart == -1 && setBitAfterEnd == -1)
+			return false;
+
+		return true;
+	}
+
+	bool MultipleDirtyFieldsBadApproximation() {
+		if (nonpmem)
+			return false;
+
+		unsigned j = dirty_bytes.size() / 8;
+		if (dirty_bytes.size() % 8 != 0)
+			j++;
+
+		int dirty_count = 0;
+		for (unsigned i = 0; i < j; i++) {
+			unsigned start = i * 8;
+			unsigned end = (i + 1) * 8;
+			if (end >= dirty_bytes.size())
+				end = dirty_bytes.size();
+/*
+			if (dirty_bytes.find_first_in(start, end) != -1) {
+				dirty_count++;
+
+				if (dirty_count >= 2) {
+					return true;
+				}
+			}
+*/
+		}
+
+		return false;
+	}
+
 	// TODO: start + len and size?
 	// Flush wrapper function may flush cache lines exceeding the size of this object
 	bool setFlush(unsigned start, unsigned len, bool onlyFlushWrittenBytes = false) {

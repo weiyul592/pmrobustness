@@ -142,7 +142,9 @@ namespace {
 
 		void checkEndError(state_map_t *AbsState, Function &F);
 		void checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before);
+		void checkMultipleEscapedDirtyFieldsError(ob_state_t *object_state, Instruction *I);
 		void reportEscapedDirtyObjects(state_t *map, Instruction *I);
+		void reportMultipleEscDirtyFieldsError(Instruction *I);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
@@ -226,6 +228,7 @@ namespace {
 
 		// Call: this call instruction marks any object as dirty and escaped when no parameters are dirty and escaped;
 		bool CallMarksEscDirObj;
+		bool report_multiple_esc_dirty_fields_error;
 		bool hasError;
 
 		unsigned MaxLookupSearchDepth = 100;
@@ -693,6 +696,8 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	InstructionMarksEscDirObj = false;
 	CallMarksEscDirObj = false;
+	report_multiple_esc_dirty_fields_error = false;
+
 	bool updated = false;
 	bool check_error = false;
 	bool non_dirty_escaped_before_call = true;
@@ -767,6 +772,10 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 
 	if (report_release_error) {
 		reportEscapedDirtyObjects(map, I);
+	}
+
+	if (report_multiple_esc_dirty_fields_error) {
+		reportMultipleEscDirtyFieldsError(I);
 	}
 
 #ifdef DUMP_INST_STATE
@@ -893,6 +902,9 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 			// Use to record escaped/captured for base pointers of arrays
 			getObjectState(map, DecompGEP.Base);
+
+			InstructionMarksEscDirObj = true;
+			FunctionMarksEscDirObj = true;
 		}
 
 /*
@@ -912,6 +924,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		I->getParent()->dump();
 		*/
 	} else {
+		// Report warnings for addresses computed by pointer arithmetics
 		if (checkPointerArithmetics(Addr, DL)) {
 			if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 				StmtErrorSet->insert(I);
@@ -930,6 +943,13 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		if (isPMAddr(I->getFunction(), Addr, DL)) {
 			unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
+
+			bool has_other_dirty_bytes = object_state->hasDirtyBytesNotIn(offset, TypeSize);
+			if (has_other_dirty_bytes && object_state->isEscaped()) {
+				errs() << "REPORT STORE!!!!!\n";
+				report_multiple_esc_dirty_fields_error = true;
+			}
+
 			updated |= object_state->setDirty(offset, TypeSize);
 
 			// For reporting in-function error
@@ -964,6 +984,12 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				bool changed_to_escaped = object_state->setEscape();
 				updated |= changed_to_escaped;
 
+				assert(object_state);
+				if (object_state->MultipleDirtyFieldsBadApproximation()) {
+					errs() << "REPORT BAD APPROX!!!!!\n";
+					report_multiple_esc_dirty_fields_error = true;
+				}
+
 				// For reporting in-function error
 				if (changed_to_escaped && object_state->isDirty()) {
 					InstructionMarksEscDirObj = true;
@@ -997,10 +1023,23 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	unsigned offset = DecompGEP.getOffsets();
 
 	if (DecompGEP.isArray) {
-		//TODO: implement robustness checks for array
-		//errs() << I->getFunction()->getName() << "\n";
-		//errs() << "Array encountered\t";
-		//errs() << "Addr: " << *Addr << "\n";
+		if (isPMAddr(I->getFunction(), DecompGEP.Base, DL) ||
+			isPMAddr(I->getFunction(), Addr, DL)) {
+			if (I->isAtomic() && isa<LoadInst>(I)) {
+				addr_set_t * unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+				ArrayInfo * tmp = new ArrayInfo();
+				tmp->copyGEP(&DecompGEP);
+				(*unflushed_addr)[Addr] = tmp;
+
+				// Use to record escaped/captured for base pointers of arrays
+				getObjectState(map, DecompGEP.Base);
+
+				// For reporting in-function error
+				InstructionMarksEscDirObj = true;
+				FunctionMarksEscDirObj = true;
+			}
+		}
+
 		//errs() << *I << "\n";
 		//getPosition(I, IRB, true);
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
@@ -1029,6 +1068,15 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 				// For Atomic RMW, this is already done in processStore
 				unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 				ob_state_t *object_state = getObjectState(map, DecompGEP.Base, updated);
+
+				bool has_other_dirty_bytes = object_state->hasDirtyBytesNotIn(offset, TypeSize);
+				if (has_other_dirty_bytes && object_state->isEscaped()) {
+					errs() << "REPORT LOAD!!!!!\n";
+					//errs() << "(LOGN) check range: [" << offset << ", " << offset + TypeSize << ")\n";
+					//errs() << *I << "\n";
+					report_multiple_esc_dirty_fields_error = true;
+				}
+
 				updated |= object_state->setDirty(offset, TypeSize);
 
 				// For reporting in-function error
@@ -1055,6 +1103,12 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 			ob_state_t *object_state = getObjectState(map, LIDecompGEP.Base, updated);
 			bool changed_to_escaped = object_state->setEscape();
 			updated |= changed_to_escaped;
+
+			if (object_state->MultipleDirtyFieldsBadApproximation()) {
+				errs() << "REPORT BAD APPROX!!!!!\n";
+				//errs() << *I << "\n";
+				report_multiple_esc_dirty_fields_error = true;
+			}
 
 			// For reporting in-function error
 			if (changed_to_escaped && object_state->isDirty()) {
@@ -1835,6 +1889,7 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 	if (!InstructionMarksEscDirObj)
 		return;
 
+	// FIXME: also count the unflushed arrays
 	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
 		ob_state_t *object_state = it->second;
 		if (object_state->isEscaped() && object_state->isDirty()) {
@@ -1875,6 +1930,12 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 	}
 }
 
+void PMRobustness::checkMultipleEscapedDirtyFieldsError(ob_state_t *object_state, Instruction *I) {
+//	for () {
+
+//	}
+}
+
 // Report escaped and dirty objects before unlock/atomic release operations on Non PM objects
 void PMRobustness::reportEscapedDirtyObjects(state_t *map, Instruction *I) {
 	unsigned escaped_dirty_objs_count = 0;
@@ -1901,6 +1962,20 @@ void PMRobustness::reportEscapedDirtyObjects(state_t *map, Instruction *I) {
 			errs() << "--" << *Val << "\n";
 	}
 }
+
+void PMRobustness::reportMultipleEscDirtyFieldsError(Instruction *I) {
+	IRBuilder<> IRB(I);
+
+	if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
+		hasError = true;
+		StmtErrorSet->insert(I);
+		errs() << "Reporting NEW2 errors for function: " << I->getFunction()->getName() << "\n";
+		errs() << "NEWError2: Has multiple dirty fields on escaped objects ";
+		getPosition(I, IRB, true);
+		errs() << "@@ Instruction " << *I << "\n";
+	}
+}
+
 
 void PMRobustness::decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL) {
 	unsigned MaxPointerSize = getMaxPointerSize(DL);

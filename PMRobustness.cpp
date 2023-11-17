@@ -68,6 +68,26 @@
 #define DEBUG_TYPE "PMROBUST_DEBUG"
 #include <llvm/IR/DebugLoc.h>
 
+int getAtomicOrderIndex(AtomicOrdering order) {
+	switch (order) {
+		case AtomicOrdering::Monotonic:
+			return (int)AtomicOrderingCABI::relaxed;
+		//case AtomicOrdering::Consume:     // not specified yet
+		//  return AtomicOrderingCABI::consume;
+		case AtomicOrdering::Acquire:
+			return (int)AtomicOrderingCABI::acquire;
+		case AtomicOrdering::Release:
+			return (int)AtomicOrderingCABI::release;
+		case AtomicOrdering::AcquireRelease:
+			return (int)AtomicOrderingCABI::acq_rel;
+		case AtomicOrdering::SequentiallyConsistent:
+			return (int)AtomicOrderingCABI::seq_cst;
+		default:
+			// unordered or Not Atomic
+			return -1;
+	}
+}
+
 namespace {
 	struct PMRobustness : public ModulePass {
 		PMRobustness() : ModulePass(ID) {}
@@ -92,7 +112,7 @@ namespace {
 			SmallSetVector<BasicBlock *, 8> *src_list, addr_set_t *dst);
 
 		void processInstruction(state_t * map, Instruction * I);
-		bool processAtomic(state_t * map, Instruction * I);
+		bool processAtomic(state_t * map, Instruction * I, bool &report_release_error);
 		bool processMemIntrinsic(state_t * map, Instruction * I);
 		bool processLoad(state_t * map, Instruction * I);
 		bool processStore(state_t * map, Instruction * I);
@@ -106,7 +126,8 @@ namespace {
 		//void processNTSWrapperFunction(state_t *map, Instruction * I);
 		void processReturnAnnotation(state_t *map, Instruction *I);
 		void processPMMemcpy(state_t *map, Instruction *I);
-		void processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before);
+		void processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before, bool &report_release_error);
+		void processMutexUnlock(state_t * map, Instruction * I);
 		void getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee);
 
 		//bool processParamAnnotationFunction(Instruction * I);
@@ -121,6 +142,7 @@ namespace {
 
 		void checkEndError(state_map_t *AbsState, Function &F);
 		void checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before);
+		void reportEscapedDirtyObjects(state_t *map, Instruction *I);
 
 		void decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL);
 		unsigned getMemoryAccessSize(Value *Addr, const DataLayout &DL);
@@ -134,6 +156,7 @@ namespace {
 		bool isFunctionAnnotated(Function &F);
 		bool isFlushWrapperFunction(Instruction *I);
 		//bool isNTSWrapperFunction(Instruction *I);
+		bool isMutexUnlock(Instruction *I);
 
 		addr_set_t * getOrCreateUnflushedAddrSet(Function *F, BasicBlock *B);
 		bool checkUnflushedAddress(Function *F, addr_set_t * AddrSet, Value * Addr, DecomposedGEP &DecompGEP);
@@ -141,9 +164,11 @@ namespace {
 		bool compareDecomposedGEP(DecomposedGEP &GEP1, DecomposedGEP &GEP2);
 
 		CallingContext * computeContext(state_t *map, Instruction *I);
-		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context, bool &non_dirty_escaped_before);
+		void lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context,
+				bool &non_dirty_escaped_before, bool &report_release_error);
 		void computeInitialState(state_t *map, Function &F, CallingContext *Context);
 		bool computeFinalState(state_map_t *AbsState, Function &F, CallingContext *Context);
+		FunctionSummary * getOrCreateFunctionSummary(Function *F);
 
 		void makeParametersTOP(state_t *map, CallBase *CB);
 		void modifyReturnState(state_t *map, CallBase *CB, OutputState *out_state);
@@ -671,13 +696,14 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 	bool updated = false;
 	bool check_error = false;
 	bool non_dirty_escaped_before_call = true;
+	bool report_release_error = false;
 
 	if (skipAnnotatedInstruction(I)) {
 		return;
 	}
 
 	if (I->isAtomic()) {
-		updated |= processAtomic(map, I);
+		updated |= processAtomic(map, I, report_release_error);
 		check_error = true;
 	} else if (isa<LoadInst>(I)) {
 		updated |= processLoad(map, I);
@@ -689,6 +715,9 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		updated |= processPHI(map, I);
 	} else if (isa<SelectInst>(I)) {
 		updated |= processSelect(map, I);
+	} else if (isMutexUnlock(I)) {
+		processMutexUnlock(map, I);
+		report_release_error = true;
 	} else if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
 		/* TODO: identify primitive functions that allocate memory
 		CallBase *CallSite = cast<CallBase>(I);
@@ -723,7 +752,7 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 				// updated |= processFlush(map, I, op);
 			} else {
 #ifdef INTERPROCEDURAL
-				processCalls(map, I, non_dirty_escaped_before_call);
+				processCalls(map, I, non_dirty_escaped_before_call, report_release_error);
 				updated |= true;
 				check_error = true;
 #endif
@@ -736,6 +765,10 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 		checkEscapedObjError(map, I, non_dirty_escaped_before_call);
 	}
 
+	if (report_release_error) {
+		reportEscapedDirtyObjects(map, I);
+	}
+
 #ifdef DUMP_INST_STATE
 	if (I->getFunction()->getName() == FUNCTIONNAME) {
 		errs() << "After " << *I << "\n\n";
@@ -744,9 +777,46 @@ void PMRobustness::processInstruction(state_t * map, Instruction * I) {
 #endif
 }
 
-bool PMRobustness::processAtomic(state_t * map, Instruction * I) {
+bool PMRobustness::processAtomic(state_t * map, Instruction * I, bool &report_release_error) {
 	bool updated = false;
-	//const DataLayout &DL = I->getModule()->getDataLayout();
+	const DataLayout &DL = I->getModule()->getDataLayout();
+
+	int atomic_order_index = -1;
+	Value *Addr = NULL;
+	if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+		atomic_order_index = getAtomicOrderIndex(LI->getOrdering());
+		Addr = LI->getPointerOperand();
+
+		//errs() << "(LOG1 Load): atomic index: " << atomic_order_index << "\n";
+	} else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+		atomic_order_index = getAtomicOrderIndex(SI->getOrdering());
+		Addr = SI->getPointerOperand();
+
+		//errs() << "(LOG2 Store): atomic index: " << atomic_order_index << "\n";
+	} else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
+		atomic_order_index = getAtomicOrderIndex(RMWI->getOrdering());
+		Addr = RMWI->getPointerOperand();
+
+		//errs() << "(LOG3 RMW): atomic index: " << atomic_order_index << "\n";
+	} else if (AtomicCmpXchgInst *CASI = dyn_cast<AtomicCmpXchgInst>(I)) {
+		atomic_order_index = getAtomicOrderIndex(CASI->getSuccessOrdering());
+		Addr = CASI->getPointerOperand();
+
+		//errs() << "(LOG4 CAS): atomic index: " << atomic_order_index << "\n";
+	} else if (FenceInst *FI = dyn_cast<FenceInst>(I)) {
+		atomic_order_index = getAtomicOrderIndex(FI->getOrdering());
+		//errs() << "(LOG5 Fence): atomic index: " << atomic_order_index << "\n";
+	}
+
+	if ((isa<FenceInst>(I) || !isPMAddr(I->getFunction(), Addr, DL)) &&
+		atomic_order_index >= 3) {
+		//errs() << "Non PM Atomic operation detected for: " << *I << "\n";
+		//I->getFunction()->dump();
+
+		FunctionSummary *FS = getOrCreateFunctionSummary(I->getFunction());
+		FS->setRelease();
+		report_release_error = true;
+	}
 
 	if (isa<StoreInst>(I)) {
 		updated |= processStore(map, I);
@@ -1480,7 +1550,7 @@ void PMRobustness::processNTSWrapperFunction(state_t * map, Instruction * I) {
 	}
 }*/
 
-void PMRobustness::processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before) {
+void PMRobustness::processCalls(state_t *map, Instruction *I, bool &non_dirty_escaped_before, bool &report_release_error) {
 	CallBase *CB = cast<CallBase>(I);
 	if (CallInst *CI = dyn_cast<CallInst>(CB)) {
 		if (CI->isInlineAsm())
@@ -1516,7 +1586,14 @@ void PMRobustness::processCalls(state_t *map, Instruction *I, bool &non_dirty_es
 	}
 
 	CallingContext *context = computeContext(map, I);
-	lookupFunctionResult(map, CB, context, non_dirty_escaped_before);
+	lookupFunctionResult(map, CB, context, non_dirty_escaped_before, report_release_error);
+}
+
+void PMRobustness::processMutexUnlock(state_t *map, Instruction *I) {
+	errs() << "pthread_mutex_unlock detected in function: " << *I->getFunction() << "\n";
+
+	FunctionSummary *FS = getOrCreateFunctionSummary(I->getFunction());
+	FS->setRelease();
 }
 
 void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
@@ -1798,6 +1875,33 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 	}
 }
 
+// Report escaped and dirty objects before unlock/atomic release operations on Non PM objects
+void PMRobustness::reportEscapedDirtyObjects(state_t *map, Instruction *I) {
+	unsigned escaped_dirty_objs_count = 0;
+	SmallVector<const Value *, 8> escaped_dirty_objs;
+	IRBuilder<> IRB(I);
+
+	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
+		ob_state_t *object_state = it->second;
+		if (object_state->isEscaped() && object_state->isDirty()) {
+			escaped_dirty_objs_count++;
+			escaped_dirty_objs.push_back(it->first);
+		}
+	}
+
+	if (escaped_dirty_objs_count > 0 && StmtErrorSet->find(I) == StmtErrorSet->end()) {
+		hasError = true;
+		StmtErrorSet->insert(I);
+		errs() << "Reporting NEW1 errors for function: " << I->getFunction()->getName() << "\n";
+		errs() << "NEWError: Has escaped and dirty objects before unlock/release atomic operations on non PM objects: ";
+		getPosition(I, IRB, true);
+		errs() << "@@ Instruction " << *I << "\n";
+		errs() << "Dirty and escaped objects \n";
+		for(auto const *Val: escaped_dirty_objs)
+			errs() << "--" << *Val << "\n";
+	}
+}
+
 void PMRobustness::decomposeAddress(DecomposedGEP &DecompGEP, Value *Addr, const DataLayout &DL) {
 	unsigned MaxPointerSize = getMaxPointerSize(DL);
 	DecompGEP.StructOffset = DecompGEP.OtherOffset = APInt(MaxPointerSize, 0);
@@ -1933,6 +2037,18 @@ bool PMRobustness::isFlushWrapperFunction(Instruction *I) {
 
 	return false;
 }
+
+bool PMRobustness::isMutexUnlock(Instruction *I) {
+	if (CallBase *CB = dyn_cast<CallBase>(I)) {
+		if (Function *callee = CB->getCalledFunction()) {
+			if (callee->getName() == "pthread_mutex_unlock")
+				return true;
+		}
+	}
+
+	return false;
+}
+
 
 /*
 // Non-temporal store
@@ -2183,34 +2299,24 @@ CallingContext * PMRobustness::computeContext(state_t *map, Instruction *I) {
 	return context;
 }
 
-void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context, bool &non_dirty_escaped_before) {
+void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingContext *Context,
+	bool &non_dirty_escaped_before, bool &report_release_error) {
 	Function *F = CB->getCalledFunction();
-	FunctionSummary *FS = FunctionSummaries[F];
+	FunctionSummary *FS = getOrCreateFunctionSummary(F);
 	const DataLayout &DL = CB->getModule()->getDataLayout();
 	bool use_higher_results = false;
+
+	// Set has release bit for caller
+	if (FS->hasRelease()) {
+		FunctionSummary *parentFS = getOrCreateFunctionSummary(CB->getFunction());
+		parentFS->setRelease();
+		report_release_error = true;
+	}
 
 #ifdef DUMP_CACHED_RESULT
 	errs() << "lookup results for function: " << F->getName() << " with Context:\n";
 	Context->dump();
 #endif
-
-	// Function has not been analyzed before
-	if (FS == NULL) {
-		if (UniqueFunctionSet.find(std::make_pair(F, Context)) == UniqueFunctionSet.end()) {
-			FunctionWorklist.emplace_back(F, Context);
-			UniqueFunctionSet.insert(std::make_pair(F, Context));
-			//errs() << "(LOG5) Function " << F->getName() << " added to worklist in " << CB->getFunction()->getName() << "\n";
-		} else {
-			delete Context;
-		}
-
-		// Mark all parameters as TOP (clean and captured)
-		makeParametersTOP(map, CB);
-#ifdef DUMP_CACHED_RESULT
-		errs() << "Function cached result not found. Make all parameters TOP\n\n";
-#endif
-		return;
-	}
 
 	OutputState *out_state = FS->getResult(Context);
 	// Function has not been analyzed with the context
@@ -2452,11 +2558,7 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	const DataLayout &DL = F.getParent()->getDataLayout();
 	SmallPtrSet<Instruction *, 8> &RetSet = FunctionRetInstMap[&F];
 
-	FunctionSummary *FS = FunctionSummaries[&F];
-	if (FS == NULL) {
-		FS = new FunctionSummary();
-		FunctionSummaries[&F] = FS;
-	}
+	FunctionSummary *FS = getOrCreateFunctionSummary(&F);
 	OutputState *Output = FS->getOrCreateResult(Context);
 
 	state_t final_state;
@@ -2484,6 +2586,8 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	}
 
 	bool updated = false;
+	updated |= FS->justSetRelease();
+
 	unsigned i = 0;
 	Output->AbstractOutputState.resize(F.arg_size());
 	for (Function::arg_iterator it = F.arg_begin(); it != F.arg_end(); it++) {
@@ -2549,11 +2653,18 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 			}
 		}
 
-		Output->retVal.setState(PS.get_state());
+		if (Output->retVal.get_state() != PS.get_state()) {
+			Output->retVal.setState(PS.get_state());
+			updated = true;
+		}
 	} else {
 		//errs() << "RetVal non PMEM\n";
 		Output->hasRetVal = true;
-		Output->retVal.setState(ParamStateType::NON_PMEM);
+
+		if (Output->retVal.get_state() != ParamStateType::NON_PMEM) {
+			Output->retVal.setState(ParamStateType::NON_PMEM);
+			updated = true;
+		}
 	}
 
 	if (FunctionMarksEscDirObj) {
@@ -2598,6 +2709,16 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 	}
 
 	return updated;
+}
+
+FunctionSummary * PMRobustness::getOrCreateFunctionSummary(Function *F) {
+	FunctionSummary *FS = FunctionSummaries[F];
+	if (FS == NULL) {
+		FS = new FunctionSummary();
+		FunctionSummaries[F] = FS;
+	}
+
+	return FS;
 }
 
 // Mark all parameters as TOP (clean and captured)

@@ -142,7 +142,6 @@ namespace {
 
 		void checkEndError(state_map_t *AbsState, Function &F);
 		void checkEscapedObjError(state_t *map, Instruction *I, bool non_dirty_escaped_before);
-		void checkMultipleEscapedDirtyFieldsError(ob_state_t *object_state, Instruction *I);
 		void reportEscapedDirtyObjects(state_t *map, Instruction *I);
 		void reportMultipleEscDirtyFieldsError(Instruction *I);
 
@@ -817,6 +816,7 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I, bool &report_re
 		//errs() << "(LOG5 Fence): atomic index: " << atomic_order_index << "\n";
 	}
 
+	// Set release op flag for fence and other release or stronger operations
 	if ((isa<FenceInst>(I) || !isPMAddr(I->getFunction(), Addr, DL)) &&
 		atomic_order_index >= 3) {
 		//errs() << "Non PM Atomic operation detected for: " << *I << "\n";
@@ -1889,7 +1889,7 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 	if (!InstructionMarksEscDirObj)
 		return;
 
-	// FIXME: also count the unflushed arrays
+	// First condition: there are clearly two escaped dirty objects
 	for (state_t::iterator it = map->begin(); it != map->end(); it++) {
 		ob_state_t *object_state = it->second;
 		if (object_state->isEscaped() && object_state->isDirty()) {
@@ -1901,11 +1901,24 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 				check_and_report = true;
 				break;
 			}
-
-			// TODO: check if two fields in an object is dirty
 		}
 	}
 
+	// count in unflushed array addresses
+	if (!check_and_report) {
+		addr_set_t *unflushed_addr = getOrCreateUnflushedAddrSet(I->getFunction(), I->getParent());
+		for (addr_set_t::iterator it = unflushed_addr->begin(); it != unflushed_addr->end(); it++) {
+			escaped_dirty_objs_count++;
+			escaped_dirty_objs.push_back(it->first);
+
+			if (escaped_dirty_objs_count == 2) {
+				check_and_report = true;
+				break;
+			}
+		}
+	}
+
+	// Second condition: one escaped dirty object and the current instruction is a call
 	if (escaped_dirty_objs_count == 1 && CallMarksEscDirObj) {
 		// If escaped_dirty_objs_count was 0 before processCall updated states,
 		// then it is not a bug
@@ -1924,16 +1937,11 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 		errs() << "Dirty and escaped objects \n";
 		for(auto const *Val: escaped_dirty_objs)
 			errs() << "--" << *Val << "\n";
+
 		if (hasTwoEscapedDirtyParams) {
 			errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
 		}
 	}
-}
-
-void PMRobustness::checkMultipleEscapedDirtyFieldsError(ob_state_t *object_state, Instruction *I) {
-//	for () {
-
-//	}
 }
 
 // Report escaped and dirty objects before unlock/atomic release operations on Non PM objects

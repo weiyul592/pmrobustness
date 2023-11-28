@@ -140,6 +140,11 @@ private:
 	BitVector clwb_bytes;
 	bool escaped;
 	bool nonpmem;
+	// the position where state most recently
+	// changes to dirty/escaped
+	// empty if not dirty/escaped
+	std::string escaped_pos; 
+	std::string dirty_pos;
 	bool mark_delete;
 
 	void resize(unsigned s) {
@@ -182,6 +187,7 @@ public:
 		mark_delete(false)
 	{ /*assert(size <= (1 << 12));*/ }
 
+	// For merging positions, give priority to positions from this mergeFrom
 	void mergeFrom(ob_state_t * other) {
 		//assert(size == other->size);
 
@@ -193,6 +199,7 @@ public:
 		// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <0, 1>
 		// dirty_byte = dirty_byte | other->dirty_byte
 		// clwb_byte = (clwb_byte | other->clwb_byte) & ~dirty_byte [result from last line]
+		if(dirty_bytes.none()) dirty_pos = other->dirty_pos;
 		dirty_bytes |= other->dirty_bytes;
 		BitVector tmp(dirty_bytes);
 		tmp.flip();
@@ -200,6 +207,7 @@ public:
 		clwb_bytes |= other->clwb_bytes;
 		clwb_bytes &= tmp;
 
+		if(!escaped) escaped_pos = other->escaped_pos; 
 		escaped |= other->escaped;
 		nonpmem = other->nonpmem;
 	}
@@ -209,8 +217,10 @@ public:
 
 		size = src->size;
 		dirty_bytes = src->dirty_bytes;
+		dirty_pos = src->dirty_pos;
 		clwb_bytes = src->clwb_bytes;
 		escaped = src->escaped;
+		escaped_pos = src->escaped_pos;
 
 //		if (nonpmem != src->nonpmem) {
 //			assert(false);
@@ -241,7 +251,7 @@ public:
 	}
 
 	// return true: modified; return else: unchanged
-	bool setDirty(unsigned start, unsigned len) {
+	bool setDirty(unsigned start, unsigned len, std::string &new_dirty_pos) {
 		if (nonpmem)
 			return false;
 
@@ -259,8 +269,9 @@ public:
 		if (index1 == -1 && index2 == -1)
 			return false;
 
+		if(dirty_bytes.none()) dirty_pos = new_dirty_pos;
 		dirty_bytes.set(start, end);
-		clwb_bytes.reset(start, end);
+		clwb_bytes.reset(start, end);	
 
 		return true;
 	}
@@ -379,8 +390,9 @@ public:
 	}
 
 	// return true: modified; return else: unchanged
-	bool setEscape() {
+	bool setEscape(std::string &new_escaped_pos) {
 		if (escaped == false) {
+			escaped_pos = new_escaped_pos;
 			escaped = true;
 			return true;
 		}
@@ -519,6 +531,14 @@ public:
 		info->finalize();
 	}
 
+	std::string getDirtyPos() {
+		return dirty_pos;
+	}
+
+	std::string getEscapedPos() {
+		return escaped_pos;
+	}
+
 	void dump() {
 		errs() << "bit vector size: " << size << "\n";
 		unsigned limit_size = size;
@@ -530,7 +550,7 @@ public:
 				for (unsigned i = 0; i < limit_size; i++) {
 					errs() << dirty_bytes[i];
 				}
-				errs() << "\n";
+				errs() << "first dirty at " << dirty_pos << "\n";
 				for (unsigned i = 0; i < limit_size; i++) {
 					errs() << clwb_bytes[i];
 				}
@@ -539,7 +559,7 @@ public:
 		}
 
 		if (escaped)
-			errs() << "escaped";
+			errs() << "escaped at " << escaped_pos;
 		else
 			errs() << "captured";
 
@@ -565,7 +585,7 @@ void printDecomposedGEP(DecomposedGEP &Decom) {
 	}*/
 }
 
-static inline Value *getPosition(const Instruction * I, IRBuilder <> IRB, bool print = false)
+static inline std::string getPosition(const Instruction * I, bool print = false)
 {
 	const DebugLoc & debug_location = I->getDebugLoc ();
 	std::string position_string;
@@ -575,16 +595,13 @@ static inline Value *getPosition(const Instruction * I, IRBuilder <> IRB, bool p
 	}
 
 	// Phi instructions do not have positions
-	if (position_string == "")
-		return NULL;
-
 	// TODO: some instructions have position:0
 
 	if (print) {
 		errs() << position_string << "\n";
 	}
 
-	return IRB.CreateGlobalStringPtr (position_string);
+	return position_string;
 }
 
 bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)

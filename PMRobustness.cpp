@@ -26,6 +26,7 @@
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -925,6 +926,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		*/
 	} else {
 		// Report warnings for addresses computed by pointer arithmetics
+		auto pos = getPosition(I);
 		if (checkPointerArithmetics(Addr, DL)) {
 			if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 				StmtErrorSet->insert(I);
@@ -932,7 +934,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 
 				errs() << "Warning: Store to addresses computed by pointer arithmetics: ";
 				IRBuilder<> IRB(I);
-				getPosition(I, IRB, true);
+				getPosition(I, true);
 				errs() << "@@ Instruction " << *I << "\n";
 			}
 
@@ -950,7 +952,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				report_multiple_esc_dirty_fields_error = true;
 			}
 
-			updated |= object_state->setDirty(offset, TypeSize);
+			updated |= object_state->setDirty(offset, TypeSize, pos);
 
 			// For reporting in-function error
 			if (object_state->isEscaped()) {
@@ -973,7 +975,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				ob_state_t *object_state = getObjectState(map, ValDecompGEP.Base, updated);
 
 				// Mark it as escaped
-				updated |= object_state->setEscape();
+				updated |= object_state->setEscape(pos);
 			} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 				// TODO: start working here
 				//assert(false && "Fix me");
@@ -981,7 +983,7 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 				ob_state_t *object_state = getObjectState(map, ValDecompGEP.Base, updated);
 
 				// Note: if *x = &p->f, then *p is potentially reachabled; so mark it as escaped
-				bool changed_to_escaped = object_state->setEscape();
+				bool changed_to_escaped = object_state->setEscape(pos);
 				updated |= changed_to_escaped;
 
 				assert(object_state);
@@ -1045,6 +1047,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
+		auto pos = getPosition(I);
 		if (checkPointerArithmetics(Addr, DL)) {
 			// Only need to check for atomic loads
 			if (I->isAtomic() && isa<LoadInst>(I)) {
@@ -1053,8 +1056,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 					hasError = true;
 
 					errs() << "Warning: Load from addresses computed by pointer arithmetics: ";
-					IRBuilder<> IRB(I);
-					getPosition(I, IRB, true);
+					getPosition(I, true);
 					errs() << "@@ Instruction " << *I << "\n";
 				}
 			}
@@ -1077,7 +1079,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 					report_multiple_esc_dirty_fields_error = true;
 				}
 
-				updated |= object_state->setDirty(offset, TypeSize);
+				updated |= object_state->setDirty(offset, TypeSize, pos);
 
 				// For reporting in-function error
 				if (object_state->isEscaped()) {
@@ -1101,7 +1103,7 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 
 			//unsigned TypeSize = getMemoryAccessSize(Addr, DL);
 			ob_state_t *object_state = getObjectState(map, LIDecompGEP.Base, updated);
-			bool changed_to_escaped = object_state->setEscape();
+			bool changed_to_escaped = object_state->setEscape(pos);
 			updated |= changed_to_escaped;
 
 			if (object_state->MultipleDirtyFieldsBadApproximation()) {
@@ -1137,6 +1139,7 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 
 	SmallVector<ob_state_t *, 8> object_list;
 	bool anyescaped = false;
+	std::string escaped_pos;
 	for (unsigned i = 0; i != PHI->getNumIncomingValues(); i++) {
 		Value *V = PHI->getIncomingValue(i);
 		if (!visited_blocks[PHI->getIncomingBlock(i)]) {
@@ -1166,8 +1169,11 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 			}
 
 			// If one incoming value has escaped, mark all of them as escaped
-			if (object_state->isEscaped())
+			if (object_state->isEscaped()) {
 				anyescaped = true;
+				//save position of the first branch where object is escaped
+				escaped_pos = object_state->getEscapedPos();
+			}
 
 			object_list.push_back(object_state);
 		}
@@ -1175,7 +1181,7 @@ bool PMRobustness::processPHI(state_t * map, Instruction * I) {
 
 	if (anyescaped) {
 		for (ob_state_t *ob : object_list) {
-			ob->setEscape();
+			ob->setEscape(escaped_pos);
 		}
 	}
 
@@ -1463,7 +1469,8 @@ void PMRobustness::processReturnAnnotation(state_t * map, Instruction * I) {
 	} else {
 		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
 		if (annotation == "escaped") {
-			object_state->setEscape();
+			auto pos = getPosition(I);
+			object_state->setEscape(pos);
 		} else {
 			assert(false);
 		}
@@ -1521,8 +1528,7 @@ void PMRobustness::processPMMemcpy(state_t * map, Instruction * I) {
 				hasError = true;
 
 				errs() << "Warning: Memcpy to addresses computed by pointer arithmetics: ";
-				IRBuilder<> IRB(I);
-				getPosition(I, IRB, true);
+				getPosition(I, true);
 				errs() << "@@ Instruction " << *I << "\n";
 			}
 
@@ -1540,7 +1546,8 @@ void PMRobustness::processPMMemcpy(state_t * map, Instruction * I) {
 			size = object_state->getSize();
 		}
 
-		object_state->setDirty(offset, size);
+		auto pos = getPosition(I);
+		object_state->setDirty(offset, size, pos);
 		if (object_state->isEscaped()) {
 			InstructionMarksEscDirObj = true;
 			FunctionMarksEscDirObj = true;
@@ -1836,19 +1843,17 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 					ErrorSet->insert(it->first);
 
 					errs() << "Error!!!!!!! at return statement: ";
-					IRBuilder<> IRB(I);
-					Value *pos = NULL;
 					if (isa<Instruction>(it->first) && !isa<PHINode>(it->first)) {
 						const Instruction *inst = cast<Instruction>(it->first);
-						pos = getPosition(inst, IRB, true);
 
-						if (pos == NULL)
-							getPosition(I, IRB, true);
+						if (getPosition(inst, true).empty())
+							getPosition(I, true);
 					} else {
-						getPosition(I, IRB, true);
+						getPosition(I, true);
 					}
 
 					errs() << "@@ Instruction " << *it->first << "\n";
+					errs() << "dirty at: " << object_state->getDirtyPos() << ", escaped at " << object_state->getEscapedPos() << "\n";
 				}
 			}
 		}
@@ -1866,12 +1871,11 @@ void PMRobustness::checkEndError(state_map_t *AbsState, Function &F) {
 					ErrorSet->insert(it->first);
 
 					errs() << "Error: Unflushed array address: ";
-					IRBuilder<> IRB(I);
 					if (isa<Instruction>(it->first)) {
 						const Instruction *inst = cast<Instruction>(it->first);
-						getPosition(inst, IRB, true);
+						getPosition(inst, true);
 					} else
-						getPosition(I, IRB, true);
+						getPosition(I, true);
 
 					errs() << "@@ Instruction " << *it->first << "\n";
 				}
@@ -1932,11 +1936,16 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 		StmtErrorSet->insert(I);
 		errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
 		errs() << "Error: More than two objects are escaped and dirty at: ";
-		getPosition(I, IRB, true);
+		getPosition(I, true);
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "Dirty and escaped objects \n";
-		for(auto const *Val: escaped_dirty_objs)
-			errs() << "--" << *Val << "\n";
+		for(auto const *Val: escaped_dirty_objs) {
+			errs() << "--" << *Val;
+			auto it = map->find(Val);
+			if(it != map->end())
+			  errs() << " dirty at " << it->second->getDirtyPos() << ", escaped at " << it->second->getEscapedPos();
+			errs() <<" \n";
+		}
 
 		if (hasTwoEscapedDirtyParams) {
 			errs() << "Two Parameters are already escaped dirty, this error may not be real\n";
@@ -1963,11 +1972,16 @@ void PMRobustness::reportEscapedDirtyObjects(state_t *map, Instruction *I) {
 		StmtErrorSet->insert(I);
 		errs() << "Reporting NEW1 errors for function: " << I->getFunction()->getName() << "\n";
 		errs() << "NEWError: Has escaped and dirty objects before unlock/release atomic operations on non PM objects: ";
-		getPosition(I, IRB, true);
+		getPosition(I, true);
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "Dirty and escaped objects \n";
-		for(auto const *Val: escaped_dirty_objs)
-			errs() << "--" << *Val << "\n";
+		for(auto const *Val: escaped_dirty_objs) {
+			errs() << "--" << *Val;
+			auto it = map->find(Val);
+			if(it != map->end())
+			  errs() << " dirty at " << it->second->getDirtyPos() << ", escaped at " << it->second->getEscapedPos();
+			errs() <<" \n";
+		}
 	}
 }
 
@@ -1979,7 +1993,7 @@ void PMRobustness::reportMultipleEscDirtyFieldsError(Instruction *I) {
 		StmtErrorSet->insert(I);
 		errs() << "Reporting NEW2 errors for function: " << I->getFunction()->getName() << "\n";
 		errs() << "NEWError2: Has multiple dirty fields on escaped objects ";
-		getPosition(I, IRB, true);
+		getPosition(I, true);
 		errs() << "@@ Instruction " << *I << "\n";
 	}
 }
@@ -2473,6 +2487,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		DecomposedGEP DecompGEP;
 		decomposeAddress(DecompGEP, op, DL);
 		unsigned offset = DecompGEP.getOffsets();
+		auto pos = getPosition(CB);
 
 		if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 			// TODO: We have information about arrays escaping or not.
@@ -2491,7 +2506,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
 				if (info == NULL)
 					(*unflushed_addr)[op] = tmp;
-				object_state->setEscape();
+				object_state->setEscape(pos);
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				// FIXME
 				if (info == NULL)
@@ -2500,7 +2515,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 				// FIXME
 				if (info == NULL)
 					(*unflushed_addr)[op] = tmp;
-				object_state->setEscape();
+				object_state->setEscape(pos);
 			} else if (param_state == ParamStateType::CLEAN_CAPTURED) {
 				if (info != NULL)
 					checkUnflushedAddress(CB->getFunction(), unflushed_addr, op, DecompGEP);
@@ -2508,7 +2523,7 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 			} else if (param_state == ParamStateType::CLEAN_ESCAPED) {
 				if (info != NULL)
 					checkUnflushedAddress(CB->getFunction(), unflushed_addr, op, DecompGEP);
-				object_state->setEscape();
+				object_state->setEscape(pos);
 				delete tmp;
 			} else if (param_state == ParamStateType::TOP) {
 				checkUnflushedAddress(CB->getFunction(), unflushed_addr, op, DecompGEP);
@@ -2537,10 +2552,10 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
 					for (unsigned i = 0; i < lst->size(); i++) {
 						std::pair<int, int> &elem = (*lst)[i];
-						object_state->setDirty(offset + elem.first, elem.second - elem.first);
+						object_state->setDirty(offset + elem.first, elem.second - elem.first, pos);
 					}
 				} else if (!out_state->isUntouched(i)) {
-					object_state->setDirty(offset, TypeSize);
+					object_state->setDirty(offset, TypeSize, pos);
 				}
 			} else if (param_state == ParamStateType::DIRTY_ESCAPED) {
 				// Approximate dirty
@@ -2553,23 +2568,23 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 					assert(offset != UNKNOWNOFFSET && offset != VARIABLEOFFSET);
 					for (unsigned i = 0; i < lst->size(); i++) {
 						std::pair<int, int> &elem = (*lst)[i];
-						object_state->setDirty(offset + elem.first, elem.second - elem.first);
+						object_state->setDirty(offset + elem.first, elem.second - elem.first, pos);
 					}
 				} else if (!out_state->isUntouched(i)) {
-					object_state->setDirty(offset, TypeSize);
+					object_state->setDirty(offset, TypeSize, pos);
 				}
 
-				object_state->setEscape();
+				object_state->setEscape(pos);
 			} else if (param_state == ParamStateType::CLWB_CAPTURED) {
 				object_state->setClwb(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLWB_ESCAPED) {
 				object_state->setClwb(offset, TypeSize);
-				object_state->setEscape();
+				object_state->setEscape(pos);
 			} else if (param_state == ParamStateType::CLEAN_CAPTURED) {
 				object_state->setFlush(offset, TypeSize);
 			} else if (param_state == ParamStateType::CLEAN_ESCAPED) {
 				object_state->setFlush(offset, TypeSize);
-				object_state->setEscape();
+				object_state->setEscape(pos);
 			} else if (param_state == ParamStateType::TOP) {
 				object_state->setFlush(offset, TypeSize);
 				object_state->setCaptured();
@@ -2608,24 +2623,27 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		if (TypeSize == (unsigned)-1) {
 			continue;
 		}
+		//TODO: save position in ParamState to have position information here
+		auto DI = F.getSubprogram();
+		std::string pos = DI->getFilename().str() + ":" + std::to_string(DI->getLine());
 
 		if (PS == ParamStateType::DIRTY_CAPTURED) {
 			// TODO: how to better approximate dirty
-			object_state->setDirty(0, TypeSize);
+			object_state->setDirty(0, TypeSize, pos);
 		} else if (PS == ParamStateType::DIRTY_ESCAPED) {
 			// TODO: how to better approximate dirty
-			object_state->setDirty(0, TypeSize);
-			object_state->setEscape();
+			object_state->setDirty(0, TypeSize, pos);
+			object_state->setEscape(pos);
 		} else if (PS == ParamStateType::CLWB_CAPTURED) {
 			object_state->setClwb(0, TypeSize);
 		} else if (PS == ParamStateType::CLWB_ESCAPED) {
 			object_state->setClwb(0, TypeSize);
-			object_state->setEscape();
+			object_state->setEscape(pos);
 		} else if (PS == ParamStateType::CLEAN_CAPTURED) {
 			object_state->setFlush(0, TypeSize);
 		} else if (PS == ParamStateType::CLEAN_ESCAPED) {
 			object_state->setFlush(0, TypeSize);
-			object_state->setEscape();
+			object_state->setEscape(pos);
 		} else if (PS == ParamStateType::TOP) {
 			// TOP: clean and captured
 			object_state->setFlush(0, TypeSize);
@@ -2856,25 +2874,26 @@ void PMRobustness::modifyReturnState(state_t *map, CallBase *CB, OutputState *ou
 		}
 
 		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
+		auto pos = getPosition(CB);
 
 		if (return_state == ParamStateType::DIRTY_CAPTURED) {
 			// Approximate dirty
-			object_state->setDirty(offset, TypeSize);
+			object_state->setDirty(offset, TypeSize, pos);
 		} else if (return_state == ParamStateType::DIRTY_ESCAPED) {
 			// TODO: How to approximate dirty?
 			//assert(false);
-			object_state->setEscape();
-			object_state->setDirty(offset, TypeSize);
+			object_state->setEscape(pos);
+			object_state->setDirty(offset, TypeSize, pos);
 		} else if (return_state == ParamStateType::CLWB_CAPTURED) {
 			object_state->setClwb(offset, TypeSize);
 		} else if (return_state == ParamStateType::CLWB_ESCAPED) {
 			object_state->setClwb(offset, TypeSize);
-			object_state->setEscape();
+			object_state->setEscape(pos);
 		} else if (return_state == ParamStateType::CLEAN_CAPTURED) {
 			object_state->setFlush(offset, TypeSize);
 		} else if (return_state == ParamStateType::CLEAN_ESCAPED) {
 			object_state->setFlush(offset, TypeSize);
-			object_state->setEscape();
+			object_state->setEscape(pos);
 		} else if (return_state == ParamStateType::TOP) {
 			object_state->setFlush(offset, TypeSize);
 			object_state->setCaptured();

@@ -129,6 +129,42 @@ struct ArrayInfo : public DecomposedGEP {
 	}
 };
 
+static inline std::string getPosition(const Instruction * I, bool print = false)
+{
+	const DebugLoc & debug_location = I->getDebugLoc ();
+	std::string position_string;
+	{
+		llvm::raw_string_ostream position_stream (position_string);
+		debug_location . print (position_stream);
+	}
+
+	// Phi instructions do not have positions
+	// TODO: some instructions have position:0
+
+	if (print) {
+		errs() << position_string << "\n";
+	}
+
+	return position_string;
+}
+
+bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)
+{
+	const DebugLoc & debug_location = I->getDebugLoc ();
+	std::string position_string;
+	{
+		llvm::raw_string_ostream position_stream (position_string);
+		debug_location . print (position_stream);
+	}
+
+	std::size_t found = position_string.find(sub);
+	if (found!=std::string::npos)
+		return true;
+
+	return false;
+}
+
+
 /**
  * TODO: may need to track the size of fields
  **/
@@ -140,11 +176,11 @@ private:
 	BitVector clwb_bytes;
 	bool escaped;
 	bool nonpmem;
-	// the position where state most recently
+	// the position where the state most recently
 	// changes to dirty/escaped
-	// empty if not dirty/escaped
-	std::string escaped_pos; 
-	std::string dirty_pos;
+	// empty from not dirty/escaped
+	const Instruction* dirty_pos = nullptr;
+	const Instruction* escaped_pos = nullptr; 
 	bool mark_delete;
 
 	void resize(unsigned s) {
@@ -184,6 +220,8 @@ public:
 		clwb_bytes(other->clwb_bytes),
 		escaped(other->escaped),
 		nonpmem(other->nonpmem),
+		dirty_pos(other->dirty_pos),
+		escaped_pos(other->escaped_pos),
 		mark_delete(false)
 	{ /*assert(size <= (1 << 12));*/ }
 
@@ -251,7 +289,7 @@ public:
 	}
 
 	// return true: modified; return else: unchanged
-	bool setDirty(unsigned start, unsigned len, std::string &new_dirty_pos) {
+	bool setDirty(unsigned start, unsigned len, const Instruction *new_dirty_pos) {
 		if (nonpmem)
 			return false;
 
@@ -390,7 +428,7 @@ public:
 	}
 
 	// return true: modified; return else: unchanged
-	bool setEscape(std::string &new_escaped_pos) {
+	bool setEscape(const Instruction *new_escaped_pos) {
 		if (escaped == false) {
 			escaped_pos = new_escaped_pos;
 			escaped = true;
@@ -531,12 +569,16 @@ public:
 		info->finalize();
 	}
 
-	std::string getDirtyPos() {
+	const Instruction *getDirtyPos() {
 		return dirty_pos;
 	}
 
-	std::string getEscapedPos() {
+	const Instruction *getEscapedPos() {
 		return escaped_pos;
+	}
+
+	std::string getDirtyEscapedPos() {
+		return " dirty at " + (dirty_pos ? getPosition(dirty_pos): "") + ", escaped at " + (escaped_pos ? getPosition(escaped_pos): "");
 	}
 
 	void dump() {
@@ -550,7 +592,7 @@ public:
 				for (unsigned i = 0; i < limit_size; i++) {
 					errs() << dirty_bytes[i];
 				}
-				errs() << "first dirty at " << dirty_pos << "\n";
+				errs() << "\nfirst dirty at " << dirty_pos << "\n";
 				for (unsigned i = 0; i < limit_size; i++) {
 					errs() << clwb_bytes[i];
 				}
@@ -583,41 +625,6 @@ void printDecomposedGEP(DecomposedGEP &Decom) {
 		errs() << "(" << VI.ZExtBits << ", " << VI.SExtBits << ")\t";
 		errs() << "Scale: " << VI.Scale << "\n";
 	}*/
-}
-
-static inline std::string getPosition(const Instruction * I, bool print = false)
-{
-	const DebugLoc & debug_location = I->getDebugLoc ();
-	std::string position_string;
-	{
-		llvm::raw_string_ostream position_stream (position_string);
-		debug_location . print (position_stream);
-	}
-
-	// Phi instructions do not have positions
-	// TODO: some instructions have position:0
-
-	if (print) {
-		errs() << position_string << "\n";
-	}
-
-	return position_string;
-}
-
-bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)
-{
-	const DebugLoc & debug_location = I->getDebugLoc ();
-	std::string position_string;
-	{
-		llvm::raw_string_ostream position_stream (position_string);
-		debug_location . print (position_stream);
-	}
-
-	std::size_t found = position_string.find(sub);
-	if (found!=std::string::npos)
-		return true;
-
-	return false;
 }
 
 /// To ensure a pointer offset fits in an integer of size PointerSize

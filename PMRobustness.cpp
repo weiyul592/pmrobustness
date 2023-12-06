@@ -62,7 +62,7 @@
 #define FUNCTIONNAME ""
 
 //#define DUMP_CACHED_RESULT
-//#define DUMP_INST_STATE
+#define DUMP_INST_STATE
 
 //#define PMROBUST_DEBUG
 #define INTERPROCEDURAL
@@ -694,6 +694,12 @@ void PMRobustness::copyMergedArrayState(DenseMap<BasicBlock *, addr_set_t *> *Ar
 }
 
 void PMRobustness::processInstruction(state_t * map, Instruction * I) {
+#ifdef DUMP_INST_STATE
+	if (I->getFunction()->getName() == FUNCTIONNAME) {
+		errs() << "Before " << *I << "\n\n";
+		printMap(map);
+	}
+#endif
 	InstructionMarksEscDirObj = false;
 	CallMarksEscDirObj = false;
 	multiple_esc_dirty_fields_prev_pos = "";
@@ -926,7 +932,6 @@ bool PMRobustness::processStore(state_t * map, Instruction * I) {
 		*/
 	} else {
 		// Report warnings for addresses computed by pointer arithmetics
-		auto pos = getPosition(I);
 		if (checkPointerArithmetics(Addr, DL)) {
 			if (StmtErrorSet->find(I) == StmtErrorSet->end()) {
 				StmtErrorSet->insert(I);
@@ -1047,7 +1052,6 @@ bool PMRobustness::processLoad(state_t * map, Instruction * I) {
 	} else if (offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 		// TODO: treat it the same way as array
 	} else {
-		auto pos = getPosition(I);
 		if (checkPointerArithmetics(Addr, DL)) {
 			// Only need to check for atomic loads
 			if (I->isAtomic() && isa<LoadInst>(I)) {
@@ -1469,7 +1473,6 @@ void PMRobustness::processReturnAnnotation(state_t * map, Instruction * I) {
 	} else {
 		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
 		if (annotation == "escaped") {
-			auto pos = getPosition(I);
 			object_state->setEscape(I);
 		} else {
 			assert(false);
@@ -1546,7 +1549,6 @@ void PMRobustness::processPMMemcpy(state_t * map, Instruction * I) {
 			size = object_state->getSize();
 		}
 
-		auto pos = getPosition(I);
 		object_state->setDirty(offset, size, I);
 		if (object_state->isEscaped()) {
 			InstructionMarksEscDirObj = true;
@@ -2488,7 +2490,6 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 		DecomposedGEP DecompGEP;
 		decomposeAddress(DecompGEP, op, DL);
 		unsigned offset = DecompGEP.getOffsets();
-		auto pos = getPosition(CB);
 
 		if (DecompGEP.isArray || offset == UNKNOWNOFFSET || offset == VARIABLEOFFSET) {
 			// TODO: We have information about arrays escaping or not.
@@ -2624,7 +2625,7 @@ void PMRobustness::computeInitialState(state_t *map, Function &F, CallingContext
 		if (TypeSize == (unsigned)-1) {
 			continue;
 		}
-		//TODO: save position in ParamState to have position information here
+		//TODO: save position in ParamState to have precise position information here
 		Instruction *first_inst = (F.begin() != F.end() && F.begin()->begin() != F.begin()->end())? 
 									&*F.begin()->begin():
 									nullptr;
@@ -2876,7 +2877,6 @@ void PMRobustness::modifyReturnState(state_t *map, CallBase *CB, OutputState *ou
 		}
 
 		ob_state_t *object_state = getObjectState(map, DecompGEP.Base);
-		auto pos = getPosition(CB);
 
 		if (return_state == ParamStateType::DIRTY_CAPTURED) {
 			// Approximate dirty

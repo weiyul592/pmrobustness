@@ -164,6 +164,18 @@ bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)
 	return false;
 }
 
+static void printBitVectorAsIntervals(BitVector BV) {
+	int IntervalStart = -1; //-1 if not in a strip of ones
+	for (unsigned i = 0; i < BV.size(); i++) {
+		if (BV[i] && IntervalStart == -1)
+			IntervalStart = i;
+		if ((!BV[i] || i+1 == BV.size())  && IntervalStart != -1) {
+			errs() << IntervalStart << " - " << i << ", ";
+			IntervalStart =  -1;
+		}
+	}
+
+}
 
 /**
  * TODO: may need to track the size of fields
@@ -237,7 +249,7 @@ public:
 		// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <0, 1>
 		// dirty_byte = dirty_byte | other->dirty_byte
 		// clwb_byte = (clwb_byte | other->clwb_byte) & ~dirty_byte [result from last line]
-		if(dirty_bytes.none()) dirty_pos = other->dirty_pos;
+		if(!isDirty()) dirty_pos = other->dirty_pos;
 		dirty_bytes |= other->dirty_bytes;
 		BitVector tmp(dirty_bytes);
 		tmp.flip();
@@ -307,7 +319,8 @@ public:
 		if (index1 == -1 && index2 == -1)
 			return false;
 
-		if(dirty_bytes.none()) dirty_pos = new_dirty_pos;
+		if(!isDirty()) 
+			dirty_pos = new_dirty_pos;
 		dirty_bytes.set(start, end);
 		clwb_bytes.reset(start, end);	
 
@@ -533,13 +546,19 @@ public:
 	}
 
 	bool isDirty() {
-		BitVector tmp(dirty_bytes);
+		for (auto Itr = dirty_bytes.set_bits_begin(); Itr != dirty_bytes.set_bits_end(); Itr++)
+			if(!clwb_bytes.test(*Itr))
+				return true;
+		return false; 
+
+		//this bitvector constructor causes memory errors in certain cases, possibly a llvm bug.
+		/*BitVector tmp(dirty_bytes);
 		tmp ^= clwb_bytes;
 
 		if (tmp.any())
 			return true;
 
-		return false;
+		return false;*/
 	}
 
 	void computeDirtyBytes(DirtyBytesInfo *info) {
@@ -583,25 +602,20 @@ public:
 
 	void dump() {
 		errs() << "bit vector size: " << size << "\n";
-		unsigned limit_size = size;
 		if (size != 0) {
-//			if (size > 128)
-//				limit_size = 128;	// Maybe only print a few bytes when the object is large
-
 			if (dirty_bytes.any()) {
-				for (unsigned i = 0; i < limit_size; i++) {
-					errs() << dirty_bytes[i];
-				}
-				errs() << "\nfirst dirty at " << dirty_pos << "\n";
-				for (unsigned i = 0; i < limit_size; i++) {
-					errs() << clwb_bytes[i];
-				}
+				errs() << "dirty bytes: ";
+				printBitVectorAsIntervals(dirty_bytes);
+				errs() << "\nfirst dirty at " << *dirty_pos << "\n";
+
+				errs() << "clwb bytes: ";
+				printBitVectorAsIntervals(clwb_bytes);
 				errs() << "\n";
 			}
 		}
 
 		if (escaped)
-			errs() << "escaped at " << escaped_pos;
+			errs() << "escaped at " << *escaped_pos;
 		else
 			errs() << "captured";
 

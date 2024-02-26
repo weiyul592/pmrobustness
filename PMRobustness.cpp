@@ -62,7 +62,7 @@
 #define FUNCTIONNAME ""
 
 //#define DUMP_CACHED_RESULT
-#define DUMP_INST_STATE
+//#define DUMP_INST_STATE
 
 //#define PMROBUST_DEBUG
 #define INTERPROCEDURAL
@@ -1941,7 +1941,7 @@ void PMRobustness::checkEscapedObjError(state_t *map, Instruction *I, bool non_d
 		hasError = true;
 		StmtErrorSet->insert(I);
 		errs() << "Reporting errors for function: " << I->getFunction()->getName() << "\n";
-		errs() << "Error: More than two objects are escaped and  object_state->getDirtyEscapedPos() << dirty at: ";
+		errs() << "Error: More than two objects are escaped and dirty at: ";
 		getPosition(I, true);
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "Dirty and escaped objects \n";
@@ -1978,7 +1978,7 @@ void PMRobustness::reportEscapedDirtyObjects(state_t *map, Instruction *I) {
 		StmtErrorSet->insert(I);
 		errs() << "Reporting NEW1 errors for function: " << I->getFunction()->getName() << "\n";
 		errs() << "NEWError: Has escaped and dirty objects before unlock/release atomic operations on non PM objects at: ";
-		getPosition(I, IRB, true);
+		getPosition(I, true);
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "Dirty and escaped objects \n";
 		for(auto const *Val: escaped_dirty_objs) {
@@ -1999,7 +1999,7 @@ void PMRobustness::reportMultipleEscDirtyFieldsError(Instruction *I) {
 		StmtErrorSet->insert(I);
 		errs() << "Reporting NEW2 errors for function: " << I->getFunction()->getName() << "\n";
 		errs() << "NEWError2: Has multiple dirty fields on escaped objects at: ";
-		getPosition(I, IRB, true);
+		getPosition(I, true);
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "previously " << multiple_esc_dirty_fields_prev_pos << "\n";
 	}

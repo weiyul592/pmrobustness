@@ -486,7 +486,11 @@ public:
 		BitVector tmp(dirty_bytes);
 		tmp ^= clwb_bytes;
 
-		if (tmp.any())
+		// fence are not implemented yet
+//		if (tmp.any())
+//			return true;
+
+		if (dirty_bytes.any())
 			return true;
 
 		return false;

@@ -824,6 +824,8 @@ bool PMRobustness::processAtomic(state_t * map, Instruction * I, bool &report_re
 
 		FunctionSummary *FS = getOrCreateFunctionSummary(I->getFunction());
 		FS->setRelease();
+		errs() << "Set Release Instruction: " << *I << "\n";
+		errs() << "For " << I->getFunction()->getName() << "\n";
 		report_release_error = true;
 	}
 
@@ -1648,6 +1650,8 @@ void PMRobustness::processMutexUnlock(state_t *map, Instruction *I) {
 
 	FunctionSummary *FS = getOrCreateFunctionSummary(I->getFunction());
 	FS->setRelease();
+	errs() << "Set Release Instruction: " << *I << "\n";
+	errs() << "For " << I->getFunction()->getName() << "\n";
 }
 
 void PMRobustness::getAnnotatedParamaters(std::string attr, std::vector<StringRef> &annotations, Function *callee) {
@@ -1962,7 +1966,7 @@ void PMRobustness::reportEscapedDirtyObjects(state_t *map, Instruction *I) {
 		hasError = true;
 		StmtErrorSet->insert(I);
 		errs() << "Reporting NEW1 errors for function: " << I->getFunction()->getName() << "\n";
-		errs() << "NEWError: Has escaped and dirty objects before unlock/release atomic operations on non PM objects: ";
+		errs() << "NEWError: Has escaped and dirty objects before unlock/release atomic operations on non PM objects at: ";
 		getPosition(I, IRB, true);
 		errs() << "@@ Instruction " << *I << "\n";
 		errs() << "Dirty and escaped objects \n";
@@ -1978,7 +1982,7 @@ void PMRobustness::reportMultipleEscDirtyFieldsError(Instruction *I) {
 		hasError = true;
 		StmtErrorSet->insert(I);
 		errs() << "Reporting NEW2 errors for function: " << I->getFunction()->getName() << "\n";
-		errs() << "NEWError2: Has multiple dirty fields on escaped objects ";
+		errs() << "NEWError2: Has multiple dirty fields on escaped objects at: ";
 		getPosition(I, IRB, true);
 		errs() << "@@ Instruction " << *I << "\n";
 	}
@@ -2393,6 +2397,9 @@ void PMRobustness::lookupFunctionResult(state_t *map, CallBase *CB, CallingConte
 	if (FS->hasRelease()) {
 		FunctionSummary *parentFS = getOrCreateFunctionSummary(CB->getFunction());
 		parentFS->setRelease();
+		errs() << "Set Release Instruction: " << *CB << "\n";
+		errs() << "For " << CB->getFunction()->getName() << "\n";
+
 		report_release_error = true;
 	}
 
@@ -2723,6 +2730,9 @@ bool PMRobustness::computeFinalState(state_map_t *AbsState, Function &F, Calling
 		ParamState PS(ParamStateType::TOP);
 		for (Instruction *I : RetSet) {
 			state_t *s = AbsState->lookup(I);
+			if (s == NULL)
+				continue;
+
 			Value *Ret = cast<ReturnInst>(I)->getReturnValue();
 			ob_state_t *RetState = s->lookup(Ret);
 

@@ -129,6 +129,54 @@ struct ArrayInfo : public DecomposedGEP {
 	}
 };
 
+static inline std::string getPosition(const Instruction * I, bool print = false)
+{
+	const DebugLoc & debug_location = I->getDebugLoc ();
+	std::string position_string;
+	{
+		llvm::raw_string_ostream position_stream (position_string);
+		debug_location . print (position_stream);
+	}
+
+	// Phi instructions do not have positions
+	// TODO: some instructions have position:0
+
+	if (print) {
+		errs() << position_string << "\n";
+	}
+
+	return position_string;
+}
+
+bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)
+{
+	const DebugLoc & debug_location = I->getDebugLoc ();
+	std::string position_string;
+	{
+		llvm::raw_string_ostream position_stream (position_string);
+		debug_location . print (position_stream);
+	}
+
+	std::size_t found = position_string.find(sub);
+	if (found!=std::string::npos)
+		return true;
+
+	return false;
+}
+
+static void printBitVectorAsIntervals(BitVector BV) {
+	int IntervalStart = -1; //-1 if not in a strip of ones
+	for (unsigned i = 0; i < BV.size(); i++) {
+		if (BV[i] && IntervalStart == -1)
+			IntervalStart = i;
+		if ((!BV[i] || i+1 == BV.size())  && IntervalStart != -1) {
+			errs() << IntervalStart << " - " << i << ", ";
+			IntervalStart =  -1;
+		}
+	}
+
+}
+
 /**
  * TODO: may need to track the size of fields
  **/
@@ -140,6 +188,11 @@ private:
 	BitVector clwb_bytes;
 	bool escaped;
 	bool nonpmem;
+	// the position where the state most recently
+	// changes to dirty/escaped
+	// empty from not dirty/escaped
+	const Instruction* dirty_pos = nullptr;
+	const Instruction* escaped_pos = nullptr; 
 	bool mark_delete;
 
 	void resize(unsigned s) {
@@ -179,9 +232,12 @@ public:
 		clwb_bytes(other->clwb_bytes),
 		escaped(other->escaped),
 		nonpmem(other->nonpmem),
+		dirty_pos(other->dirty_pos),
+		escaped_pos(other->escaped_pos),
 		mark_delete(false)
 	{ /*assert(size <= (1 << 12));*/ }
 
+	// For merging positions, give priority to positions from this mergeFrom
 	void mergeFrom(ob_state_t * other) {
 		//assert(size == other->size);
 
@@ -193,6 +249,7 @@ public:
 		// <dirty_byte, clwb_byte> is either <0, 0>, <1, 0>, or <0, 1>
 		// dirty_byte = dirty_byte | other->dirty_byte
 		// clwb_byte = (clwb_byte | other->clwb_byte) & ~dirty_byte [result from last line]
+		if(!isDirty()) dirty_pos = other->dirty_pos;
 		dirty_bytes |= other->dirty_bytes;
 		BitVector tmp(dirty_bytes);
 		tmp.flip();
@@ -200,6 +257,7 @@ public:
 		clwb_bytes |= other->clwb_bytes;
 		clwb_bytes &= tmp;
 
+		if(!escaped) escaped_pos = other->escaped_pos; 
 		escaped |= other->escaped;
 		nonpmem = other->nonpmem;
 	}
@@ -209,8 +267,10 @@ public:
 
 		size = src->size;
 		dirty_bytes = src->dirty_bytes;
+		dirty_pos = src->dirty_pos;
 		clwb_bytes = src->clwb_bytes;
 		escaped = src->escaped;
+		escaped_pos = src->escaped_pos;
 
 //		if (nonpmem != src->nonpmem) {
 //			assert(false);
@@ -241,7 +301,7 @@ public:
 	}
 
 	// return true: modified; return else: unchanged
-	bool setDirty(unsigned start, unsigned len) {
+	bool setDirty(unsigned start, unsigned len, const Instruction *new_dirty_pos) {
 		if (nonpmem)
 			return false;
 
@@ -259,8 +319,10 @@ public:
 		if (index1 == -1 && index2 == -1)
 			return false;
 
+		if(!isDirty()) 
+			dirty_pos = new_dirty_pos;
 		dirty_bytes.set(start, end);
-		clwb_bytes.reset(start, end);
+		clwb_bytes.reset(start, end);	
 
 		return true;
 	}
@@ -379,8 +441,9 @@ public:
 	}
 
 	// return true: modified; return else: unchanged
-	bool setEscape() {
+	bool setEscape(const Instruction *new_escaped_pos) {
 		if (escaped == false) {
+			escaped_pos = new_escaped_pos;
 			escaped = true;
 			return true;
 		}
@@ -483,7 +546,13 @@ public:
 	}
 
 	bool isDirty() {
-		BitVector tmp(dirty_bytes);
+		for (auto Itr = dirty_bytes.set_bits_begin(); Itr != dirty_bytes.set_bits_end(); Itr++)
+			if(!clwb_bytes.test(*Itr))
+				return true;
+		return false; 
+
+		//this bitvector constructor causes memory errors in certain cases, possibly a llvm bug.
+		/*BitVector tmp(dirty_bytes);
 		tmp ^= clwb_bytes;
 
 		// fence are not implemented yet
@@ -493,7 +562,7 @@ public:
 		if (dirty_bytes.any())
 			return true;
 
-		return false;
+		return false;*/
 	}
 
 	void computeDirtyBytes(DirtyBytesInfo *info) {
@@ -523,27 +592,34 @@ public:
 		info->finalize();
 	}
 
+	const Instruction *getDirtyPos() {
+		return dirty_pos;
+	}
+
+	const Instruction *getEscapedPos() {
+		return escaped_pos;
+	}
+
+	std::string getDirtyEscapedPos() {
+		return " dirty at " + (dirty_pos ? getPosition(dirty_pos): "") + ", escaped at " + (escaped_pos ? getPosition(escaped_pos): "");
+	}
+
 	void dump() {
 		errs() << "bit vector size: " << size << "\n";
-		unsigned limit_size = size;
 		if (size != 0) {
-//			if (size > 128)
-//				limit_size = 128;	// Maybe only print a few bytes when the object is large
-
 			if (dirty_bytes.any()) {
-				for (unsigned i = 0; i < limit_size; i++) {
-					errs() << dirty_bytes[i];
-				}
-				errs() << "\n";
-				for (unsigned i = 0; i < limit_size; i++) {
-					errs() << clwb_bytes[i];
-				}
+				errs() << "dirty bytes: ";
+				printBitVectorAsIntervals(dirty_bytes);
+				errs() << "\nfirst dirty at " << *dirty_pos << "\n";
+
+				errs() << "clwb bytes: ";
+				printBitVectorAsIntervals(clwb_bytes);
 				errs() << "\n";
 			}
 		}
 
 		if (escaped)
-			errs() << "escaped";
+			errs() << "escaped at " << *escaped_pos;
 		else
 			errs() << "captured";
 
@@ -567,44 +643,6 @@ void printDecomposedGEP(DecomposedGEP &Decom) {
 		errs() << "(" << VI.ZExtBits << ", " << VI.SExtBits << ")\t";
 		errs() << "Scale: " << VI.Scale << "\n";
 	}*/
-}
-
-static inline Value *getPosition(const Instruction * I, IRBuilder <> IRB, bool print = false)
-{
-	const DebugLoc & debug_location = I->getDebugLoc ();
-	std::string position_string;
-	{
-		llvm::raw_string_ostream position_stream (position_string);
-		debug_location . print (position_stream);
-	}
-
-	// Phi instructions do not have positions
-	if (position_string == "")
-		return NULL;
-
-	// TODO: some instructions have position:0
-
-	if (print) {
-		errs() << position_string << "\n";
-	}
-
-	return IRB.CreateGlobalStringPtr (position_string);
-}
-
-bool checkPosition(Instruction * I, IRBuilder <> IRB, std::string sub)
-{
-	const DebugLoc & debug_location = I->getDebugLoc ();
-	std::string position_string;
-	{
-		llvm::raw_string_ostream position_stream (position_string);
-		debug_location . print (position_stream);
-	}
-
-	std::size_t found = position_string.find(sub);
-	if (found!=std::string::npos)
-		return true;
-
-	return false;
 }
 
 /// To ensure a pointer offset fits in an integer of size PointerSize
